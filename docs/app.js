@@ -1,0 +1,994 @@
+(() => {
+  "use strict";
+
+  const STORAGE_KEY = "gold-mobile-mechanic-phone-v1";
+  const RECEIPT_DB = "gold-mobile-mechanic-receipts";
+  const RECEIPT_STORE = "receipts";
+  const STATUS_COPY = {
+    draft: "Ready",
+    in_progress: "On the clock",
+    on_break: "On break",
+    completed: "Clocked out",
+    invoiced: "Invoice ready"
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const boardView = $("boardView");
+  const jobView = $("jobView");
+  const jobDialog = $("jobDialog");
+  const jobForm = $("jobForm");
+  const receiptDialog = $("receiptDialog");
+  const receiptForm = $("receiptForm");
+  const materialRows = $("materialRows");
+  const toastElement = $("toast");
+
+  let selectedJobId = null;
+  let receiptJobId = null;
+  let receiptPreviewUrl = null;
+  let activeObjectUrls = [];
+  let toastTimer = null;
+
+  function loadState() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+      if (saved && saved.version === 1 && Array.isArray(saved.jobs)) return saved;
+    } catch {
+      // A malformed local value should never prevent the app from opening.
+    }
+    return { version: 1, jobs: [] };
+  }
+
+  let state = loadState();
+
+  function saveState() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    $("storageLabel").textContent = `${state.jobs.length} job${state.jobs.length === 1 ? "" : "s"} on this phone`;
+  }
+
+  function uid() {
+    return crypto.randomUUID();
+  }
+
+  function jobId() {
+    const now = new Date();
+    const day = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0")
+    ].join("");
+    const token = crypto.randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase();
+    return `GMM-${day}-${token}`;
+  }
+
+  function parseCents(value) {
+    const amount = Number.parseFloat(String(value || "").replaceAll(",", ""));
+    return Number.isFinite(amount) ? Math.max(0, Math.round(amount * 100)) : 0;
+  }
+
+  function money(cents) {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD"
+    }).format((Number(cents) || 0) / 100);
+  }
+
+  function duration(seconds) {
+    const safe = Math.max(0, Math.floor(seconds || 0));
+    const hours = Math.floor(safe / 3600);
+    const minutes = Math.floor((safe % 3600) / 60);
+    const remaining = safe % 60;
+    return [hours, minutes, remaining]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":");
+  }
+
+  function clockTime(value) {
+    if (!value) return "—";
+    return new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      minute: "2-digit"
+    }).format(new Date(value));
+  }
+
+  function calendarDate(value) {
+    if (!value) return "—";
+    return new Intl.DateTimeFormat("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric"
+    }).format(new Date(value));
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    })[character]);
+  }
+
+  function vehicleName(job) {
+    return [job.vehicleYear, job.vehicleMake, job.vehicleModel].filter(Boolean).join(" ");
+  }
+
+  function elapsedSeconds(job, kind, now = Date.now()) {
+    return (job.timeEntries || [])
+      .filter((entry) => entry.kind === kind)
+      .reduce((total, entry) => {
+        const start = Date.parse(entry.startedAt);
+        const end = entry.endedAt ? Date.parse(entry.endedAt) : now;
+        return total + Math.max(0, Math.floor((end - start) / 1000));
+      }, 0);
+  }
+
+  function materialTotal(job) {
+    return (job.materials || []).reduce(
+      (total, item) => total + Math.round(Number(item.quantity || 0) * Number(item.unitCostCents || 0)),
+      0
+    );
+  }
+
+  function findJob(id) {
+    return state.jobs.find((job) => job.id === id);
+  }
+
+  function notify(message, isError = false) {
+    toastElement.textContent = message;
+    toastElement.className = `toast${isError ? " error" : ""}`;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastElement.classList.add("hidden"), 3600);
+  }
+
+  function revokeObjectUrls() {
+    activeObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+    activeObjectUrls = [];
+  }
+
+  function openReceiptDatabase() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(RECEIPT_DB, 1);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(RECEIPT_STORE)) {
+          database.createObjectStore(RECEIPT_STORE, { keyPath: "id" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function receiptDatabaseAction(mode, action) {
+    const database = await openReceiptDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = database.transaction(RECEIPT_STORE, mode);
+      const store = transaction.objectStore(RECEIPT_STORE);
+      let result;
+      try {
+        result = action(store);
+      } catch (error) {
+        database.close();
+        reject(error);
+        return;
+      }
+      transaction.oncomplete = () => {
+        database.close();
+        resolve(result && "result" in result ? result.result : result);
+      };
+      transaction.onerror = () => {
+        database.close();
+        reject(transaction.error);
+      };
+    });
+  }
+
+  function storeReceipt(id, blob) {
+    return receiptDatabaseAction("readwrite", (store) => store.put({ id, blob }));
+  }
+
+  function getReceipt(id) {
+    return receiptDatabaseAction("readonly", (store) => store.get(id));
+  }
+
+  function clearReceiptStore() {
+    return receiptDatabaseAction("readwrite", (store) => store.clear());
+  }
+
+  function fileToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function dataUrlToBlob(value) {
+    const [header, encoded] = value.split(",");
+    const mime = /data:([^;]+)/.exec(header)?.[1] || "application/octet-stream";
+    const bytes = atob(encoded);
+    const array = new Uint8Array(bytes.length);
+    for (let index = 0; index < bytes.length; index += 1) array[index] = bytes.charCodeAt(index);
+    return new Blob([array], { type: mime });
+  }
+
+  async function compressReceipt(file) {
+    try {
+      const bitmap = await createImageBitmap(file);
+      const limit = 1800;
+      const scale = Math.min(1, limit / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.84));
+      return blob || file;
+    } catch {
+      return file;
+    }
+  }
+
+  function showBoard() {
+    selectedJobId = null;
+    window.location.hash = "";
+    jobView.classList.add("hidden");
+    boardView.classList.remove("hidden");
+    revokeObjectUrls();
+    renderBoard();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function renderBoard() {
+    saveState();
+    const jobs = [...state.jobs].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    if (!jobs.length) {
+      $("jobGrid").innerHTML = `
+        <div class="empty-state">
+          <strong>No work orders yet.</strong>
+          <p>Create the first job when you arrive. The timer, receipts, notes, and final invoice will stay together.</p>
+          <button class="button button-dark" id="emptyNewJob" type="button">Create first job</button>
+        </div>`;
+      $("emptyNewJob").addEventListener("click", openJobDialog);
+      return;
+    }
+
+    $("jobGrid").innerHTML = jobs.map((job) => `
+      <button class="job-card" type="button" data-job-id="${escapeHtml(job.id)}" data-status="${escapeHtml(job.status)}">
+        <span class="job-card-top">
+          <span class="job-id">${escapeHtml(job.id)}</span>
+          <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status] || job.status)}</span>
+        </span>
+        <h3>${escapeHtml(vehicleName(job) || "Vehicle not named")}</h3>
+        <p class="customer">${escapeHtml(job.customerName)}</p>
+        <span class="card-stats">
+          <span><span>Work</span><strong>${duration(elapsedSeconds(job, "work"))}</strong></span>
+          <span><span>Receipts</span><strong>${job.receipts.length}</strong></span>
+          <span><span>Estimate</span><strong>${money(materialTotal(job))}</strong></span>
+        </span>
+      </button>
+    `).join("");
+
+    document.querySelectorAll("[data-job-id]").forEach((button) => {
+      button.addEventListener("click", () => openJob(button.dataset.jobId));
+    });
+  }
+
+  async function openJob(id) {
+    const job = findJob(id);
+    if (!job) {
+      showBoard();
+      return;
+    }
+    selectedJobId = id;
+    window.location.hash = `job/${encodeURIComponent(id)}`;
+    boardView.classList.add("hidden");
+    jobView.classList.remove("hidden");
+    await renderJob();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function timerControls(job) {
+    if (job.status === "draft") {
+      return `<button class="button button-green" data-timer-action="clock_in" type="button">Clock in</button>`;
+    }
+    if (job.status === "in_progress") {
+      return `<button class="button button-dark" data-timer-action="break_start" type="button">Start break</button>`;
+    }
+    if (job.status === "on_break") {
+      return `<button class="button button-green" data-timer-action="break_end" type="button">End break</button>`;
+    }
+    return `<button class="button button-quiet" type="button" disabled>${job.status === "invoiced" ? "Invoice filed" : "Job complete"}</button>`;
+  }
+
+  function materialsMarkup(job) {
+    if (!job.materials.length) return `<p class="materials-empty">No approved materials were entered for this job.</p>`;
+    return `
+      <table class="materials-table">
+        <thead><tr><th>Material</th><th>Qty</th><th>Unit</th><th>Total</th></tr></thead>
+        <tbody>
+          ${job.materials.map((item) => `
+            <tr>
+              <td>${escapeHtml(item.description)}</td>
+              <td>${Number(item.quantity).toFixed(2).replace(/\.00$/, "")}</td>
+              <td>${money(item.unitCostCents)}</td>
+              <td>${money(Math.round(item.quantity * item.unitCostCents))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>`;
+  }
+
+  function invoiceMarkup(job) {
+    if (!job.invoice) return "";
+    return `
+      <article class="content-card invoice-card">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">Filed invoice</p>
+            <h2>${escapeHtml(job.invoice.invoiceNumber)}</h2>
+            <p>${calendarDate(job.invoice.createdAt)} · ${escapeHtml(job.customerEmail || "Recipient email not entered")}</p>
+          </div>
+          <span class="status-pill invoiced">Ready</span>
+        </div>
+        <div class="invoice-meta">
+          <span>Labor · ${money(job.invoice.laborCents)}</span>
+          <span>Materials · ${money(job.invoice.materialsCents)}</span>
+          <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} filed</span>
+        </div>
+        <div class="invoice-total"><span>Total</span><strong>${money(job.invoice.totalCents)}</strong></div>
+        <div class="invoice-actions">
+          <button class="button button-dark" id="shareInvoiceButton" type="button">Share invoice</button>
+          <button class="button button-quiet" id="downloadInvoiceButton" type="button">Download</button>
+          <button class="button button-gold" id="emailInvoiceButton" type="button">Prepare email</button>
+        </div>
+      </article>`;
+  }
+
+  async function receiptMarkup(job) {
+    revokeObjectUrls();
+    if (!job.receipts.length) return `<p class="receipt-empty">No receipts filed yet.</p>`;
+    const rows = await Promise.all(job.receipts.map(async (receipt) => {
+      const stored = await getReceipt(receipt.id).catch(() => null);
+      let image = `<span class="receipt-thumb">▧</span>`;
+      if (stored?.blob) {
+        const url = URL.createObjectURL(stored.blob);
+        activeObjectUrls.push(url);
+        image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
+      }
+      return `
+        <div class="receipt-row">
+          <button type="button" data-receipt-id="${escapeHtml(receipt.id)}">
+            ${image}
+            <span class="receipt-copy">
+              <strong>${escapeHtml(receipt.vendor || receipt.filename)}</strong>
+              <small>${calendarDate(receipt.createdAt)} · ${money(receipt.amountCents)}</small>
+            </span>
+          </button>
+          <strong>${money(receipt.amountCents)}</strong>
+        </div>`;
+    }));
+    return rows.join("");
+  }
+
+  async function renderJob() {
+    const job = findJob(selectedJobId);
+    if (!job) {
+      showBoard();
+      return;
+    }
+    const workSeconds = elapsedSeconds(job, "work");
+    const breakSeconds = elapsedSeconds(job, "break");
+    const receipts = await receiptMarkup(job);
+    const locked = job.status === "invoiced";
+    const canReview = job.status === "completed";
+    const canInvoice = job.status === "completed" && job.receiptReview;
+
+    jobView.innerHTML = `
+      <div class="job-hero">
+        <button class="back-button" id="backButton" type="button">← All jobs</button>
+        <p class="eyebrow">${escapeHtml(job.id)}</p>
+        <h1>${escapeHtml(vehicleName(job) || "Vehicle")} <em>work order.</em></h1>
+        <p>${escapeHtml(job.customerName)} · ${escapeHtml(job.vehiclePlate || "No plate recorded")}</p>
+        <div class="job-hero-meta">
+          <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status])}</span>
+          <span>Opened ${calendarDate(job.createdAt)}</span>
+          <span>${money(job.laborRateCents)}/hour</span>
+        </div>
+      </div>
+
+      <div class="detail-layout">
+        <div class="detail-column">
+          <article class="content-card">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Job timer</p>
+                <h2>${job.status === "on_break" ? "Break in progress" : job.status === "draft" ? "Ready to begin" : "Work ledger"}</h2>
+              </div>
+              <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status])}</span>
+            </div>
+            <div class="timer-face">
+              <span>Billable work time</span>
+              <strong id="liveWorkTimer">${duration(workSeconds)}</strong>
+            </div>
+            <div class="timer-summary">
+              <div><span class="detail-label">Clocked in</span><strong>${clockTime(job.startedAt)}</strong></div>
+              <div><span class="detail-label">Break time</span><strong id="liveBreakTimer">${duration(breakSeconds)}</strong></div>
+            </div>
+            <div class="timer-buttons">${timerControls(job)}</div>
+          </article>
+
+          <article class="content-card">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Approved scope</p>
+                <h2>Agreed work</h2>
+              </div>
+            </div>
+            <p class="work-copy">${escapeHtml(job.agreedWork)}</p>
+          </article>
+
+          <article class="content-card">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Customer-approved costs</p>
+                <h2>Materials</h2>
+              </div>
+              <strong>${money(materialTotal(job))}</strong>
+            </div>
+            ${materialsMarkup(job)}
+          </article>
+
+          <article class="content-card">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Professional notes</p>
+                <h2>Mechanic's suggestions</h2>
+                <p>Your opinion and recommended next steps print on the invoice.</p>
+              </div>
+            </div>
+            <textarea class="suggestions" id="suggestionsInput" ${locked ? "disabled" : ""} placeholder="Example: Front brake pads are nearing replacement thickness. Recheck within 3,000 miles.">${escapeHtml(job.suggestions || "")}</textarea>
+            ${locked ? "" : `<div class="save-row"><button class="button button-quiet" id="saveSuggestionsButton" type="button">Save suggestions</button></div>`}
+          </article>
+        </div>
+
+        <aside class="detail-column">
+          <article class="content-card">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Job files</p>
+                <h2>Receipt folder</h2>
+                <p>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} captured on this phone.</p>
+              </div>
+              <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
+            </div>
+            <div class="receipt-list">${receipts}</div>
+            <label class="review-check">
+              <input id="receiptReviewInput" type="checkbox" ${job.receiptReview ? "checked" : ""} ${canReview ? "" : "disabled"}>
+              <span><strong>Receipt folder reviewed</strong><br>Confirm every receipt looks right before the invoice is created.</span>
+            </label>
+          </article>
+
+          ${job.status === "completed" && !job.invoice ? `
+            <article class="content-card invoice-card">
+              <div class="card-heading">
+                <div>
+                  <p class="eyebrow">Final step</p>
+                  <h2>Create invoice</h2>
+                  <p>Labor comes from the work timer. Materials and receipt images stay filed with this job.</p>
+                </div>
+              </div>
+              <button class="button button-gold" id="createInvoiceButton" type="button" ${canInvoice ? "" : "disabled"}>Create invoice</button>
+            </article>` : ""}
+
+          ${invoiceMarkup(job)}
+        </aside>
+      </div>
+
+      <section class="clock-out-zone">
+        <div>
+          <p class="eyebrow">Bottom of work order</p>
+          <h3>${job.status === "completed" || job.status === "invoiced" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
+          <p>${job.status === "on_break" ? "End the current break before clocking out." : job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Clocking out closes the billable timer. Review the receipts next, then create the invoice."}</p>
+        </div>
+        <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" ? "" : "disabled"}>Clock out</button>
+      </section>`;
+
+    bindJobEvents(job);
+    updateLiveTimer();
+  }
+
+  function bindJobEvents(job) {
+    $("backButton").addEventListener("click", showBoard);
+    document.querySelectorAll("[data-timer-action]").forEach((button) => {
+      button.addEventListener("click", () => timerAction(job, button.dataset.timerAction));
+    });
+
+    const clockOutButton = $("clockOutButton");
+    if (clockOutButton) clockOutButton.addEventListener("click", () => timerAction(job, "clock_out"));
+
+    const addReceiptButton = $("addReceiptButton");
+    if (addReceiptButton) addReceiptButton.addEventListener("click", () => openReceiptDialog(job.id));
+
+    document.querySelectorAll("[data-receipt-id]").forEach((button) => {
+      button.addEventListener("click", () => viewReceipt(button.dataset.receiptId));
+    });
+
+    const saveSuggestionsButton = $("saveSuggestionsButton");
+    if (saveSuggestionsButton) {
+      saveSuggestionsButton.addEventListener("click", () => {
+        job.suggestions = $("suggestionsInput").value.trim();
+        saveState();
+        notify("Mechanic's suggestions saved.");
+      });
+    }
+
+    const reviewInput = $("receiptReviewInput");
+    if (reviewInput && !reviewInput.disabled) {
+      reviewInput.addEventListener("change", () => {
+        job.receiptReview = reviewInput.checked;
+        saveState();
+        renderJob();
+        notify(job.receiptReview ? "Receipt folder approved." : "Receipt review reopened.");
+      });
+    }
+
+    const createInvoiceButton = $("createInvoiceButton");
+    if (createInvoiceButton) createInvoiceButton.addEventListener("click", () => createInvoice(job));
+
+    const downloadInvoiceButton = $("downloadInvoiceButton");
+    if (downloadInvoiceButton) downloadInvoiceButton.addEventListener("click", () => downloadInvoice(job));
+
+    const shareInvoiceButton = $("shareInvoiceButton");
+    if (shareInvoiceButton) shareInvoiceButton.addEventListener("click", () => shareInvoice(job));
+
+    const emailInvoiceButton = $("emailInvoiceButton");
+    if (emailInvoiceButton) emailInvoiceButton.addEventListener("click", () => prepareEmail(job));
+  }
+
+  function timerAction(job, action) {
+    const now = new Date().toISOString();
+    const openEntry = job.timeEntries.find((entry) => !entry.endedAt);
+
+    if (action === "clock_in" && job.status === "draft") {
+      job.status = "in_progress";
+      job.startedAt = now;
+      job.timeEntries.push({ id: uid(), kind: "work", startedAt: now, endedAt: null });
+      notify("Clocked in. Billable time is running.");
+    } else if (action === "break_start" && job.status === "in_progress") {
+      if (openEntry) openEntry.endedAt = now;
+      job.timeEntries.push({ id: uid(), kind: "break", startedAt: now, endedAt: null });
+      job.status = "on_break";
+      notify("Break started. Billable time is paused.");
+    } else if (action === "break_end" && job.status === "on_break") {
+      if (openEntry) openEntry.endedAt = now;
+      job.timeEntries.push({ id: uid(), kind: "work", startedAt: now, endedAt: null });
+      job.status = "in_progress";
+      notify("Break ended. Billable time resumed.");
+    } else if (action === "clock_out" && job.status === "in_progress") {
+      if (!window.confirm("Clock out and close the billable timer for this job?")) return;
+      if (openEntry) openEntry.endedAt = now;
+      job.status = "completed";
+      job.endedAt = now;
+      notify("Clocked out. Review receipts to unlock the invoice.");
+    } else {
+      notify("That timer action is not available right now.", true);
+      return;
+    }
+
+    saveState();
+    renderJob();
+  }
+
+  function updateLiveTimer() {
+    const job = selectedJobId ? findJob(selectedJobId) : null;
+    if (!job) return;
+    const work = $("liveWorkTimer");
+    const rest = $("liveBreakTimer");
+    if (work) work.textContent = duration(elapsedSeconds(job, "work"));
+    if (rest) rest.textContent = duration(elapsedSeconds(job, "break"));
+  }
+
+  function addMaterialRow(values = {}) {
+    const row = document.createElement("div");
+    row.className = "material-row";
+    row.dataset.materialId = values.id || uid();
+    row.innerHTML = `
+      <label class="field">
+        <span>Description</span>
+        <input name="materialDescription" value="${escapeHtml(values.description || "")}" placeholder="Alternator">
+      </label>
+      <label class="field">
+        <span>Qty</span>
+        <input name="materialQuantity" inputmode="decimal" value="${escapeHtml(values.quantity || "1")}">
+      </label>
+      <label class="field">
+        <span>Unit cost</span>
+        <span class="money-input"><b>$</b><input name="materialCost" inputmode="decimal" value="${escapeHtml(values.unitCost || "")}" placeholder="0.00"></span>
+      </label>
+      <button class="icon-button" type="button" aria-label="Remove material">×</button>`;
+    row.querySelector("button").addEventListener("click", () => {
+      if (materialRows.children.length === 1) {
+        row.querySelectorAll("input").forEach((input) => {
+          input.value = input.name === "materialQuantity" ? "1" : "";
+        });
+      } else {
+        row.remove();
+      }
+    });
+    materialRows.appendChild(row);
+  }
+
+  function openJobDialog() {
+    jobForm.reset();
+    materialRows.innerHTML = "";
+    addMaterialRow();
+    $("jobFormError").classList.add("hidden");
+    jobDialog.showModal();
+  }
+
+  function closeJobDialog() {
+    jobDialog.close();
+  }
+
+  jobForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(jobForm);
+    const laborRateCents = parseCents(data.get("laborRate"));
+    if (!laborRateCents) {
+      $("jobFormError").textContent = "Enter a labor rate greater than zero.";
+      $("jobFormError").classList.remove("hidden");
+      return;
+    }
+
+    const materials = [...materialRows.querySelectorAll(".material-row")]
+      .map((row) => {
+        const description = row.querySelector('[name="materialDescription"]').value.trim();
+        const quantity = Number.parseFloat(row.querySelector('[name="materialQuantity"]').value);
+        const unitCostCents = parseCents(row.querySelector('[name="materialCost"]').value);
+        return {
+          id: row.dataset.materialId,
+          description,
+          quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1,
+          unitCostCents
+        };
+      })
+      .filter((item) => item.description);
+
+    const job = {
+      id: jobId(),
+      customerName: String(data.get("customerName") || "").trim(),
+      customerEmail: String(data.get("customerEmail") || "").trim(),
+      vehicleYear: String(data.get("vehicleYear") || "").trim(),
+      vehicleMake: String(data.get("vehicleMake") || "").trim(),
+      vehicleModel: String(data.get("vehicleModel") || "").trim(),
+      vehiclePlate: String(data.get("vehiclePlate") || "").trim().toUpperCase(),
+      laborRateCents,
+      agreedWork: String(data.get("agreedWork") || "").trim(),
+      materials,
+      suggestions: "",
+      status: "draft",
+      receiptReview: false,
+      createdAt: new Date().toISOString(),
+      startedAt: null,
+      endedAt: null,
+      timeEntries: [],
+      receipts: [],
+      invoice: null
+    };
+
+    state.jobs.push(job);
+    saveState();
+    closeJobDialog();
+    notify(`${job.id} created.`);
+    openJob(job.id);
+  });
+
+  function openReceiptDialog(jobIdValue) {
+    receiptJobId = jobIdValue;
+    receiptForm.reset();
+    $("receiptFormError").classList.add("hidden");
+    $("receiptPreview").classList.add("hidden");
+    $("receiptPreview").innerHTML = "";
+    if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
+    receiptPreviewUrl = null;
+    receiptDialog.showModal();
+  }
+
+  function closeReceiptDialog() {
+    if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
+    receiptPreviewUrl = null;
+    receiptDialog.close();
+  }
+
+  $("receiptFile").addEventListener("change", () => {
+    const file = $("receiptFile").files?.[0];
+    if (!file) return;
+    if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
+    receiptPreviewUrl = URL.createObjectURL(file);
+    $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
+    $("receiptPreview").classList.remove("hidden");
+  });
+
+  receiptForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const job = findJob(receiptJobId);
+    const file = $("receiptFile").files?.[0];
+    if (!job || !file) {
+      $("receiptFormError").textContent = "Take or choose a receipt photo first.";
+      $("receiptFormError").classList.remove("hidden");
+      return;
+    }
+
+    try {
+      const blob = await compressReceipt(file);
+      const data = new FormData(receiptForm);
+      const receipt = {
+        id: uid(),
+        filename: file.name || `receipt-${Date.now()}.jpg`,
+        vendor: String(data.get("vendor") || "").trim(),
+        amountCents: parseCents(data.get("amount")),
+        createdAt: new Date().toISOString()
+      };
+      await storeReceipt(receipt.id, blob);
+      job.receipts.push(receipt);
+      job.receiptReview = false;
+      saveState();
+      closeReceiptDialog();
+      await renderJob();
+      notify("Receipt filed with this job.");
+    } catch {
+      $("receiptFormError").textContent = "The receipt could not be saved. Check available phone storage and retry.";
+      $("receiptFormError").classList.remove("hidden");
+    }
+  });
+
+  async function viewReceipt(id) {
+    const stored = await getReceipt(id).catch(() => null);
+    if (!stored?.blob) {
+      notify("That receipt image is missing from this phone.", true);
+      return;
+    }
+    const url = URL.createObjectURL(stored.blob);
+    window.open(url, "_blank", "noopener,noreferrer");
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  function createInvoice(job) {
+    if (job.status !== "completed" || !job.receiptReview) {
+      notify("Clock out and review the receipt folder first.", true);
+      return;
+    }
+    const workSeconds = elapsedSeconds(job, "work");
+    const laborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
+    const materialsCents = materialTotal(job);
+    job.invoice = {
+      invoiceNumber: job.id.replace(/^GMM-/, "GMM-INV-"),
+      createdAt: new Date().toISOString(),
+      workSeconds,
+      laborCents,
+      materialsCents,
+      totalCents: laborCents + materialsCents
+    };
+    job.status = "invoiced";
+    saveState();
+    renderJob();
+    notify(`${job.invoice.invoiceNumber} created.`);
+  }
+
+  async function invoiceHtml(job) {
+    const receiptPages = [];
+    for (const [index, receipt] of job.receipts.entries()) {
+      const stored = await getReceipt(receipt.id).catch(() => null);
+      if (!stored?.blob) continue;
+      const dataUrl = await fileToDataUrl(stored.blob);
+      receiptPages.push(`
+        <section class="receipt-page">
+          <p class="eyebrow">Receipt ${index + 1} of ${job.receipts.length}</p>
+          <h2>${escapeHtml(receipt.vendor || receipt.filename)} · ${money(receipt.amountCents)}</h2>
+          <img src="${dataUrl}" alt="Receipt ${index + 1}">
+        </section>`);
+    }
+
+    const materialRowsMarkup = job.materials.map((item) => `
+      <tr>
+        <td>${escapeHtml(item.description)}</td>
+        <td>${Number(item.quantity).toFixed(2).replace(/\.00$/, "")}</td>
+        <td>${money(item.unitCostCents)}</td>
+        <td>${money(Math.round(item.quantity * item.unitCostCents))}</td>
+      </tr>`).join("");
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(job.invoice.invoiceNumber)} — Gold Mobile Mechanic</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;padding:40px;color:#171717;font:14px/1.5 Arial,sans-serif}
+    main,.receipt-page{max-width:820px;margin:0 auto}header{display:flex;justify-content:space-between;border-bottom:4px solid #b48624;padding-bottom:24px}
+    h1{margin:0;font-size:30px;letter-spacing:-.04em}h2{margin:8px 0 20px}.gold{color:#9d7219}.eyebrow{text-transform:uppercase;letter-spacing:.16em;font-weight:700;color:#7a5a18}
+    .meta{text-align:right}.grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin:30px 0}.box{border:1px solid #ddd;border-radius:10px;padding:16px}
+    table{width:100%;border-collapse:collapse;margin:24px 0}th,td{border-bottom:1px solid #ddd;padding:12px 8px;text-align:left}th:last-child,td:last-child{text-align:right}
+    .totals{margin-left:auto;width:320px}.totals div{display:flex;justify-content:space-between;padding:8px 0}.total{border-top:2px solid #171717;font-size:20px;font-weight:800}
+    .notes{margin-top:36px;white-space:pre-wrap}.receipt-page{break-before:page;padding-top:24px}.receipt-page img{max-width:100%;max-height:930px;object-fit:contain;border:1px solid #ddd}
+    @media(max-width:600px){body{padding:22px}.grid{grid-template-columns:1fr}.totals{width:100%}}@media print{body{padding:0}}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow">Gold Mobile Mechanic</p><h1>Service <span class="gold">Invoice</span></h1></div>
+      <div class="meta"><strong>${escapeHtml(job.invoice.invoiceNumber)}</strong><br>${calendarDate(job.invoice.createdAt)}<br>Job ${escapeHtml(job.id)}</div>
+    </header>
+    <div class="grid">
+      <div class="box"><span class="eyebrow">Bill to</span><br><strong>${escapeHtml(job.customerName)}</strong><br>${escapeHtml(job.customerEmail || "Email not provided")}</div>
+      <div class="box"><span class="eyebrow">Vehicle</span><br><strong>${escapeHtml(vehicleName(job))}</strong><br>${escapeHtml(job.vehiclePlate || "No plate recorded")}</div>
+    </div>
+    <div class="box"><span class="eyebrow">Agreed work</span><p>${escapeHtml(job.agreedWork)}</p></div>
+    <table>
+      <thead><tr><th>Service / material</th><th>Qty / hours</th><th>Rate</th><th>Amount</th></tr></thead>
+      <tbody>
+        <tr><td>Mobile mechanic labor</td><td>${(job.invoice.workSeconds / 3600).toFixed(2)} hrs</td><td>${money(job.laborRateCents)}/hr</td><td>${money(job.invoice.laborCents)}</td></tr>
+        ${materialRowsMarkup}
+      </tbody>
+    </table>
+    <div class="totals">
+      <div><span>Labor</span><strong>${money(job.invoice.laborCents)}</strong></div>
+      <div><span>Materials</span><strong>${money(job.invoice.materialsCents)}</strong></div>
+      <div class="total"><span>Total</span><span>${money(job.invoice.totalCents)}</span></div>
+    </div>
+    <div class="notes box"><span class="eyebrow">Mechanic's suggestions</span><p>${escapeHtml(job.suggestions || "No additional suggestions.")}</p></div>
+    <p>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} filed with this invoice.</p>
+  </main>
+  ${receiptPages.join("")}
+</body>
+</html>`;
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+
+  async function invoiceFile(job) {
+    const html = await invoiceHtml(job);
+    return new File([html], `${job.invoice.invoiceNumber}.html`, { type: "text/html" });
+  }
+
+  async function downloadInvoice(job) {
+    const file = await invoiceFile(job);
+    downloadBlob(file, file.name);
+    notify("Invoice downloaded. Open it to print or save as PDF.");
+  }
+
+  async function shareInvoice(job) {
+    const file = await invoiceFile(job);
+    if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
+      try {
+        await navigator.share({
+          title: job.invoice.invoiceNumber,
+          text: `Gold Mobile Mechanic invoice for ${vehicleName(job)}`,
+          files: [file]
+        });
+        return;
+      } catch (error) {
+        if (error?.name === "AbortError") return;
+      }
+    }
+    downloadBlob(file, file.name);
+    notify("Invoice downloaded because file sharing is unavailable here.");
+  }
+
+  function prepareEmail(job) {
+    const recipient = job.customerEmail || "";
+    const subject = `${job.invoice.invoiceNumber} — Gold Mobile Mechanic`;
+    const body = [
+      `Hi ${job.customerName},`,
+      "",
+      `Your Gold Mobile Mechanic invoice for ${vehicleName(job)} is ready.`,
+      `Invoice total: ${money(job.invoice.totalCents)}`,
+      "",
+      "Attach the downloaded invoice file to this message before sending.",
+      "",
+      "Thank you,"
+    ].join("\n");
+    window.location.href = `mailto:${encodeURIComponent(recipient)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  }
+
+  async function backupData() {
+    try {
+      const receiptFiles = [];
+      for (const job of state.jobs) {
+        for (const receipt of job.receipts) {
+          const stored = await getReceipt(receipt.id).catch(() => null);
+          if (stored?.blob) {
+            receiptFiles.push({ id: receipt.id, dataUrl: await fileToDataUrl(stored.blob) });
+          }
+        }
+      }
+      const payload = {
+        app: "Gold Mobile Mechanic",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        state,
+        receiptFiles
+      };
+      const filename = `gold-mobile-mechanic-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      downloadBlob(new Blob([JSON.stringify(payload)], { type: "application/json" }), filename);
+      notify("Full phone backup downloaded.");
+    } catch {
+      notify("The backup could not be created.", true);
+    }
+  }
+
+  async function restoreData(file) {
+    try {
+      const payload = JSON.parse(await file.text());
+      if (payload?.app !== "Gold Mobile Mechanic" || payload?.version !== 1 || !Array.isArray(payload?.state?.jobs)) {
+        throw new Error("Invalid backup");
+      }
+      if (!window.confirm("Replace all Gold Mobile Mechanic jobs and receipts currently saved on this phone?")) return;
+      await clearReceiptStore();
+      for (const receipt of payload.receiptFiles || []) {
+        if (receipt.id && receipt.dataUrl) await storeReceipt(receipt.id, dataUrlToBlob(receipt.dataUrl));
+      }
+      state = payload.state;
+      saveState();
+      showBoard();
+      notify("Backup restored to this phone.");
+    } catch {
+      notify("That file is not a valid Gold Mobile Mechanic backup.", true);
+    } finally {
+      $("restoreInput").value = "";
+    }
+  }
+
+  $("homeButton").addEventListener("click", showBoard);
+  $("newJobButton").addEventListener("click", openJobDialog);
+  $("closeJobDialog").addEventListener("click", closeJobDialog);
+  $("cancelJobButton").addEventListener("click", closeJobDialog);
+  $("addMaterialButton").addEventListener("click", () => addMaterialRow());
+  $("closeReceiptDialog").addEventListener("click", closeReceiptDialog);
+  $("cancelReceiptButton").addEventListener("click", closeReceiptDialog);
+  $("backupButton").addEventListener("click", backupData);
+  $("restoreButton").addEventListener("click", () => $("restoreInput").click());
+  $("restoreInput").addEventListener("change", () => {
+    const file = $("restoreInput").files?.[0];
+    if (file) restoreData(file);
+  });
+
+  [jobDialog, receiptDialog].forEach((dialog) => {
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+  });
+
+  window.addEventListener("hashchange", () => {
+    const match = /^#job\/(.+)$/.exec(window.location.hash);
+    if (match) openJob(decodeURIComponent(match[1]));
+    else if (selectedJobId) showBoard();
+  });
+
+  setInterval(updateLiveTimer, 1000);
+
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
+  }
+
+  saveState();
+  const initialMatch = /^#job\/(.+)$/.exec(window.location.hash);
+  if (initialMatch && findJob(decodeURIComponent(initialMatch[1]))) {
+    openJob(decodeURIComponent(initialMatch[1]));
+  } else {
+    renderBoard();
+  }
+})();

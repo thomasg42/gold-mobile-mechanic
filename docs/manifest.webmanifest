@@ -1,0 +1,12 @@
+{
+  "name": "Gold Mobile Mechanic",
+  "short_name": "Gold Mechanic",
+  "description": "Phone-first job clock, receipt folder, mechanic notes, and invoices.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#101214",
+  "theme_color": "#101214",
+  "orientation": "portrait-primary"
+}

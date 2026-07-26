@@ -1,11 +1,15 @@
 # Gold Mobile Mechanic
 
-Private, mobile-first field app for running vehicle jobs from clock-in through
+Public, installable phone app for running vehicle jobs from clock-in through
 invoice handoff.
 
-- Private app: <https://gold-mobile-mechanic.thomas-g-gutierrez42.chatgpt.site>
-- Private source: <https://github.com/thomasg42/gold-mobile-mechanic>
-- Production data: Cloudflare D1 + R2, provisioned by Sites
+- Public phone app: <https://thomasg42.github.io/gold-mobile-mechanic/>
+- Public source: <https://github.com/thomasg42/gold-mobile-mechanic>
+- Phone data: private browser storage on the device using the app
+
+The GitHub Pages edition is public to open, but its jobs and receipt photos are
+not public. Each browser gets a separate local ledger. Nothing entered into the
+phone app is committed to GitHub or visible to another visitor.
 
 ## Operator workflow
 
@@ -29,25 +33,33 @@ The app does not claim an email was sent before the phone's mail/share sheet
 confirms it. Fully automatic Gmail sending is a separate connected-backend
 feature and must retain the sending authorization gate.
 
+## Put it on a phone
+
+- iPhone: open the public phone-app link in Safari, tap **Share**, then
+  **Add to Home Screen**.
+- Android: open the link in Chrome, open the browser menu, then choose
+  **Install app** or **Add to Home screen**.
+
+Use **Backup data** inside the app before clearing browser data, changing phones,
+or removing the home-screen app. The backup includes jobs and receipt images;
+**Restore** imports that file onto another device.
+
 ## Architecture
 
 | Layer | Implementation |
 |---|---|
-| UI | Next.js App Router client UI in `app/MechanicApp.tsx` |
-| Styling | Product-specific responsive CSS in `app/globals.css` |
-| API | App Router handlers under `app/api/` |
-| Structured state | D1 binding `DB` |
-| Receipt images | R2 binding `RECEIPTS` |
-| Schema | `db/schema.ts` + generated Drizzle migration |
-| Runtime initialization | Idempotent prepared statements in `db/store.ts` |
-| Hosting | Private Sites deployment, owner-only access |
-| Source control | Private GitHub repository, `main` |
+| Public phone UI | Static PWA under `docs/`, hosted by GitHub Pages |
+| Phone job state | `localStorage`, isolated to that browser and device |
+| Phone receipt images | IndexedDB, isolated to that browser and device |
+| Offline shell | Service worker caching the GitHub Pages assets |
+| Server-backed reference | Next.js API routes plus D1/R2 implementation under `app/` and `db/` |
+| Source control | Public GitHub repository, `main` |
 
 ## Source map
 
 ```text
 app/
-  MechanicApp.tsx                 Complete job-board and job-detail UI
+  MechanicApp.tsx                 Server-backed job-board and job-detail UI
   globals.css                     Charcoal, paper, and antique-gold design system
   api/jobs/route.ts               List and create jobs
   api/jobs/[jobId]/route.ts       Read/update suggestions, email, receipt review
@@ -62,6 +74,13 @@ db/
 drizzle/                          Deployable D1 migration
 public/og.png                     Matching charcoal/gold social card
 tests/rendered-html.test.mjs      Product-shell and workflow contract checks
+docs/
+  index.html                      GitHub Pages phone shell
+  styles.css                      Matching responsive charcoal/gold design
+  app.js                          Device-local jobs, timers, receipts, invoices
+  manifest.webmanifest            Home-screen installation metadata
+  sw.js                           Offline application shell
+tests/github-pages.test.mjs       Public phone-edition contract checks
 ```
 
 ## Data model
@@ -94,18 +113,26 @@ Invalid transitions return HTTP `409`. Clock-out is unavailable during a break.
 
 Requirements: Node 22.13 or newer.
 
+Server-backed reference:
+
 ```bash
 npm install
 npm run dev
 ```
 
-The local Cloudflare runtime creates isolated D1/R2 state under ignored
-`.wrangler/` files. Local verification data never ships to production.
+GitHub Pages phone edition:
+
+```bash
+python3 -m http.server 8000 --directory docs
+```
+
+Open `http://localhost:8000`. Local phone-edition data remains in that browser.
 
 ## Validation
 
 ```bash
 npm test
+npm run test:pages
 npx tsc --noEmit
 npm run lint
 npm audit --omit=dev
@@ -121,17 +148,25 @@ Verified on July 26, 2026:
 - Full real API lifecycle passes:
   create → clock in → break start/end → receipt upload/retrieval → suggestions →
   clock out → receipt review → invoice.
-- Remote `main` is private and matches the committed source.
+- The GitHub Pages phone contract covers the same workflow with device-local
+  state, receipt backup/restore, install metadata, and an offline shell.
+- Remote `main` is public and is the source for the GitHub Pages deployment.
+
+## GitHub Pages publishing
+
+GitHub Pages serves `main` from `/docs`. A normal push to `main` updates the
+public phone app after GitHub finishes its Pages build.
 
 ## Reusing this for another service business
 
 1. Copy the repository into a new isolated project.
 2. Change business name, vocabulary, palette, invoice copy, and job fields.
-3. Remove the existing `project_id` from `.openai/hosting.json`. Never reuse this
-   deployment's D1 database or R2 bucket for another business.
-4. Keep logical bindings as `DB` and `RECEIPTS`, or update the runtime and routes
-   together.
-5. Build and run the full lifecycle before deployment.
-6. Create a new private repository and a new owner-only Sites project.
+3. Update both the GitHub Pages files in `docs/` and the server-backed reference
+   when the workflow itself changes.
+4. If the new business only needs one-device use, publish `/docs` through a new
+   GitHub Pages repository.
+5. If multiple devices need shared live records, provision a separate database
+   and receipt bucket. Never reuse another business's storage.
+6. Build and run the full lifecycle before deployment.
 7. Add direct email only through an authorized backend with explicit sending
    controls.

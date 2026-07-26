@@ -18,9 +18,9 @@ test("builds the Gold Mobile Mechanic application shell", async () => {
 });
 
 test("includes the complete mechanic job workflow in source", async () => {
-  const [app, hosting, manifest] = await Promise.all([
+  const [app, viteConfig, manifest] = await Promise.all([
     readFile(new URL("../app/MechanicApp.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
+    readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
     readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
   ]);
 
@@ -36,8 +36,8 @@ test("includes the complete mechanic job workflow in source", async () => {
     assert.match(app, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
 
-  assert.equal(JSON.parse(hosting).d1, "DB");
-  assert.equal(JSON.parse(hosting).r2, "RECEIPTS");
-  assert.match(JSON.parse(hosting).project_id, /^appgprj_/);
+  assert.match(viteConfig, /binding: "DB"/);
+  assert.match(viteConfig, /binding: "RECEIPTS"/);
+  assert.doesNotMatch(viteConfig, /hosting\.json|sites-vite-plugin/);
   assert.equal(JSON.parse(manifest).display, "standalone");
 });

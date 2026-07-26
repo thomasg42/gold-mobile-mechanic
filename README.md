@@ -78,6 +78,7 @@ docs/
   index.html                      GitHub Pages phone shell
   styles.css                      Matching responsive charcoal/gold design
   app.js                          Device-local jobs, timers, receipts, invoices
+  icon-192.png / icon-512.png      Home-screen and install icons
   manifest.webmanifest            Home-screen installation metadata
   sw.js                           Offline application shell
 tests/github-pages.test.mjs       Public phone-edition contract checks

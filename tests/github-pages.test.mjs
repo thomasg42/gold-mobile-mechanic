@@ -16,6 +16,7 @@ test("GitHub Pages phone shell exposes the complete field workflow", async () =>
   assert.match(html, /capture="environment"/);
   assert.match(html, /Backup data/);
   assert.match(html, /manifest\.webmanifest/);
+  assert.match(html, /apple-touch-icon/);
 });
 
 test("phone app keeps data device-local and enforces timer-to-invoice gates", async () => {
@@ -50,6 +51,7 @@ test("Pages assets are project-relative and name GitHub Pages as the public home
   assert.equal(manifest.start_url, "./");
   assert.equal(manifest.scope, "./");
   assert.equal(manifest.display, "standalone");
+  assert.deepEqual(manifest.icons.map((icon) => icon.sizes), ["192x192", "512x512"]);
   assert.match(files[0], /thomasg42\.github\.io\/gold-mobile-mechanic/);
   assert.doesNotMatch(files.join("\n"), /thomas-g-gutierrez42/);
 });

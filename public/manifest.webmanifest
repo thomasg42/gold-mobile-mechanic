@@ -1,0 +1,9 @@
+{
+  "name": "Gold Mobile Mechanic",
+  "short_name": "Gold Mechanic",
+  "description": "Job clock, receipt folder, mechanic notes, and customer invoices.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090b0d",
+  "theme_color": "#090b0d"
+}

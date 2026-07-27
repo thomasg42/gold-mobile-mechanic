@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v3-github-cloud-ledger";
+const CACHE = "gold-mobile-mechanic-v4-owner-pin";
 const APP_SHELL = [
   "./",
   "./index.html",

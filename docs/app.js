@@ -101,7 +101,7 @@
   let state = loadState();
 
   function consumePairingKey() {
-    const match = /^#sync=([A-Za-z0-9_-]{20,})$/.exec(window.location.hash);
+    const match = /^#sync=(\d{6})$/.exec(window.location.hash);
     if (!match) return false;
     localStorage.setItem(SYNC_KEY_STORAGE, match[1]);
     history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
@@ -112,6 +112,32 @@
 
   function syncKey() {
     return localStorage.getItem(SYNC_KEY_STORAGE) || "";
+  }
+
+  function normalizeOwnerPin(value) {
+    const digits = String(value || "").replace(/\D/g, "");
+    return /^\d{6}$/.test(digits) ? digits : "";
+  }
+
+  async function ensureCloudSync() {
+    if (!syncKey()) {
+      const entered = window.prompt("Enter your 6-digit Gold Mobile PIN:");
+      const pin = normalizeOwnerPin(entered);
+      if (!pin) {
+        notify("Cloud sync needs your 6-digit PIN before creating or changing jobs.", true);
+        return false;
+      }
+      localStorage.setItem(SYNC_KEY_STORAGE, pin);
+    }
+    try {
+      await syncFromCloud();
+      return true;
+    } catch (error) {
+      localStorage.removeItem(SYNC_KEY_STORAGE);
+      setSyncStatus("disconnected");
+      notify(error instanceof Error ? error.message : "Cloud sync could not connect. Check the 6-digit PIN.", true);
+      return false;
+    }
   }
 
   function pendingJobIds() {
@@ -284,24 +310,6 @@
     saveState();
     await flushSyncQueue();
     setSyncStatus("synced");
-  }
-
-  async function ensureCloudSync() {
-    if (!syncKey()) {
-      const entered = window.prompt("Enter the Gold Mobile Mechanic owner sync key:");
-      if (!entered?.trim()) {
-        notify("Connect cloud sync before creating or changing jobs.", true);
-        return false;
-      }
-      localStorage.setItem(SYNC_KEY_STORAGE, entered.trim());
-    }
-    try {
-      await syncFromCloud();
-      return true;
-    } catch (error) {
-      notify(error instanceof Error ? error.message : "Cloud sync could not connect.", true);
-      return false;
-    }
   }
 
   function uid() {

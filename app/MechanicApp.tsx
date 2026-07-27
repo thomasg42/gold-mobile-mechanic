@@ -11,6 +11,12 @@ import type { JobRecord, MaterialRecord } from "../db/jobs";
 
 type JobStatus = JobRecord["status"];
 type TimerAction = "clock_in" | "break_start" | "break_end" | "clock_out";
+type PendingTimerMutation = {
+  mutationId: string;
+  jobId: string;
+  action: TimerAction;
+  occurredAt: string;
+};
 type MaterialDraft = {
   id: string;
   description: string;
@@ -57,13 +63,84 @@ const statusCopy: Record<JobStatus, string> = {
   invoiced: "Invoice ready",
 };
 
+const timerEventCopy: Record<TimerAction, string> = {
+  clock_in: "Clocked in",
+  break_start: "Paused job",
+  break_end: "Resumed job",
+  clock_out: "Clocked out",
+};
+
+const JOB_CACHE_KEY = "gold-mobile-mechanic-cloud-cache-v1";
+const PENDING_TIMER_KEY = "gold-mobile-mechanic-pending-timers-v1";
+
+function readJobCache(): JobRecord[] {
+  try {
+    const cached = JSON.parse(localStorage.getItem(JOB_CACHE_KEY) || "[]");
+    if (!Array.isArray(cached)) return [];
+    return cached.map((job) => ({
+      ...job,
+      eventHistory: Array.isArray(job.eventHistory) ? job.eventHistory : [],
+      timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function writeJobCache(jobs: JobRecord[]) {
+  try {
+    localStorage.setItem(JOB_CACHE_KEY, JSON.stringify(jobs));
+  } catch {
+    // The cloud database remains authoritative when phone cache space is full.
+  }
+}
+
+function readPendingTimers(): PendingTimerMutation[] {
+  try {
+    const pending = JSON.parse(localStorage.getItem(PENDING_TIMER_KEY) || "[]");
+    return Array.isArray(pending) ? pending : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingTimers(pending: PendingTimerMutation[]) {
+  localStorage.setItem(PENDING_TIMER_KEY, JSON.stringify(pending));
+}
+
+function removePendingTimer(mutationId: string) {
+  writePendingTimers(
+    readPendingTimers().filter((item) => item.mutationId !== mutationId),
+  );
+}
+
+function queuePendingTimer(mutation: PendingTimerMutation) {
+  const pending = readPendingTimers().filter(
+    (item) => item.mutationId !== mutation.mutationId,
+  );
+  writePendingTimers([...pending, mutation]);
+}
+
+class RequestError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "RequestError";
+    this.status = status;
+  }
+}
+
 async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
   const payload = (await response.json().catch(() => ({}))) as T & {
     error?: string;
   };
   if (!response.ok) {
-    throw new Error(payload.error || "The request could not be completed.");
+    throw new RequestError(
+      payload.error || "The request could not be completed.",
+      response.status,
+    );
   }
   return payload;
 }
@@ -99,6 +176,17 @@ function clockTime(value: string | null) {
   }).format(new Date(value));
 }
 
+function clockDateTime(value: string | null) {
+  if (!value) return "Pending sync";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
 function calendarDate(value: string) {
   return new Intl.DateTimeFormat("en-US", {
     month: "short",
@@ -121,6 +209,106 @@ function vehicleName(job: JobRecord) {
   return [job.vehicleYear, job.vehicleMake, job.vehicleModel]
     .filter(Boolean)
     .join(" ");
+}
+
+function applyTimerLocally(
+  job: JobRecord,
+  mutation: PendingTimerMutation,
+): JobRecord {
+  const timeEntries = job.timeEntries.map((entry) => ({ ...entry }));
+  const openEntry = timeEntries.find((entry) => !entry.endedAt);
+  const entryId = `pending-${mutation.mutationId}`;
+  let status = job.status;
+  let startedAt = job.startedAt;
+  let endedAt = job.endedAt;
+
+  if (mutation.action === "clock_in" && status === "draft") {
+    status = "in_progress";
+    startedAt = mutation.occurredAt;
+    timeEntries.push({
+      id: entryId,
+      kind: "work",
+      startedAt: mutation.occurredAt,
+      endedAt: null,
+    });
+  } else if (mutation.action === "break_start" && status === "in_progress") {
+    if (openEntry) openEntry.endedAt = mutation.occurredAt;
+    status = "on_break";
+    timeEntries.push({
+      id: entryId,
+      kind: "break",
+      startedAt: mutation.occurredAt,
+      endedAt: null,
+    });
+  } else if (mutation.action === "break_end" && status === "on_break") {
+    if (openEntry) openEntry.endedAt = mutation.occurredAt;
+    status = "in_progress";
+    timeEntries.push({
+      id: entryId,
+      kind: "work",
+      startedAt: mutation.occurredAt,
+      endedAt: null,
+    });
+  } else if (mutation.action === "clock_out" && status === "in_progress") {
+    if (openEntry) openEntry.endedAt = mutation.occurredAt;
+    status = "completed";
+    endedAt = mutation.occurredAt;
+  }
+
+  return {
+    ...job,
+    status,
+    startedAt,
+    endedAt,
+    updatedAt: mutation.occurredAt,
+    timeEntries,
+    eventHistory: [
+      ...(job.eventHistory || []),
+      {
+        id: entryId,
+        action: mutation.action,
+        occurredAt: mutation.occurredAt,
+      },
+    ],
+  };
+}
+
+function clockHistory(job: JobRecord) {
+  if (job.eventHistory?.length) return job.eventHistory;
+  const events: JobRecord["eventHistory"] = [];
+  const firstWork = job.timeEntries.find((entry) => entry.kind === "work");
+  if (firstWork) {
+    events.push({
+      id: `${firstWork.id}-clock-in`,
+      action: "clock_in",
+      occurredAt: firstWork.startedAt,
+    });
+  }
+  for (const entry of job.timeEntries.filter((item) => item.kind === "break")) {
+    events.push({
+      id: `${entry.id}-break-start`,
+      action: "break_start",
+      occurredAt: entry.startedAt,
+    });
+    if (entry.endedAt) {
+      events.push({
+        id: `${entry.id}-break-end`,
+        action: "break_end",
+        occurredAt: entry.endedAt,
+      });
+    }
+  }
+  if (job.endedAt) {
+    events.push({
+      id: `${job.id}-clock-out`,
+      action: "clock_out",
+      occurredAt: job.endedAt,
+    });
+  }
+  return events.sort(
+    (left, right) =>
+      Date.parse(left.occurredAt) - Date.parse(right.occurredAt),
+  );
 }
 
 function escapeHtml(value: string) {
@@ -266,6 +454,8 @@ export function MechanicApp() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [syncLabel, setSyncLabel] = useState("Connecting to cloud…");
+  const [pendingCount, setPendingCount] = useState(0);
 
   const selected = jobs.find((job) => job.id === selectedId) ?? null;
 
@@ -275,31 +465,110 @@ export function MechanicApp() {
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    requestJson<{ jobs: JobRecord[] }>("/api/jobs")
-      .then((payload) => {
-        if (!cancelled) setJobs(payload.jobs);
-      })
-      .catch((loadError: unknown) => {
-        if (!cancelled) {
+    let active = true;
+    const cacheTimer = window.setTimeout(() => {
+      const cached = readJobCache();
+      if (cached.length) {
+        setJobs(cached);
+        setLoading(false);
+        setSyncLabel("Saved copy · checking cloud…");
+      }
+      setPendingCount(readPendingTimers().length);
+    }, 0);
+
+    async function refreshFromCloud() {
+      if (!active) return;
+      setSyncLabel("Syncing with cloud…");
+      for (const mutation of readPendingTimers()) {
+        try {
+          const payload = await requestJson<{ job: JobRecord }>(
+            `/api/jobs/${encodeURIComponent(mutation.jobId)}/timer`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(mutation),
+            },
+          );
+          removePendingTimer(mutation.mutationId);
+          setJobs((current) => {
+            const next = current.some((item) => item.id === payload.job.id)
+              ? current.map((item) =>
+                  item.id === payload.job.id ? payload.job : item,
+                )
+              : [payload.job, ...current];
+            writeJobCache(next);
+            return next;
+          });
+        } catch (syncError) {
+          if (syncError instanceof TypeError || !navigator.onLine) break;
+          if (syncError instanceof RequestError && syncError.status >= 500) {
+            break;
+          }
+          removePendingTimer(mutation.mutationId);
+        }
+      }
+      setPendingCount(readPendingTimers().length);
+
+      try {
+        const payload = await requestJson<{ jobs: JobRecord[] }>("/api/jobs", {
+          cache: "no-store",
+        });
+        if (!active) return;
+        setJobs(payload.jobs);
+        writeJobCache(payload.jobs);
+        setSyncLabel(
+          readPendingTimers().length ? "Phone changes pending" : "Cloud saved",
+        );
+      } catch (loadError) {
+        if (!active) return;
+        const hasSavedCopy = readJobCache().length > 0;
+        setSyncLabel(
+          hasSavedCopy
+            ? "Offline · showing saved copy"
+            : "Cloud connection unavailable",
+        );
+        if (!hasSavedCopy) {
           setError(
-            loadError instanceof Error ? loadError.message : "Could not load jobs.",
+            loadError instanceof Error
+              ? loadError.message
+              : "Could not load jobs.",
           );
         }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    const resume = () => {
+      if (document.visibilityState === "visible") void refreshFromCloud();
+    };
+    void refreshFromCloud();
+    window.addEventListener("online", refreshFromCloud);
+    window.addEventListener("pageshow", refreshFromCloud);
+    document.addEventListener("visibilitychange", resume);
+    const refreshTimer = window.setInterval(refreshFromCloud, 60_000);
+    if ("serviceWorker" in navigator) {
+      void navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+
     return () => {
-      cancelled = true;
+      active = false;
+      window.removeEventListener("online", refreshFromCloud);
+      window.removeEventListener("pageshow", refreshFromCloud);
+      document.removeEventListener("visibilitychange", resume);
+      window.clearInterval(refreshTimer);
+      window.clearTimeout(cacheTimer);
     };
   }, []);
 
   function replaceJob(job: JobRecord) {
     setJobs((current) => {
       const exists = current.some((item) => item.id === job.id);
-      if (!exists) return [job, ...current];
-      return current.map((item) => (item.id === job.id ? job : item));
+      const next = exists
+        ? current.map((item) => (item.id === job.id ? job : item))
+        : [job, ...current];
+      writeJobCache(next);
+      return next;
     });
   }
 
@@ -311,6 +580,15 @@ export function MechanicApp() {
       break_end: "ending break",
       clock_out: "clocking out",
     }[action];
+    const mutation: PendingTimerMutation = {
+      mutationId: crypto.randomUUID(),
+      jobId: selected.id,
+      action,
+      occurredAt: new Date().toISOString(),
+    };
+    queuePendingTimer(mutation);
+    setPendingCount(readPendingTimers().length);
+    setSyncLabel("Saving clock history…");
     setBusy(action);
     setError(null);
     try {
@@ -319,17 +597,36 @@ export function MechanicApp() {
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ action }),
+          body: JSON.stringify(mutation),
         },
       );
+      removePendingTimer(mutation.mutationId);
+      setPendingCount(readPendingTimers().length);
       replaceJob(payload.job);
+      setSyncLabel("Cloud saved");
       setNotice(
         action === "clock_out"
           ? "Job clocked out. Review the receipts to unlock the invoice."
           : `Done ${actionLabel}.`,
       );
     } catch (actionError) {
-      setError(actionError instanceof Error ? actionError.message : "Timer update failed.");
+      if (actionError instanceof TypeError || !navigator.onLine) {
+        replaceJob(applyTimerLocally(selected, mutation));
+        setPendingCount(readPendingTimers().length);
+        setSyncLabel("Saved on phone · sync pending");
+        setNotice(
+          "Clock history saved on this phone. It will sync to the cloud when service returns.",
+        );
+      } else {
+        removePendingTimer(mutation.mutationId);
+        setPendingCount(readPendingTimers().length);
+        setSyncLabel("Cloud save needs attention");
+        setError(
+          actionError instanceof Error
+            ? actionError.message
+            : "Timer update failed.",
+        );
+      }
     } finally {
       setBusy(null);
     }
@@ -416,8 +713,10 @@ export function MechanicApp() {
           </span>
         </button>
         <div className="topbar-meta">
-          <span className="signal-dot" />
-          <span>Private work log</span>
+          <span
+            className={`signal-dot ${pendingCount ? "signal-dot-pending" : ""}`}
+          />
+          <span>{pendingCount ? `${pendingCount} pending · ${syncLabel}` : syncLabel}</span>
         </div>
       </header>
 
@@ -1173,17 +1472,21 @@ function JobWorkspace({
             </dl>
           </section>
           <section className="side-card timeline-card">
-            <p className="eyebrow">Time log</p>
-            {job.timeEntries.length ? (
+            <p className="eyebrow">Clock history</p>
+            {clockHistory(job).length ? (
               <ol className="timeline">
-                {job.timeEntries.map((entry) => (
-                  <li key={entry.id}>
-                    <i className={`timeline-dot timeline-${entry.kind}`} />
+                {clockHistory(job).map((event) => (
+                  <li key={event.id}>
+                    <i
+                      className={`timeline-dot ${
+                        event.action === "break_start"
+                          ? "timeline-break"
+                          : "timeline-work"
+                      }`}
+                    />
                     <div>
-                      <strong>{entry.kind === "work" ? "Work" : "Break"}</strong>
-                      <span>
-                        {clockTime(entry.startedAt)} → {clockTime(entry.endedAt)}
-                      </span>
+                      <strong>{timerEventCopy[event.action]}</strong>
+                      <span>{clockDateTime(event.occurredAt)}</span>
                     </div>
                   </li>
                 ))}
@@ -1191,6 +1494,11 @@ function JobWorkspace({
             ) : (
               <p className="side-empty">The first clock-in starts the time log.</p>
             )}
+            <p className="side-empty">
+              {job.timeEntries.length} saved work/break interval
+              {job.timeEntries.length === 1 ? "" : "s"} · {shortDuration(workSeconds)} work ·{" "}
+              {shortDuration(breakSeconds)} paused
+            </p>
           </section>
         </aside>
       </div>

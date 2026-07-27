@@ -22,6 +22,7 @@ export type JobRecord = {
   materials: MaterialRecord[];
   receipts: ReceiptRecord[];
   timeEntries: TimeEntryRecord[];
+  eventHistory: JobEventRecord[];
   invoice: InvoiceRecord | null;
 };
 
@@ -47,6 +48,12 @@ export type TimeEntryRecord = {
   kind: "work" | "break";
   startedAt: string;
   endedAt: string | null;
+};
+
+export type JobEventRecord = {
+  id: string;
+  action: "clock_in" | "break_start" | "break_end" | "clock_out";
+  occurredAt: string;
 };
 
 export type InvoiceRecord = {
@@ -79,11 +86,17 @@ function elapsedSeconds(startedAt: string, endedAt: string | null) {
 export async function hydrateJob(jobRow: Row): Promise<JobRecord> {
   const db = await getDatabase();
   const jobId = stringValue(jobRow.id);
-  const [timeResult, materialResult, receiptResult, invoiceRow] =
+  const [timeResult, eventResult, materialResult, receiptResult, invoiceRow] =
     await Promise.all([
       db
         .prepare(
           "SELECT id, kind, started_at, ended_at FROM time_entries WHERE job_id = ? ORDER BY started_at ASC",
+        )
+        .bind(jobId)
+        .all<Row>(),
+      db
+        .prepare(
+          "SELECT id, action, occurred_at FROM job_events WHERE job_id = ? ORDER BY occurred_at ASC, rowid ASC",
         )
         .bind(jobId)
         .all<Row>(),
@@ -160,6 +173,11 @@ export async function hydrateJob(jobRow: Row): Promise<JobRecord> {
       url: `/api/receipts/${encodeURIComponent(stringValue(row.id))}`,
     })),
     timeEntries,
+    eventHistory: (eventResult.results ?? []).map((row: Row) => ({
+      id: stringValue(row.id),
+      action: stringValue(row.action) as JobEventRecord["action"],
+      occurredAt: stringValue(row.occurred_at),
+    })),
     invoice: invoiceRow
       ? {
           id: stringValue(invoiceRow.id),

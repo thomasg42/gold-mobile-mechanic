@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "gold-mobile-mechanic-sync",
+  "main": "sync-worker/index.ts",
+  "compatibility_date": "2026-07-26",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gold-mobile-mechanic-sync",
+      "database_id": "abe1e162-78f5-4d25-917c-a310d14145ac",
+      "migrations_dir": "sync-worker/migrations"
+    }
+  ]
+}

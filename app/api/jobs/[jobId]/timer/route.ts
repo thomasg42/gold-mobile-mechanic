@@ -4,14 +4,44 @@ import { getJob } from "../../../../../db/jobs";
 type RouteContext = { params: Promise<{ jobId: string }> };
 type TimerAction = "clock_in" | "break_start" | "break_end" | "clock_out";
 
+function eventTime(value: unknown, jobCreatedAt: string) {
+  if (typeof value !== "string") return new Date().toISOString();
+  const parsed = Date.parse(value);
+  const earliest = Date.parse(jobCreatedAt) - 5 * 60 * 1000;
+  const latest = Date.now() + 5 * 60 * 1000;
+  if (!Number.isFinite(parsed) || parsed < earliest || parsed > latest) {
+    return new Date().toISOString();
+  }
+  return new Date(parsed).toISOString();
+}
+
 export async function POST(request: Request, context: RouteContext) {
   try {
     const { jobId } = await context.params;
-    const payload = (await request.json()) as { action?: TimerAction };
+    const payload = (await request.json()) as {
+      action?: TimerAction;
+      mutationId?: string;
+      occurredAt?: string;
+    };
     const action = payload.action;
     const job = await getJob(jobId);
     if (!job) {
       return Response.json({ error: "Job not found." }, { status: 404 });
+    }
+
+    const mutationId =
+      typeof payload.mutationId === "string" && payload.mutationId.length >= 8
+        ? payload.mutationId.slice(0, 128)
+        : crypto.randomUUID();
+    const db = await getDatabase();
+    const existingMutation = await db
+      .prepare(
+        "SELECT id FROM job_events WHERE job_id = ? AND mutation_id = ? LIMIT 1",
+      )
+      .bind(jobId, mutationId)
+      .first();
+    if (existingMutation) {
+      return Response.json({ job: await getJob(jobId), replayed: true });
     }
 
     const allowed: Record<TimerAction, string[]> = {
@@ -27,9 +57,15 @@ export async function POST(request: Request, context: RouteContext) {
       );
     }
 
-    const db = await getDatabase();
-    const now = new Date().toISOString();
+    const now = eventTime(payload.occurredAt, job.createdAt);
     const entryId = crypto.randomUUID();
+    const eventStatement = action
+      ? db
+          .prepare(
+            "INSERT INTO job_events (id, job_id, action, occurred_at, mutation_id) VALUES (?, ?, ?, ?, ?)",
+          )
+          .bind(crypto.randomUUID(), jobId, action, now, mutationId)
+      : null;
 
     if (action === "clock_in") {
       await db.batch([
@@ -43,6 +79,7 @@ export async function POST(request: Request, context: RouteContext) {
             "INSERT INTO time_entries (id, job_id, kind, started_at) VALUES (?, ?, 'work', ?)",
           )
           .bind(entryId, jobId, now),
+        eventStatement!,
       ]);
     }
 
@@ -63,6 +100,7 @@ export async function POST(request: Request, context: RouteContext) {
             "UPDATE jobs SET status = 'on_break', updated_at = ? WHERE id = ?",
           )
           .bind(now, jobId),
+        eventStatement!,
       ]);
     }
 
@@ -83,6 +121,7 @@ export async function POST(request: Request, context: RouteContext) {
             "UPDATE jobs SET status = 'in_progress', updated_at = ? WHERE id = ?",
           )
           .bind(now, jobId),
+        eventStatement!,
       ]);
     }
 
@@ -98,6 +137,7 @@ export async function POST(request: Request, context: RouteContext) {
             "UPDATE jobs SET status = 'completed', ended_at = ?, updated_at = ? WHERE id = ?",
           )
           .bind(now, now, jobId),
+        eventStatement!,
       ]);
     }
 

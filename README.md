@@ -1,23 +1,27 @@
 # Gold Mobile Mechanic
 
-Public, installable phone app for running vehicle jobs from clock-in through
+Installable GitHub Pages app for running vehicle jobs from clock-in through
 invoice handoff.
 
-- Public phone app: <https://thomasg42.github.io/gold-mobile-mechanic/>
+- Canonical live app: <https://thomasg42.github.io/gold-mobile-mechanic/>
 - Public source: <https://github.com/thomasg42/gold-mobile-mechanic>
-- Phone data: private browser storage on the device using the app
+- Job/time data: private Cloudflare D1 ledger behind an authenticated sync API
+- Receipt images: private D1 receipt records, cached in IndexedDB on each phone
 
-The GitHub Pages edition is public to open, but its jobs and receipt photos are
-not public. Each browser gets a separate local ledger. Nothing entered into the
-phone app is committed to GitHub or visible to another visitor.
+GitHub Pages is the only user-facing app URL. Its private sync key is saved only
+on connected devices and sent to the hidden API as an authorization header; it
+is never committed to GitHub. D1 is the source of truth for jobs, timer
+intervals, append-only clock events, and receipt files. Each phone keeps a
+last-known recovery copy and queues changes while offline.
 
 ## Operator workflow
 
-1. Create a job with the customer, vehicle, labor rate, agreed work, and
-   approved materials. The server assigns a durable
+1. Create a job in the GitHub app with the customer, vehicle, labor rate,
+   agreed work, and approved materials. The server assigns a durable
    `GMM-YYYYMMDD-XXXX` job ID.
-2. Clock in. Start and end breaks as needed. Each transition closes the current
-   time entry and opens the next one, so only work intervals are billable.
+2. Clock in. Pause/resume as needed. Every action writes both the current
+   interval and an append-only clock-history event. A unique mutation ID makes
+   retries safe if mobile service drops after the server receives an action.
 3. Take receipt photos from the phone camera. Images are stored under
    `jobs/{jobId}/receipts/` and their vendor, amount, filename, MIME type, and
    timestamp are stored with the job.
@@ -33,26 +37,29 @@ The app does not claim an email was sent before the phone's mail/share sheet
 confirms it. Fully automatic Gmail sending is a separate connected-backend
 feature and must retain the sending authorization gate.
 
-## Put it on a phone
+## Put the GitHub app on a phone
 
-- iPhone: open the public phone-app link in Safari, tap **Share**, then
+- iPhone: open the paired GitHub Pages link in Safari, tap **Share**, then
   **Add to Home Screen**.
-- Android: open the link in Chrome, open the browser menu, then choose
+- Android: open the paired GitHub Pages link in Chrome, open the browser
+  menu, then choose
   **Install app** or **Add to Home screen**.
 
-Use **Backup data** inside the app before clearing browser data, changing phones,
-or removing the home-screen app. The backup includes jobs and receipt images;
-**Restore** imports that file onto another device.
+The pairing fragment is stripped immediately after the key is stored locally.
+The cloud ledger then returns after reloads, app restarts, deployments, and
+device changes. **Backup data** remains available as a second recovery path.
 
 ## Architecture
 
 | Layer | Implementation |
 |---|---|
-| Public phone UI | Static PWA under `docs/`, hosted by GitHub Pages |
-| Phone job state | `localStorage`, isolated to that browser and device |
-| Phone receipt images | IndexedDB, isolated to that browser and device |
-| Offline shell | Service worker caching the GitHub Pages assets |
-| Server-backed reference | Next.js API routes plus D1/R2 implementation under `app/` and `db/` |
+| Canonical phone UI | Static PWA under `docs/`, hosted by GitHub Pages |
+| Private sync API | Cloudflare Worker; implementation endpoint, never the app URL |
+| Authoritative job state | Private D1 records, one JSON ledger per job |
+| Authoritative receipt images | Private D1 receipt records |
+| Mobile recovery | LocalStorage/IndexedDB cache plus pending job and receipt queues |
+| Clock history | Time intervals plus append-only `eventHistory` records |
+| Offline shell | Service worker; queued changes replay when online |
 | Source control | Public GitHub repository, `main` |
 
 ## Source map
@@ -75,13 +82,17 @@ drizzle/                          Deployable D1 migration
 public/og.png                     Matching charcoal/gold social card
 tests/rendered-html.test.mjs      Product-shell and workflow contract checks
 docs/
-  index.html                      GitHub Pages phone shell
+  index.html                      Canonical GitHub Pages phone shell
   styles.css                      Matching responsive charcoal/gold design
-  app.js                          Device-local jobs, timers, receipts, invoices
+  app.js                          Cloud sync, offline recovery, timers, receipts, invoices
   icon-192.png / icon-512.png      Home-screen and install icons
   manifest.webmanifest            Home-screen installation metadata
   sw.js                           Offline application shell
 tests/github-pages.test.mjs       Public phone-edition contract checks
+sync-worker/
+  index.ts                        Authenticated jobs and receipts API
+  migrations/                     Private durable D1 schema
+wrangler.sync.jsonc               Backend deployment configuration
 ```
 
 ## Data model
@@ -89,8 +100,10 @@ tests/github-pages.test.mjs       Public phone-edition contract checks
 - `jobs`: customer, vehicle, labor rate, agreed work, suggestions, status,
   receipt-review flag, start/end timestamps.
 - `time_entries`: `work` or `break`, with independent start/end timestamps.
+- `eventHistory`: append-only clock-in, pause, resume, and clock-out records
+  stored with each synchronized job.
 - `materials`: agreed description, quantity, and unit cost.
-- `receipts`: job ownership, R2 object key, filename, MIME type, vendor, amount,
+- `receipts`: job ownership, image bytes, MIME type, filename, vendor, amount,
   and timestamp.
 - `invoices`: one invoice per job, calculated labor/material/total cents,
   recipient email, status, and timestamp.
@@ -127,7 +140,7 @@ GitHub Pages phone edition:
 python3 -m http.server 8000 --directory docs
 ```
 
-Open `http://localhost:8000`. Local phone-edition data remains in that browser.
+Open `http://localhost:8000`. Localhost is allowed by the sync API for testing.
 
 ## Validation
 
@@ -149,14 +162,18 @@ Verified on July 26, 2026:
 - Full real API lifecycle passes:
   create → clock in → break start/end → receipt upload/retrieval → suggestions →
   clock out → receipt review → invoice.
-- The GitHub Pages phone contract covers the same workflow with device-local
-  state, receipt backup/restore, install metadata, and an offline shell.
-- Remote `main` is public and is the source for the GitHub Pages deployment.
+- The GitHub Pages contract covers authenticated cloud persistence, device-local
+  recovery, receipt backup/restore, clock history, install metadata, and an
+  offline shell.
+- The pause/restart test creates a job, clocks in, pauses, fully restarts the
+  runtime, verifies the open break and history, resumes, clocks out, restarts
+  again, and verifies all four clock events and all three intervals.
 
-## GitHub Pages publishing
+## Publishing
 
-GitHub Pages serves `main` from `/docs`. A normal push to `main` updates the
-public phone app after GitHub finishes its Pages build.
+GitHub Pages serves the only live app from `main:/docs`. The Worker is a hidden,
+authenticated persistence API and must not be presented as a user-facing URL.
+A normal push to `main` publishes the app after GitHub finishes its Pages build.
 
 ## Reusing this for another service business
 
@@ -164,10 +181,9 @@ public phone app after GitHub finishes its Pages build.
 2. Change business name, vocabulary, palette, invoice copy, and job fields.
 3. Update both the GitHub Pages files in `docs/` and the server-backed reference
    when the workflow itself changes.
-4. If the new business only needs one-device use, publish `/docs` through a new
-   GitHub Pages repository.
-5. If multiple devices need shared live records, provision a separate database
-   and receipt bucket. Never reuse another business's storage.
+4. Publish `/docs` through a new GitHub Pages repository.
+5. Provision a separate Worker, database, and sync secret. Never reuse another
+   business's storage or credentials.
 6. Build and run the full lifecycle before deployment.
 7. Add direct email only through an authorized backend with explicit sending
    controls.

@@ -15,11 +15,13 @@ test("GitHub Pages phone shell exposes the complete field workflow", async () =>
   assert.match(html, /Approved materials/);
   assert.match(html, /capture="environment"/);
   assert.match(html, /Backup data/);
+  assert.match(html, /Permanent cloud ledger/);
+  assert.match(html, /Sync now/);
   assert.match(html, /manifest\.webmanifest/);
   assert.match(html, /apple-touch-icon/);
 });
 
-test("phone app keeps data device-local and enforces timer-to-invoice gates", async () => {
+test("GitHub phone app syncs durable jobs, receipts, and clock history", async () => {
   const script = await read("docs/app.js");
 
   assert.match(script, /localStorage/);
@@ -35,6 +37,13 @@ test("phone app keeps data device-local and enforces timer-to-invoice gates", as
   assert.match(script, /mailto:/);
   assert.match(script, /backupData/);
   assert.match(script, /serviceWorker\.register/);
+  assert.match(script, /SYNC_API/);
+  assert.match(script, /Authorization/);
+  assert.match(script, /PENDING_JOBS_STORAGE/);
+  assert.match(script, /PENDING_RECEIPTS_STORAGE/);
+  assert.match(script, /eventHistory/);
+  assert.match(script, /Clock history/);
+  assert.doesNotMatch(script, /CLOUD_APP_URL|chatgpt\.site/);
 });
 
 test("Pages assets are project-relative and name GitHub Pages as the public home", async () => {
@@ -53,5 +62,5 @@ test("Pages assets are project-relative and name GitHub Pages as the public home
   assert.equal(manifest.display, "standalone");
   assert.deepEqual(manifest.icons.map((icon) => icon.sizes), ["192x192", "512x512"]);
   assert.match(files[0], /thomasg42\.github\.io\/gold-mobile-mechanic/);
-  assert.doesNotMatch(files.join("\n"), /thomas-g-gutierrez42/);
+  assert.doesNotMatch(files.join("\n"), /chatgpt\.site/);
 });

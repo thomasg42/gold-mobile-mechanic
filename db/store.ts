@@ -64,6 +64,19 @@ async function initializeSchema(db: D1Database) {
       ),
     db
       .prepare(
+        `CREATE TABLE IF NOT EXISTS job_events (
+          id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL,
+          action TEXT NOT NULL CHECK (
+            action IN ('clock_in', 'break_start', 'break_end', 'clock_out')
+          ),
+          occurred_at TEXT NOT NULL,
+          mutation_id TEXT NOT NULL UNIQUE,
+          FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )`,
+      ),
+    db
+      .prepare(
         `CREATE TABLE IF NOT EXISTS materials (
           id TEXT PRIMARY KEY,
           job_id TEXT NOT NULL,
@@ -104,6 +117,9 @@ async function initializeSchema(db: D1Database) {
       ),
     db.prepare(
       "CREATE INDEX IF NOT EXISTS time_entries_job_idx ON time_entries(job_id)",
+    ),
+    db.prepare(
+      "CREATE INDEX IF NOT EXISTS job_events_job_idx ON job_events(job_id, occurred_at)",
     ),
     db.prepare(
       "CREATE INDEX IF NOT EXISTS materials_job_idx ON materials(job_id)",

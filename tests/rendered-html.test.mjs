@@ -18,10 +18,17 @@ test("builds the Gold Mobile Mechanic application shell", async () => {
 });
 
 test("includes the complete mechanic job workflow in source", async () => {
-  const [app, viteConfig, manifest] = await Promise.all([
+  const [app, viteConfig, manifest, store, timer, serviceWorker, syncWorker] = await Promise.all([
     readFile(new URL("../app/MechanicApp.tsx", import.meta.url), "utf8"),
     readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
     readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
+    readFile(new URL("../db/store.ts", import.meta.url), "utf8"),
+    readFile(
+      new URL("../app/api/jobs/[jobId]/timer/route.ts", import.meta.url),
+      "utf8",
+    ),
+    readFile(new URL("../public/sw.js", import.meta.url), "utf8"),
+    readFile(new URL("../sync-worker/index.ts", import.meta.url), "utf8"),
   ]);
 
   for (const required of [
@@ -39,5 +46,15 @@ test("includes the complete mechanic job workflow in source", async () => {
   assert.match(viteConfig, /binding: "DB"/);
   assert.match(viteConfig, /binding: "RECEIPTS"/);
   assert.doesNotMatch(viteConfig, /hosting\.json|sites-vite-plugin/);
+  assert.match(app, /JOB_CACHE_KEY/);
+  assert.match(app, /PENDING_TIMER_KEY/);
+  assert.match(app, /Clock history/);
+  assert.match(store, /CREATE TABLE IF NOT EXISTS job_events/);
+  assert.match(timer, /mutationId/);
+  assert.match(timer, /replayed: true/);
+  assert.match(serviceWorker, /url\.pathname\.startsWith\("\/api\/"\)/);
+  assert.match(syncWorker, /GITHUB_ORIGIN/);
+  assert.match(syncWorker, /eventHistory/);
+  assert.match(syncWorker, /DELETE/);
   assert.equal(JSON.parse(manifest).display, "standalone");
 });

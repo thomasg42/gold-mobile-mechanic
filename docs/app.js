@@ -4,6 +4,10 @@
   const STORAGE_KEY = "gold-mobile-mechanic-phone-v1";
   const RECEIPT_DB = "gold-mobile-mechanic-receipts";
   const RECEIPT_STORE = "receipts";
+  const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
+  const SYNC_KEY_STORAGE = "gold-mobile-mechanic-sync-key-v1";
+  const PENDING_JOBS_STORAGE = "gold-mobile-mechanic-pending-jobs-v1";
+  const PENDING_RECEIPTS_STORAGE = "gold-mobile-mechanic-pending-receipts-v1";
   const STATUS_COPY = {
     draft: "Ready",
     in_progress: "On the clock",
@@ -27,11 +31,67 @@
   let receiptPreviewUrl = null;
   let activeObjectUrls = [];
   let toastTimer = null;
+  let syncInFlight = null;
+
+  function arrayFromStorage(key) {
+    try {
+      const value = JSON.parse(localStorage.getItem(key) || "[]");
+      return Array.isArray(value) ? value : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function writeStorageArray(key, values) {
+    localStorage.setItem(key, JSON.stringify(values));
+  }
+
+  function derivedEventHistory(job) {
+    const entries = [...(job.timeEntries || [])]
+      .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
+    const events = [];
+    entries.forEach((entry, index) => {
+      const action = entry.kind === "break"
+        ? "break_start"
+        : index === 0
+          ? "clock_in"
+          : "break_end";
+      events.push({
+        id: `legacy-${job.id}-${action}-${entry.startedAt}`,
+        action,
+        occurredAt: entry.startedAt
+      });
+    });
+    if (job.endedAt) {
+      events.push({
+        id: `legacy-${job.id}-clock_out-${job.endedAt}`,
+        action: "clock_out",
+        occurredAt: job.endedAt
+      });
+    }
+    return events;
+  }
+
+  function normalizeJob(job) {
+    const normalized = {
+      ...job,
+      materials: Array.isArray(job.materials) ? job.materials : [],
+      timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
+      receipts: Array.isArray(job.receipts) ? job.receipts : [],
+      eventHistory: Array.isArray(job.eventHistory) && job.eventHistory.length
+        ? job.eventHistory
+        : derivedEventHistory(job)
+    };
+    normalized.updatedAt = normalized.updatedAt || normalized.createdAt || new Date().toISOString();
+    return normalized;
+  }
 
   function loadState() {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-      if (saved && saved.version === 1 && Array.isArray(saved.jobs)) return saved;
+      if (saved && saved.version === 1 && Array.isArray(saved.jobs)) {
+        return { ...saved, jobs: saved.jobs.map(normalizeJob) };
+      }
     } catch {
       // A malformed local value should never prevent the app from opening.
     }
@@ -40,9 +100,208 @@
 
   let state = loadState();
 
+  function consumePairingKey() {
+    const match = /^#sync=([A-Za-z0-9_-]{20,})$/.exec(window.location.hash);
+    if (!match) return false;
+    localStorage.setItem(SYNC_KEY_STORAGE, match[1]);
+    history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    return true;
+  }
+
+  const pairedFromUrl = consumePairingKey();
+
+  function syncKey() {
+    return localStorage.getItem(SYNC_KEY_STORAGE) || "";
+  }
+
+  function pendingJobIds() {
+    return arrayFromStorage(PENDING_JOBS_STORAGE).filter((id) => typeof id === "string");
+  }
+
+  function pendingReceipts() {
+    return arrayFromStorage(PENDING_RECEIPTS_STORAGE)
+      .filter((item) => item && typeof item.jobId === "string" && typeof item.receiptId === "string");
+  }
+
+  function setSyncStatus(mode, detail) {
+    const label = $("storageLabel");
+    const dot = $("syncDot");
+    if (!label || !dot) return;
+    const count = `${state.jobs.length} job${state.jobs.length === 1 ? "" : "s"}`;
+    const copy = {
+      synced: `Cloud synced · ${count}`,
+      syncing: `Syncing · ${count}`,
+      pending: `Saved offline · ${count}`,
+      disconnected: `Cloud not connected · ${count}`,
+      error: `Sync needs attention · ${count}`
+    };
+    label.textContent = detail || copy[mode] || copy.disconnected;
+    dot.dataset.sync = mode;
+  }
+
   function saveState() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    $("storageLabel").textContent = `${state.jobs.length} job${state.jobs.length === 1 ? "" : "s"} on this phone`;
+    if (!syncKey()) setSyncStatus("disconnected");
+    else if (pendingJobIds().length || pendingReceipts().length) {
+      setSyncStatus(navigator.onLine ? "syncing" : "pending");
+    }
+  }
+
+  function replaceJob(job) {
+    const normalized = normalizeJob(job);
+    const index = state.jobs.findIndex((item) => item.id === normalized.id);
+    if (index === -1) state.jobs.push(normalized);
+    else state.jobs[index] = normalized;
+  }
+
+  function queueJobSync(job) {
+    job.updatedAt = new Date().toISOString();
+    const ids = new Set(pendingJobIds());
+    ids.add(job.id);
+    writeStorageArray(PENDING_JOBS_STORAGE, [...ids]);
+    saveState();
+    void flushSyncQueue().catch(() => {});
+  }
+
+  function queueReceiptSync(jobIdValue, receiptId) {
+    const pending = pendingReceipts();
+    if (!pending.some((item) => item.jobId === jobIdValue && item.receiptId === receiptId)) {
+      pending.push({ jobId: jobIdValue, receiptId });
+      writeStorageArray(PENDING_RECEIPTS_STORAGE, pending);
+    }
+    saveState();
+    void flushSyncQueue().catch(() => {});
+  }
+
+  async function cloudFetch(path, options = {}) {
+    const key = syncKey();
+    if (!key) throw new Error("Cloud sync is not connected.");
+    const headers = new Headers(options.headers || {});
+    headers.set("Authorization", `Bearer ${key}`);
+    const response = await fetch(`${SYNC_API}${path}`, {
+      ...options,
+      cache: "no-store",
+      headers
+    });
+    if (!response.ok) {
+      let message = `Cloud sync failed (${response.status}).`;
+      try {
+        const payload = await response.json();
+        if (payload?.error) message = payload.error;
+      } catch {
+        // Keep the status-based message when the response is not JSON.
+      }
+      throw new Error(message);
+    }
+    return response;
+  }
+
+  async function flushSyncQueue() {
+    if (syncInFlight) return syncInFlight;
+    if (!navigator.onLine || !syncKey()) {
+      setSyncStatus(syncKey() ? "pending" : "disconnected");
+      return;
+    }
+
+    syncInFlight = (async () => {
+      setSyncStatus("syncing");
+      try {
+        let jobIds = pendingJobIds();
+        for (const id of jobIds) {
+          const job = findJob(id);
+          if (!job) continue;
+          const response = await cloudFetch(`/api/jobs/${encodeURIComponent(id)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(job)
+          });
+          const payload = await response.json();
+          replaceJob(payload.job);
+          jobIds = jobIds.filter((value) => value !== id);
+          writeStorageArray(PENDING_JOBS_STORAGE, jobIds);
+          saveState();
+        }
+
+        let receipts = pendingReceipts();
+        for (const item of receipts) {
+          const stored = await getReceipt(item.receiptId).catch(() => null);
+          if (stored?.blob) {
+            await cloudFetch(
+              `/api/jobs/${encodeURIComponent(item.jobId)}/receipts/${encodeURIComponent(item.receiptId)}`,
+              {
+                method: "PUT",
+                headers: { "Content-Type": stored.blob.type || "image/jpeg" },
+                body: stored.blob
+              }
+            );
+          }
+          receipts = receipts.filter(
+            (value) => value.jobId !== item.jobId || value.receiptId !== item.receiptId
+          );
+          writeStorageArray(PENDING_RECEIPTS_STORAGE, receipts);
+        }
+        localStorage.setItem("gold-mobile-mechanic-last-sync", new Date().toISOString());
+        saveState();
+        setSyncStatus("synced");
+      } catch (error) {
+        setSyncStatus(navigator.onLine ? "error" : "pending");
+        throw error;
+      } finally {
+        syncInFlight = null;
+      }
+    })();
+
+    return syncInFlight;
+  }
+
+  async function syncFromCloud() {
+    if (!syncKey() || !navigator.onLine) {
+      setSyncStatus(syncKey() ? "pending" : "disconnected");
+      return;
+    }
+
+    setSyncStatus("syncing");
+    const response = await cloudFetch("/api/jobs");
+    const payload = await response.json();
+    const remoteJobs = Array.isArray(payload.jobs) ? payload.jobs.map(normalizeJob) : [];
+    const remoteIds = new Set(remoteJobs.map((job) => job.id));
+    const pendingIds = new Set(pendingJobIds());
+
+    remoteJobs.forEach((remote) => {
+      const local = findJob(remote.id);
+      if (!local || !pendingIds.has(remote.id)) replaceJob(remote);
+    });
+
+    state.jobs.forEach((local) => {
+      if (!remoteIds.has(local.id)) {
+        const ids = new Set(pendingJobIds());
+        ids.add(local.id);
+        writeStorageArray(PENDING_JOBS_STORAGE, [...ids]);
+        local.receipts.forEach((receipt) => queueReceiptSync(local.id, receipt.id));
+      }
+    });
+
+    saveState();
+    await flushSyncQueue();
+    setSyncStatus("synced");
+  }
+
+  async function ensureCloudSync() {
+    if (!syncKey()) {
+      const entered = window.prompt("Enter the Gold Mobile Mechanic owner sync key:");
+      if (!entered?.trim()) {
+        notify("Connect cloud sync before creating or changing jobs.", true);
+        return false;
+      }
+      localStorage.setItem(SYNC_KEY_STORAGE, entered.trim());
+    }
+    try {
+      await syncFromCloud();
+      return true;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Cloud sync could not connect.", true);
+      return false;
+    }
   }
 
   function uid() {
@@ -192,6 +451,21 @@
     return receiptDatabaseAction("readonly", (store) => store.get(id));
   }
 
+  async function getReceiptForJob(jobIdValue, receiptId) {
+    const local = await getReceipt(receiptId).catch(() => null);
+    if (local?.blob || !syncKey() || !navigator.onLine) return local;
+    try {
+      const response = await cloudFetch(
+        `/api/jobs/${encodeURIComponent(jobIdValue)}/receipts/${encodeURIComponent(receiptId)}`
+      );
+      const blob = await response.blob();
+      await storeReceipt(receiptId, blob);
+      return { id: receiptId, blob };
+    } catch {
+      return null;
+    }
+  }
+
   function clearReceiptStore() {
     return receiptDatabaseAction("readwrite", (store) => store.clear());
   }
@@ -217,15 +491,19 @@
   async function compressReceipt(file) {
     try {
       const bitmap = await createImageBitmap(file);
-      const limit = 1800;
+      const limit = 1600;
       const scale = Math.min(1, limit / Math.max(bitmap.width, bitmap.height));
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(bitmap.width * scale));
       canvas.height = Math.max(1, Math.round(bitmap.height * scale));
       canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
       bitmap.close();
-      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.84));
-      return blob || file;
+      for (const quality of [0.82, 0.72, 0.62, 0.52]) {
+        const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+        if (blob && blob.size <= 850_000) return blob;
+      }
+      const fallback = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.42));
+      return fallback || file;
     } catch {
       return file;
     }
@@ -251,7 +529,7 @@
           <p>Create the first job when you arrive. The timer, receipts, notes, and final invoice will stay together.</p>
           <button class="button button-dark" id="emptyNewJob" type="button">Create first job</button>
         </div>`;
-      $("emptyNewJob").addEventListener("click", openJobDialog);
+      $("emptyNewJob").addEventListener("click", openNewJob);
       return;
     }
 
@@ -351,7 +629,7 @@
     revokeObjectUrls();
     if (!job.receipts.length) return `<p class="receipt-empty">No receipts filed yet.</p>`;
     const rows = await Promise.all(job.receipts.map(async (receipt) => {
-      const stored = await getReceipt(receipt.id).catch(() => null);
+      const stored = await getReceiptForJob(job.id, receipt.id);
       let image = `<span class="receipt-thumb">▧</span>`;
       if (stored?.blob) {
         const url = URL.createObjectURL(stored.blob);
@@ -371,6 +649,29 @@
         </div>`;
     }));
     return rows.join("");
+  }
+
+  function clockHistoryMarkup(job) {
+    const labels = {
+      clock_in: "Clocked in",
+      break_start: "Paused for break",
+      break_end: "Resumed work",
+      clock_out: "Clocked out"
+    };
+    const events = [...(job.eventHistory || [])]
+      .sort((a, b) => String(b.occurredAt).localeCompare(String(a.occurredAt)));
+    if (!events.length) return `<p class="history-empty">No clock events yet.</p>`;
+    return `
+      <ol class="clock-history">
+        ${events.map((event) => `
+          <li>
+            <span class="history-dot" aria-hidden="true"></span>
+            <span>
+              <strong>${escapeHtml(labels[event.action] || event.action)}</strong>
+              <small>${calendarDate(event.occurredAt)} · ${clockTime(event.occurredAt)}</small>
+            </span>
+          </li>`).join("")}
+      </ol>`;
   }
 
   async function renderJob() {
@@ -418,6 +719,11 @@
               <div><span class="detail-label">Break time</span><strong id="liveBreakTimer">${duration(breakSeconds)}</strong></div>
             </div>
             <div class="timer-buttons">${timerControls(job)}</div>
+            <div class="history-panel">
+              <p class="eyebrow">Permanent audit trail</p>
+              <h3>Clock history</h3>
+              ${clockHistoryMarkup(job)}
+            </div>
           </article>
 
           <article class="content-card">
@@ -460,7 +766,7 @@
               <div>
                 <p class="eyebrow">Job files</p>
                 <h2>Receipt folder</h2>
-                <p>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} captured on this phone.</p>
+                <p>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} saved with this cloud job.</p>
               </div>
               <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
             </div>
@@ -520,7 +826,7 @@
     if (saveSuggestionsButton) {
       saveSuggestionsButton.addEventListener("click", () => {
         job.suggestions = $("suggestionsInput").value.trim();
-        saveState();
+        queueJobSync(job);
         notify("Mechanic's suggestions saved.");
       });
     }
@@ -529,7 +835,7 @@
     if (reviewInput && !reviewInput.disabled) {
       reviewInput.addEventListener("change", () => {
         job.receiptReview = reviewInput.checked;
-        saveState();
+        queueJobSync(job);
         renderJob();
         notify(job.receiptReview ? "Receipt folder approved." : "Receipt review reopened.");
       });
@@ -578,7 +884,9 @@
       return;
     }
 
-    saveState();
+    job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
+    job.eventHistory.push({ id: uid(), action, occurredAt: now });
+    queueJobSync(job);
     renderJob();
   }
 
@@ -629,6 +937,10 @@
     jobDialog.showModal();
   }
 
+  async function openNewJob() {
+    if (await ensureCloudSync()) openJobDialog();
+  }
+
   function closeJobDialog() {
     jobDialog.close();
   }
@@ -675,12 +987,14 @@
       startedAt: null,
       endedAt: null,
       timeEntries: [],
+      eventHistory: [],
       receipts: [],
-      invoice: null
+      invoice: null,
+      updatedAt: new Date().toISOString()
     };
 
     state.jobs.push(job);
-    saveState();
+    queueJobSync(job);
     closeJobDialog();
     notify(`${job.id} created.`);
     openJob(job.id);
@@ -735,7 +1049,8 @@
       await storeReceipt(receipt.id, blob);
       job.receipts.push(receipt);
       job.receiptReview = false;
-      saveState();
+      queueJobSync(job);
+      queueReceiptSync(job.id, receipt.id);
       closeReceiptDialog();
       await renderJob();
       notify("Receipt filed with this job.");
@@ -746,9 +1061,10 @@
   });
 
   async function viewReceipt(id) {
-    const stored = await getReceipt(id).catch(() => null);
+    const job = selectedJobId ? findJob(selectedJobId) : null;
+    const stored = job ? await getReceiptForJob(job.id, id) : null;
     if (!stored?.blob) {
-      notify("That receipt image is missing from this phone.", true);
+      notify("That receipt image is not available locally or in cloud storage.", true);
       return;
     }
     const url = URL.createObjectURL(stored.blob);
@@ -773,7 +1089,7 @@
       totalCents: laborCents + materialsCents
     };
     job.status = "invoiced";
-    saveState();
+    queueJobSync(job);
     renderJob();
     notify(`${job.invoice.invoiceNumber} created.`);
   }
@@ -781,7 +1097,7 @@
   async function invoiceHtml(job) {
     const receiptPages = [];
     for (const [index, receipt] of job.receipts.entries()) {
-      const stored = await getReceipt(receipt.id).catch(() => null);
+      const stored = await getReceiptForJob(job.id, receipt.id);
       if (!stored?.blob) continue;
       const dataUrl = await fileToDataUrl(stored.blob);
       receiptPages.push(`
@@ -909,7 +1225,7 @@
       const receiptFiles = [];
       for (const job of state.jobs) {
         for (const receipt of job.receipts) {
-          const stored = await getReceipt(receipt.id).catch(() => null);
+          const stored = await getReceiptForJob(job.id, receipt.id);
           if (stored?.blob) {
             receiptFiles.push({ id: receipt.id, dataUrl: await fileToDataUrl(stored.blob) });
           }
@@ -941,10 +1257,17 @@
       for (const receipt of payload.receiptFiles || []) {
         if (receipt.id && receipt.dataUrl) await storeReceipt(receipt.id, dataUrlToBlob(receipt.dataUrl));
       }
-      state = payload.state;
+      state = {
+        ...payload.state,
+        jobs: payload.state.jobs.map(normalizeJob)
+      };
       saveState();
+      state.jobs.forEach((job) => {
+        queueJobSync(job);
+        job.receipts.forEach((receipt) => queueReceiptSync(job.id, receipt.id));
+      });
       showBoard();
-      notify("Backup restored to this phone.");
+      notify("Backup restored and queued for cloud sync.");
     } catch {
       notify("That file is not a valid Gold Mobile Mechanic backup.", true);
     } finally {
@@ -953,7 +1276,13 @@
   }
 
   $("homeButton").addEventListener("click", showBoard);
-  $("newJobButton").addEventListener("click", openJobDialog);
+  $("newJobButton").addEventListener("click", openNewJob);
+  $("syncButton").addEventListener("click", async () => {
+    if (await ensureCloudSync()) {
+      renderBoard();
+      notify("Cloud ledger is up to date.");
+    }
+  });
   $("closeJobDialog").addEventListener("click", closeJobDialog);
   $("cancelJobButton").addEventListener("click", closeJobDialog);
   $("addMaterialButton").addEventListener("click", () => addMaterialRow());
@@ -978,17 +1307,40 @@
     else if (selectedJobId) showBoard();
   });
 
+  window.addEventListener("online", () => {
+    void syncFromCloud()
+      .then(() => {
+        if (selectedJobId) renderJob();
+        else renderBoard();
+      })
+      .catch(() => setSyncStatus("error"));
+  });
+  window.addEventListener("offline", () => setSyncStatus(syncKey() ? "pending" : "disconnected"));
+
   setInterval(updateLiveTimer, 1000);
 
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
   }
 
-  saveState();
-  const initialMatch = /^#job\/(.+)$/.exec(window.location.hash);
-  if (initialMatch && findJob(decodeURIComponent(initialMatch[1]))) {
-    openJob(decodeURIComponent(initialMatch[1]));
-  } else {
-    renderBoard();
+  async function initialize() {
+    saveState();
+    if (syncKey()) {
+      try {
+        await syncFromCloud();
+        if (pairedFromUrl) notify("This phone is connected to the permanent cloud ledger.");
+      } catch (error) {
+        setSyncStatus("error");
+        notify(error instanceof Error ? error.message : "Cloud sync could not connect.", true);
+      }
+    }
+    const initialMatch = /^#job\/(.+)$/.exec(window.location.hash);
+    if (initialMatch && findJob(decodeURIComponent(initialMatch[1]))) {
+      await openJob(decodeURIComponent(initialMatch[1]));
+    } else {
+      renderBoard();
+    }
   }
+
+  void initialize();
 })();

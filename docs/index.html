@@ -23,8 +23,8 @@
       </span>
     </button>
     <div class="topbar-meta">
-      <span class="signal-dot" aria-hidden="true"></span>
-      <span id="storageLabel">Saved on this phone</span>
+      <span class="signal-dot" id="syncDot" data-sync="disconnected" aria-hidden="true"></span>
+      <span id="storageLabel">Connecting cloud ledger</span>
     </div>
   </header>
 
@@ -37,24 +37,25 @@
           <p>Clock the job. Capture the proof. Close it with a clean invoice.</p>
         </div>
         <button class="button button-gold" id="newJobButton" type="button">
-          <span class="button-plus">+</span> New job
+          New job
         </button>
       </div>
 
       <div class="phone-note">
         <span class="phone-note-icon" aria-hidden="true">⌁</span>
         <div>
-          <strong>Private to this device</strong>
-          <p>Jobs and receipt photos stay in this browser on this phone. Use Backup before clearing browser data or changing phones.</p>
+          <strong>Permanent cloud ledger with offline recovery</strong>
+          <p>Jobs, clock-in/out history, pauses, notes, and receipt files sync behind this GitHub app. The phone keeps a recovery copy and automatically uploads changes when service returns.</p>
         </div>
       </div>
 
       <div class="board-tools">
         <div>
           <p class="eyebrow">Active ledger</p>
-          <h2>Your jobs</h2>
+          <h2>Jobs saved with Gold Mobile Mechanic</h2>
         </div>
         <div class="tool-actions">
+          <button class="text-button" id="syncButton" type="button">Sync now</button>
           <button class="text-button" id="backupButton" type="button">Backup data</button>
           <button class="text-button" id="restoreButton" type="button">Restore</button>
           <input class="visually-hidden" id="restoreInput" type="file" accept="application/json">

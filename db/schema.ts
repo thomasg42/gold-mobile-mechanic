@@ -29,6 +29,14 @@ export const timeEntries = sqliteTable("time_entries", {
   endedAt: text("ended_at"),
 });
 
+export const jobEvents = sqliteTable("job_events", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull(),
+  action: text("action").notNull(),
+  occurredAt: text("occurred_at").notNull(),
+  mutationId: text("mutation_id").notNull().unique(),
+});
+
 export const materials = sqliteTable("materials", {
   id: text("id").primaryKey(),
   jobId: text("job_id").notNull(),

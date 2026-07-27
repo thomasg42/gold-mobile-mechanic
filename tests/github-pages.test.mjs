@@ -31,7 +31,9 @@ test("GitHub phone app syncs durable jobs, receipts, and clock history", async (
   assert.match(script, /break_end/);
   assert.match(script, /clock_out/);
   assert.match(script, /receiptReview/);
-  assert.match(script, /job\.status !== "completed" \|\| !job\.receiptReview/);
+  assert.match(script, /invoice-at-capture|Invoice at capture|upsertInvoice/);
+  assert.match(script, /partsTotal|receiptTotal/);
+  assert.match(script, /Clock out.*invoice|clock out.*file the invoice/i);
   assert.match(script, /invoiceHtml/);
   assert.match(script, /navigator\.share/);
   assert.match(script, /mailto:/);
@@ -44,6 +46,7 @@ test("GitHub phone app syncs durable jobs, receipts, and clock history", async (
   assert.match(script, /eventHistory/);
   assert.match(script, /Clock history/);
   assert.doesNotMatch(script, /CLOUD_APP_URL|chatgpt\.site/);
+  assert.doesNotMatch(script, /job\.status !== "completed" \|\| !job\.receiptReview/);
 });
 
 test("Pages assets are project-relative and name GitHub Pages as the public home", async () => {

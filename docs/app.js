@@ -389,6 +389,40 @@
     );
   }
 
+  function receiptTotal(job) {
+    return (job.receipts || []).reduce(
+      (total, receipt) => total + Math.max(0, Number(receipt.amountCents || 0)),
+      0
+    );
+  }
+
+  function partsTotal(job) {
+    return materialTotal(job) + receiptTotal(job);
+  }
+
+  function invoiceDraft(job) {
+    const workSeconds = elapsedSeconds(job, "work");
+    const laborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
+    const materialsCents = partsTotal(job);
+    return {
+      invoiceNumber: job.id.replace(/^GMM-/, "GMM-INV-"),
+      createdAt: job.invoice?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      workSeconds,
+      laborCents,
+      materialsCents,
+      totalCents: laborCents + materialsCents
+    };
+  }
+
+  function upsertInvoice(job) {
+    job.receiptReview = true;
+    job.invoice = invoiceDraft(job);
+    job.status = "invoiced";
+    queueJobSync(job);
+    return job.invoice;
+  }
+
   function findJob(id) {
     return state.jobs.find((job) => job.id === id);
   }
@@ -684,8 +718,8 @@
     const breakSeconds = elapsedSeconds(job, "break");
     const receipts = await receiptMarkup(job);
     const locked = job.status === "invoiced";
-    const canReview = job.status === "completed";
-    const canInvoice = job.status === "completed" && job.receiptReview;
+    const canReview = job.status === "completed" || job.status === "invoiced";
+    const draft = invoiceDraft(job);
 
     jobView.innerHTML = `
       <div class="job-hero">
@@ -773,20 +807,26 @@
             <div class="receipt-list">${receipts}</div>
             <label class="review-check">
               <input id="receiptReviewInput" type="checkbox" ${job.receiptReview ? "checked" : ""} ${canReview ? "" : "disabled"}>
-              <span><strong>Receipt folder reviewed</strong><br>Confirm every receipt looks right before the invoice is created.</span>
+              <span><strong>Receipt folder reviewed</strong><br>Optional double-check. Clock-out and receipt capture already file the invoice for payment.</span>
             </label>
           </article>
 
-          ${job.status === "completed" && !job.invoice ? `
+          ${job.status !== "invoiced" ? `
             <article class="content-card invoice-card">
               <div class="card-heading">
                 <div>
-                  <p class="eyebrow">Final step</p>
-                  <h2>Create invoice</h2>
-                  <p>Labor comes from the work timer. Materials and receipt images stay filed with this job.</p>
+                  <p class="eyebrow">Invoice at capture</p>
+                  <h2>${job.status === "completed" ? "Ready to bill" : "Running invoice"}</h2>
+                  <p>Receipt photos roll into parts the moment you file them. Clock out files the invoice so you can share it for payment.</p>
                 </div>
               </div>
-              <button class="button button-gold" id="createInvoiceButton" type="button" ${canInvoice ? "" : "disabled"}>Create invoice</button>
+              <div class="invoice-meta">
+                <span>Labor · ${money(draft.laborCents)}</span>
+                <span>Parts · ${money(draft.materialsCents)}</span>
+                <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"}</span>
+              </div>
+              <div class="invoice-total"><span>Total so far</span><strong>${money(draft.totalCents)}</strong></div>
+              ${job.status === "completed" ? `<button class="button button-gold" id="createInvoiceButton" type="button">Create & share invoice</button>` : ""}
             </article>` : ""}
 
           ${invoiceMarkup(job)}
@@ -797,9 +837,9 @@
         <div>
           <p class="eyebrow">Bottom of work order</p>
           <h3>${job.status === "completed" || job.status === "invoiced" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
-          <p>${job.status === "on_break" ? "End the current break before clocking out." : job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Clocking out closes the billable timer. Review the receipts next, then create the invoice."}</p>
+          <p>${job.status === "on_break" ? "End the current break before clocking out." : job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Clocking out closes the timer and files the invoice in the same step so you can get paid."}</p>
         </div>
-        <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" ? "" : "disabled"}>Clock out</button>
+        <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" ? "" : "disabled"}>Clock out & invoice</button>
       </section>`;
 
     bindJobEvents(job);
@@ -842,7 +882,12 @@
     }
 
     const createInvoiceButton = $("createInvoiceButton");
-    if (createInvoiceButton) createInvoiceButton.addEventListener("click", () => createInvoice(job));
+    if (createInvoiceButton) {
+      createInvoiceButton.addEventListener("click", async () => {
+        createInvoice(job);
+        await shareInvoice(job);
+      });
+    }
 
     const downloadInvoiceButton = $("downloadInvoiceButton");
     if (downloadInvoiceButton) downloadInvoiceButton.addEventListener("click", () => downloadInvoice(job));
@@ -874,11 +919,16 @@
       job.status = "in_progress";
       notify("Break ended. Billable time resumed.");
     } else if (action === "clock_out" && job.status === "in_progress") {
-      if (!window.confirm("Clock out and close the billable timer for this job?")) return;
+      if (!window.confirm("Clock out, close the timer, and file the invoice for payment?")) return;
       if (openEntry) openEntry.endedAt = now;
       job.status = "completed";
       job.endedAt = now;
-      notify("Clocked out. Review receipts to unlock the invoice.");
+      job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
+      job.eventHistory.push({ id: uid(), action, occurredAt: now });
+      const invoice = upsertInvoice(job);
+      renderJob();
+      notify(`${invoice.invoiceNumber} filed — share it to get paid.`);
+      return;
     } else {
       notify("That timer action is not available right now.", true);
       return;
@@ -1048,12 +1098,18 @@
       };
       await storeReceipt(receipt.id, blob);
       job.receipts.push(receipt);
-      job.receiptReview = false;
-      queueJobSync(job);
       queueReceiptSync(job.id, receipt.id);
       closeReceiptDialog();
-      await renderJob();
-      notify("Receipt filed with this job.");
+      if (job.status === "completed" || job.status === "invoiced") {
+        const invoice = upsertInvoice(job);
+        await renderJob();
+        notify(`${invoice.invoiceNumber} updated with this receipt — share to collect.`);
+      } else {
+        job.receiptReview = false;
+        queueJobSync(job);
+        await renderJob();
+        notify("Receipt filed. Parts total updated on the running invoice.");
+      }
     } catch {
       $("receiptFormError").textContent = "The receipt could not be saved. Check available phone storage and retry.";
       $("receiptFormError").classList.remove("hidden");
@@ -1073,25 +1129,13 @@
   }
 
   function createInvoice(job) {
-    if (job.status !== "completed" || !job.receiptReview) {
-      notify("Clock out and review the receipt folder first.", true);
+    if (job.status !== "completed" && job.status !== "invoiced") {
+      notify("Clock out first so labor is closed, then the invoice files automatically.", true);
       return;
     }
-    const workSeconds = elapsedSeconds(job, "work");
-    const laborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
-    const materialsCents = materialTotal(job);
-    job.invoice = {
-      invoiceNumber: job.id.replace(/^GMM-/, "GMM-INV-"),
-      createdAt: new Date().toISOString(),
-      workSeconds,
-      laborCents,
-      materialsCents,
-      totalCents: laborCents + materialsCents
-    };
-    job.status = "invoiced";
-    queueJobSync(job);
+    const invoice = upsertInvoice(job);
     renderJob();
-    notify(`${job.invoice.invoiceNumber} created.`);
+    notify(`${invoice.invoiceNumber} ready — share it to get paid.`);
   }
 
   async function invoiceHtml(job) {
@@ -1114,6 +1158,16 @@
         <td>${Number(item.quantity).toFixed(2).replace(/\.00$/, "")}</td>
         <td>${money(item.unitCostCents)}</td>
         <td>${money(Math.round(item.quantity * item.unitCostCents))}</td>
+      </tr>`).join("");
+
+    const receiptRowsMarkup = (job.receipts || [])
+      .filter((receipt) => Number(receipt.amountCents || 0) > 0)
+      .map((receipt) => `
+      <tr>
+        <td>Receipt — ${escapeHtml(receipt.vendor || receipt.filename)}</td>
+        <td>1</td>
+        <td>${money(receipt.amountCents)}</td>
+        <td>${money(receipt.amountCents)}</td>
       </tr>`).join("");
 
     return `<!doctype html>
@@ -1149,11 +1203,12 @@
       <tbody>
         <tr><td>Mobile mechanic labor</td><td>${(job.invoice.workSeconds / 3600).toFixed(2)} hrs</td><td>${money(job.laborRateCents)}/hr</td><td>${money(job.invoice.laborCents)}</td></tr>
         ${materialRowsMarkup}
+        ${receiptRowsMarkup}
       </tbody>
     </table>
     <div class="totals">
       <div><span>Labor</span><strong>${money(job.invoice.laborCents)}</strong></div>
-      <div><span>Materials</span><strong>${money(job.invoice.materialsCents)}</strong></div>
+      <div><span>Parts (materials + receipts)</span><strong>${money(job.invoice.materialsCents)}</strong></div>
       <div class="total"><span>Total</span><span>${money(job.invoice.totalCents)}</span></div>
     </div>
     <div class="notes box"><span class="eyebrow">Mechanic's suggestions</span><p>${escapeHtml(job.suggestions || "No additional suggestions.")}</p></div>

@@ -1033,9 +1033,11 @@ button {
   border-top: 1px solid var(--line);
 }
 
-.req-star {
-  color: #9d2f24;
-  font-weight: 800;
+.adjust-note {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--slate);
 }
 
 .labor-total-row {

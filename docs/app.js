@@ -82,12 +82,29 @@
       ...job,
       materials: Array.isArray(job.materials) ? job.materials : [],
       timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
-      receipts: (Array.isArray(job.receipts) ? job.receipts : []).map((receipt) => ({
-        ...receipt,
-        orderId: receipt.orderId || "",
-        addCents: Number.isFinite(Number(receipt.addCents)) ? Math.max(0, Math.round(Number(receipt.addCents))) : 0,
-        subtractCents: Number.isFinite(Number(receipt.subtractCents)) ? Math.max(0, Math.round(Number(receipt.subtractCents))) : 0
-      })),
+      receipts: (Array.isArray(job.receipts) ? job.receipts : []).map((receipt) => {
+        const addCents = Number.isFinite(Number(receipt.addCents)) ? Math.max(0, Math.round(Number(receipt.addCents))) : 0;
+        const subtractCents = Number.isFinite(Number(receipt.subtractCents)) ? Math.max(0, Math.round(Number(receipt.subtractCents))) : 0;
+        let adjustCents = Number.isFinite(Number(receipt.adjustCents)) ? Math.max(0, Math.round(Number(receipt.adjustCents))) : 0;
+        let adjustSign = Number(receipt.adjustSign) < 0 ? -1 : 1;
+        if (!adjustCents && (addCents || subtractCents)) {
+          if (subtractCents && !addCents) {
+            adjustCents = subtractCents;
+            adjustSign = -1;
+          } else if (addCents) {
+            adjustCents = addCents;
+            adjustSign = 1;
+          }
+        }
+        return {
+          ...receipt,
+          orderId: receipt.orderId || "",
+          addCents,
+          subtractCents,
+          adjustCents,
+          adjustSign
+        };
+      }),
       manualWorkSeconds: Number.isFinite(Number(job.manualWorkSeconds))
         ? Math.max(0, Math.round(Number(job.manualWorkSeconds)))
         : 0,
@@ -99,6 +116,7 @@
       laborAdjustmentCents: Number.isFinite(Number(job.laborAdjustmentCents))
         ? Math.round(Number(job.laborAdjustmentCents))
         : 0,
+      laborAdjustSign: Number(job.laborAdjustSign) < 0 ? -1 : 1,
       difficultyLevel: String(job.difficultyLevel || "Standard"),
       eventHistory: Array.isArray(job.eventHistory) && job.eventHistory.length
         ? job.eventHistory
@@ -444,7 +462,13 @@
   }
 
   function receiptEffectiveCents(receipt) {
-    return Number(receipt.amountCents || 0)
+    const base = Number(receipt.amountCents || 0);
+    const adjust = Math.max(0, Number(receipt.adjustCents || 0));
+    if (adjust) {
+      const sign = Number(receipt.adjustSign) < 0 ? -1 : 1;
+      return base + sign * adjust;
+    }
+    return base
       + Math.max(0, Number(receipt.addCents || 0))
       - Math.max(0, Number(receipt.subtractCents || 0));
   }
@@ -460,6 +484,18 @@
     return receiptTotal(job);
   }
 
+  function laborAdjustMagnitude(job) {
+    const signed = Number(job.laborAdjustmentCents || 0);
+    if (signed) return Math.abs(signed);
+    return 0;
+  }
+
+  function laborAdjustSignValue(job) {
+    if (Number(job.laborAdjustmentCents || 0) < 0) return -1;
+    if (Number(job.laborAdjustSign) < 0) return -1;
+    return 1;
+  }
+
   function invoiceDraft(job) {
     const workSeconds = billableSeconds(job);
     const timedLaborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
@@ -468,9 +504,9 @@
     const baseLaborCents = hasOwnLabor
       ? Math.max(0, Math.round(Number(job.laborAmountCents)))
       : timedLaborCents;
-    const laborAdjustmentCents = Number.isFinite(Number(job.laborAdjustmentCents))
-      ? Math.round(Number(job.laborAdjustmentCents))
-      : 0;
+    const magnitude = laborAdjustMagnitude(job);
+    const sign = laborAdjustSignValue(job);
+    const laborAdjustmentCents = sign * magnitude;
     const laborCents = Math.max(0, baseLaborCents + laborAdjustmentCents);
     const materialsCents = partsTotal(job);
     return {
@@ -486,6 +522,22 @@
       totalCents: laborCents + materialsCents,
       difficultyLevel: String(job.difficultyLevel || "Standard")
     };
+  }
+
+  function requiredStar(label) {
+    return `${escapeHtml(label)} <span class="req-star" aria-hidden="true">*</span>`;
+  }
+
+  function jobReadyForInvoice(job) {
+    if (!Number(job.laborRateCents || 0)) {
+      return "Enter the hourly labor rate before clock out & invoice.";
+    }
+    for (const receipt of job.receipts || []) {
+      if (!String(receipt.vendor || "").trim()) return "Every receipt needs a vendor before clock out & invoice.";
+      if (!String(receipt.orderId || "").trim()) return "Every receipt needs an order number before clock out & invoice.";
+      if (!Number(receipt.amountCents || 0)) return "Every receipt needs a total amount before clock out & invoice.";
+    }
+    return "";
   }
 
   function upsertInvoice(job) {
@@ -824,30 +876,32 @@
         image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
       }
       const effective = receiptEffectiveCents(receipt);
+      const adjustAbs = Math.max(0, Number(receipt.adjustCents || 0));
+      const adjustSign = Number(receipt.adjustSign) < 0 ? -1 : 1;
       return `
         <article class="filed-receipt-card folder-receipt-card" data-folder-receipt="${escapeHtml(receipt.id)}">
           <button type="button" class="filed-receipt-photo" data-receipt-id="${escapeHtml(receipt.id)}">${image}</button>
           <div class="filed-receipt-body">
             <label class="field">
-              <span>Vendor</span>
+              <span>${requiredStar("Vendor")}</span>
               <input data-folder-vendor="${escapeHtml(receipt.id)}" value="${escapeHtml(receipt.vendor || "")}" placeholder="Auto Zone" ${locked ? "disabled" : ""}>
             </label>
             <label class="field">
-              <span>Order ID</span>
+              <span>${requiredStar("Order number")}</span>
               <input data-folder-order="${escapeHtml(receipt.id)}" value="${escapeHtml(receipt.orderId || "")}" placeholder="Order / ticket #" ${locked ? "disabled" : ""}>
             </label>
-            <div class="folder-receipt-amount">
-              <span class="detail-label">Receipt amount</span>
-              <strong>${money(receipt.amountCents)}</strong>
-            </div>
+            <label class="field">
+              <span>${requiredStar("Receipt amount")}</span>
+              <span class="money-input"><b>$</b><input data-folder-amount="${escapeHtml(receipt.id)}" inputmode="decimal" value="${Number(receipt.amountCents || 0) ? (Math.abs(Number(receipt.amountCents)) / 100).toFixed(2) : ""}" placeholder="0.00" ${locked ? "disabled" : ""}></span>
+            </label>
             ${locked ? "" : `
               <label class="field">
-                <span>Add to this receipt</span>
-                <span class="money-input"><b>$</b><input data-folder-add="${escapeHtml(receipt.id)}" inputmode="decimal" value="${Number(receipt.addCents || 0) ? (Number(receipt.addCents) / 100).toFixed(2) : ""}" placeholder="0.00"></span>
-              </label>
-              <label class="field">
-                <span>Subtract amount from that receipt</span>
-                <span class="money-input"><b>$</b><input data-folder-subtract="${escapeHtml(receipt.id)}" inputmode="decimal" value="${Number(receipt.subtractCents || 0) ? (Number(receipt.subtractCents) / 100).toFixed(2) : ""}" placeholder="0.00"></span>
+                <span>Adjust amount</span>
+                <span class="money-input draft-amount-input">
+                  <b>$</b>
+                  <input data-folder-adjust="${escapeHtml(receipt.id)}" inputmode="decimal" value="${adjustAbs ? (adjustAbs / 100).toFixed(2) : ""}" placeholder="0.00">
+                  <button type="button" class="amount-sign-toggle" data-folder-sign="${escapeHtml(receipt.id)}" aria-label="Toggle add or subtract">${adjustSign < 0 ? "−" : "+"}</button>
+                </span>
               </label>`}
             <div class="folder-receipt-subtotal">
               <span>Subtotal to that receipt</span>
@@ -859,7 +913,7 @@
     return `${rows.join("")}
       <div class="receipt-total">
         <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} added together</span>
-        <strong>${money(receiptTotal(job))}</strong>
+        <strong data-folder-parts-total>${money(receiptTotal(job))}</strong>
       </div>`;
   }
 
@@ -954,18 +1008,20 @@
                   <button class="button button-quiet" id="addManualTimeButton" type="button">Add to total</button>
                 </div>
                 <div class="labor-cash">
-                  <p class="detail-label">Labor dollar total</p>
-                  <p class="time-edit-note">Enter your own labor total, then plus or minus more. Difficulty stays with the job.</p>
-                  <div class="time-edit-fields">
-                    <label class="field">
-                      <span>Own labor total</span>
-                      <span class="money-input"><b>$</b><input id="laborAmountInput" inputmode="decimal" value="${job.laborAmountCents !== null && job.laborAmountCents !== undefined ? (Number(job.laborAmountCents) / 100).toFixed(2) : ""}" placeholder="${(draft.timedLaborCents / 100).toFixed(2)}"></span>
-                    </label>
-                    <label class="field">
-                      <span>Plus or minus</span>
-                      <span class="money-input"><b>$</b><input id="laborAdjustInput" inputmode="decimal" value="${Number(job.laborAdjustmentCents || 0) ? (Number(job.laborAdjustmentCents) / 100).toFixed(2) : ""}" placeholder="0.00"></span>
-                    </label>
-                  </div>
+                  <p class="detail-label">Labor charge</p>
+                  <label class="field">
+                    <span>${requiredStar("Hourly rate")}</span>
+                    <span class="money-input"><b>$</b><input id="laborRateInput" inputmode="decimal" value="${(Number(job.laborRateCents || 0) / 100).toFixed(2)}" placeholder="60.00"></span>
+                  </label>
+                  <p class="time-edit-note">Timer labor from hours × rate: <strong id="timedLaborLive">${money(draft.timedLaborCents)}</strong></p>
+                  <label class="field">
+                    <span>Adjust amount</span>
+                    <span class="money-input draft-amount-input">
+                      <b>$</b>
+                      <input id="laborAdjustInput" inputmode="decimal" value="${laborAdjustMagnitude(job) ? (laborAdjustMagnitude(job) / 100).toFixed(2) : ""}" placeholder="0.00">
+                      <button type="button" class="amount-sign-toggle" id="laborAdjustSign" aria-label="Toggle add or subtract">${laborAdjustSignValue(job) < 0 ? "−" : "+"}</button>
+                    </span>
+                  </label>
                   <label class="field">
                     <span>Difficulty level</span>
                     <select id="difficultySelect">
@@ -973,13 +1029,12 @@
                         <option value="${level}" ${String(job.difficultyLevel || "Standard") === level ? "selected" : ""}>${level}</option>`).join("")}
                     </select>
                   </label>
-                  <div class="folder-receipt-subtotal">
-                    <span>Labor for invoice</span>
-                    <strong>${money(draft.laborCents)}</strong>
+                  <div class="labor-total-row">
+                    <span>Labor total</span>
+                    <strong id="laborTotalLive">${money(draft.laborCents)}</strong>
                   </div>
                   <div class="save-row time-edit-actions">
                     <button class="button button-quiet" id="saveLaborButton" type="button">Save labor</button>
-                    <button class="button button-quiet" id="clearOwnLaborButton" type="button">Use timer labor</button>
                   </div>
                 </div>`}
             </div>
@@ -1041,7 +1096,7 @@
               <div class="save-row">
                 <button class="button button-gold" id="saveReceiptFolderButton" type="button">Save receipt folder</button>
               </div>
-              <p class="time-edit-note">Saves vendor, order ID, and add/subtract amounts for every receipt on this job. Then use Clock out & invoice.</p>
+              <p class="time-edit-note">Saves vendor, order number, receipt amount, and +/- adjust for every receipt. Stars (*) are required before Clock out & invoice.</p>
             `}
           </article>
 
@@ -1087,7 +1142,27 @@
     });
 
     const clockOutButton = $("clockOutButton");
-    if (clockOutButton) clockOutButton.addEventListener("click", () => timerAction(job, "clock_out"));
+    if (clockOutButton) {
+      clockOutButton.addEventListener("click", () => {
+        if ($("laborRateInput")) {
+          const rateCents = parseCents($("laborRateInput").value);
+          if (rateCents) job.laborRateCents = rateCents;
+          const magnitude = parseCents($("laborAdjustInput")?.value);
+          const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
+          job.laborAdjustmentCents = sign * magnitude;
+          job.laborAdjustSign = sign;
+          job.laborAmountCents = null;
+          if ($("difficultySelect")) job.difficultyLevel = $("difficultySelect").value || "Standard";
+        }
+        if (job.receipts.length) readFolderReceiptInputs(job);
+        const blocked = jobReadyForInvoice(job);
+        if (blocked) {
+          notify(blocked, true);
+          return;
+        }
+        timerAction(job, "clock_out");
+      });
+    }
 
     const addReceiptButton = $("addReceiptButton");
     if (addReceiptButton) addReceiptButton.addEventListener("click", () => openReceiptDialog(job.id));
@@ -1215,17 +1290,12 @@
     const saveReceiptFolderButton = $("saveReceiptFolderButton");
     if (saveReceiptFolderButton) {
       saveReceiptFolderButton.addEventListener("click", () => {
-        job.receipts.forEach((receipt) => {
-          const vendorInput = document.querySelector(`[data-folder-vendor="${receipt.id}"]`);
-          const orderInput = document.querySelector(`[data-folder-order="${receipt.id}"]`);
-          const addInput = document.querySelector(`[data-folder-add="${receipt.id}"]`);
-          const subtractInput = document.querySelector(`[data-folder-subtract="${receipt.id}"]`);
-          if (vendorInput) receipt.vendor = canonicalizeVendor(vendorInput.value, job);
-          if (orderInput) receipt.orderId = orderInput.value.trim();
-          if (addInput) receipt.addCents = parseCents(addInput.value);
-          if (subtractInput) receipt.subtractCents = parseCents(subtractInput.value);
-        });
-        job.receiptReview = true;
+        readFolderReceiptInputs(job);
+        const blocked = jobReadyForInvoice(job);
+        if (blocked && job.receipts.length) {
+          notify(blocked, true);
+        }
+        job.receiptReview = !jobReadyForInvoice(job);
         job.receiptFolderSavedAt = new Date().toISOString();
         if (job.invoice) job.invoice = invoiceDraft(job);
         queueJobSync(job);
@@ -1234,13 +1304,32 @@
       });
     }
 
+    function liveLaborTotal() {
+      const rateCents = parseCents($("laborRateInput")?.value);
+      const timed = Math.round((billableSeconds(job) / 3600) * rateCents);
+      const magnitude = parseCents($("laborAdjustInput")?.value);
+      const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
+      const total = Math.max(0, timed + sign * magnitude);
+      const timedLive = $("timedLaborLive");
+      const laborLive = $("laborTotalLive");
+      if (timedLive) timedLive.textContent = money(timed);
+      if (laborLive) laborLive.textContent = money(total);
+    }
+
     const saveLaborButton = $("saveLaborButton");
     if (saveLaborButton) {
       saveLaborButton.addEventListener("click", () => {
-        const amountRaw = String($("laborAmountInput")?.value || "").trim();
-        const adjustRaw = String($("laborAdjustInput")?.value || "").trim();
-        job.laborAmountCents = amountRaw === "" ? null : parseCents(amountRaw);
-        job.laborAdjustmentCents = adjustRaw === "" ? 0 : parseSignedCents(adjustRaw);
+        const rateCents = parseCents($("laborRateInput")?.value);
+        if (!rateCents) {
+          notify("Enter an hourly rate greater than zero.", true);
+          return;
+        }
+        job.laborRateCents = rateCents;
+        job.laborAmountCents = null;
+        const magnitude = parseCents($("laborAdjustInput")?.value);
+        const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
+        job.laborAdjustmentCents = sign * magnitude;
+        job.laborAdjustSign = sign;
         job.difficultyLevel = $("difficultySelect")?.value || "Standard";
         if (job.invoice) job.invoice = invoiceDraft(job);
         queueJobSync(job);
@@ -1249,28 +1338,74 @@
       });
     }
 
-    const clearOwnLaborButton = $("clearOwnLaborButton");
-    if (clearOwnLaborButton) {
-      clearOwnLaborButton.addEventListener("click", () => {
-        job.laborAmountCents = null;
-        job.laborAdjustmentCents = 0;
-        if (job.invoice) job.invoice = invoiceDraft(job);
-        queueJobSync(job);
-        renderJob();
-        notify("Using timer labor for the invoice.");
+    const laborAdjustSign = $("laborAdjustSign");
+    if (laborAdjustSign) {
+      laborAdjustSign.addEventListener("click", () => {
+        const next = (laborAdjustSign.textContent || "+").includes("−") || (laborAdjustSign.textContent || "").includes("-") ? "+" : "−";
+        laborAdjustSign.textContent = next;
+        liveLaborTotal();
+      });
+    }
+    ["laborRateInput", "laborAdjustInput"].forEach((id) => {
+      const input = $(id);
+      if (input) input.addEventListener("input", liveLaborTotal);
+    });
+
+    function readFolderReceiptInputs(targetJob) {
+      targetJob.receipts.forEach((receipt) => {
+        const vendorInput = document.querySelector(`[data-folder-vendor="${receipt.id}"]`);
+        const orderInput = document.querySelector(`[data-folder-order="${receipt.id}"]`);
+        const amountInput = document.querySelector(`[data-folder-amount="${receipt.id}"]`);
+        const adjustInput = document.querySelector(`[data-folder-adjust="${receipt.id}"]`);
+        const signButton = document.querySelector(`[data-folder-sign="${receipt.id}"]`);
+        if (vendorInput) receipt.vendor = canonicalizeVendor(vendorInput.value, targetJob);
+        if (orderInput) receipt.orderId = orderInput.value.trim();
+        if (amountInput) receipt.amountCents = parseCents(amountInput.value);
+        if (adjustInput) receipt.adjustCents = parseCents(adjustInput.value);
+        if (signButton) {
+          receipt.adjustSign = (signButton.textContent || "+").includes("−") || (signButton.textContent || "").includes("-") ? -1 : 1;
+        }
+        if (receipt.adjustSign < 0) {
+          receipt.addCents = 0;
+          receipt.subtractCents = receipt.adjustCents;
+        } else {
+          receipt.addCents = receipt.adjustCents;
+          receipt.subtractCents = 0;
+        }
       });
     }
 
-    document.querySelectorAll("[data-folder-add], [data-folder-subtract]").forEach((input) => {
+    function refreshFolderSubtotal(id) {
+      const amount = parseCents(document.querySelector(`[data-folder-amount="${id}"]`)?.value);
+      const adjust = parseCents(document.querySelector(`[data-folder-adjust="${id}"]`)?.value);
+      const signButton = document.querySelector(`[data-folder-sign="${id}"]`);
+      const sign = (signButton?.textContent || "+").includes("−") || (signButton?.textContent || "").includes("-") ? -1 : 1;
+      const label = document.querySelector(`[data-folder-subtotal="${id}"]`);
+      if (label) label.textContent = money(amount + sign * adjust);
+      const parts = document.querySelector("[data-folder-parts-total]");
+      if (parts) {
+        let total = 0;
+        job.receipts.forEach((receipt) => {
+          const receiptAmount = parseCents(document.querySelector(`[data-folder-amount="${receipt.id}"]`)?.value);
+          const receiptAdjust = parseCents(document.querySelector(`[data-folder-adjust="${receipt.id}"]`)?.value);
+          const receiptSignButton = document.querySelector(`[data-folder-sign="${receipt.id}"]`);
+          const receiptSign = (receiptSignButton?.textContent || "+").includes("−") || (receiptSignButton?.textContent || "").includes("-") ? -1 : 1;
+          total += receiptAmount + receiptSign * receiptAdjust;
+        });
+        parts.textContent = money(total);
+      }
+    }
+
+    document.querySelectorAll("[data-folder-amount], [data-folder-adjust]").forEach((input) => {
       input.addEventListener("input", () => {
-        const id = input.dataset.folderAdd || input.dataset.folderSubtract;
-        const receipt = job.receipts.find((item) => item.id === id);
-        if (!receipt) return;
-        const addValue = document.querySelector(`[data-folder-add="${id}"]`)?.value;
-        const subtractValue = document.querySelector(`[data-folder-subtract="${id}"]`)?.value;
-        const effective = Number(receipt.amountCents || 0) + parseCents(addValue) - parseCents(subtractValue);
-        const label = document.querySelector(`[data-folder-subtotal="${id}"]`);
-        if (label) label.textContent = money(effective);
+        refreshFolderSubtotal(input.dataset.folderAmount || input.dataset.folderAdjust);
+      });
+    });
+    document.querySelectorAll("[data-folder-sign]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const next = (button.textContent || "+").includes("−") || (button.textContent || "").includes("-") ? "+" : "−";
+        button.textContent = next;
+        refreshFolderSubtotal(button.dataset.folderSign);
       });
     });
 

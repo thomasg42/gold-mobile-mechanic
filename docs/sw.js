@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v12-folder-labor";
+const CACHE = "gold-mobile-mechanic-v13-sign-fields";
 const APP_SHELL = [
   "./",
   "./index.html",

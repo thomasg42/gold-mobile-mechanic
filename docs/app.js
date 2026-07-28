@@ -34,6 +34,7 @@
   let toastTimer = null;
   let syncInFlight = null;
   let ocrWorkerPromise = null;
+  let pendingScan = { vendor: "", amount: 0 };
 
   function arrayFromStorage(key) {
     try {
@@ -691,6 +692,12 @@
       </article>`;
   }
 
+  function receiptSuggestLabel(receipt) {
+    const suggested = Number(receipt.suggestedAmountCents || 0);
+    if (!suggested) return "";
+    return `<span class="receipt-suggested">Suggested ${money(suggested)}</span>`;
+  }
+
   async function receiptMarkup(job) {
     revokeObjectUrls();
     if (!job.receipts.length) return `<p class="receipt-empty">No receipts filed yet.</p>`;
@@ -702,13 +709,15 @@
         activeObjectUrls.push(url);
         image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
       }
+      const suggestedVendor = String(receipt.suggestedVendor || "").trim();
       return `
         <div class="receipt-row">
           <button type="button" data-receipt-id="${escapeHtml(receipt.id)}">
             ${image}
             <span class="receipt-copy">
               <strong>${escapeHtml(receipt.vendor || receipt.filename)}</strong>
-              <small>${calendarDate(receipt.createdAt)} · ${money(receipt.amountCents)}</small>
+              <small>${calendarDate(receipt.createdAt)}${suggestedVendor ? ` · saw ${escapeHtml(suggestedVendor)}` : ""}</small>
+              ${receiptSuggestLabel(receipt)}
             </span>
           </button>
           <strong>${money(receipt.amountCents)}</strong>
@@ -1198,22 +1207,130 @@
     openJob(job.id);
   });
 
-  function openReceiptDialog(jobIdValue) {
-    receiptJobId = jobIdValue;
+  function clearReceiptCapture() {
     receiptForm.reset();
     $("receiptFormError").classList.add("hidden");
     $("receiptPreview").classList.add("hidden");
     $("receiptPreview").innerHTML = "";
     setScanStatus("");
+    clearSuggestRow();
+    pendingScan = { vendor: "", amount: 0 };
     if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
     receiptPreviewUrl = null;
+  }
+
+  async function refreshFiledReceiptsPanel() {
+    const job = findJob(receiptJobId);
+    const list = $("filedReceiptsList");
+    const total = $("filedReceiptsTotal");
+    if (!list || !total) return;
+    if (!job || !job.receipts.length) {
+      list.innerHTML = `<p class="receipt-empty">No receipts filed yet. Take a photo, confirm vendor and amount, then file.</p>`;
+      total.innerHTML = `<span>Job receipt total</span><strong>$0.00</strong>`;
+      return;
+    }
+
+    const rows = await Promise.all([...job.receipts].reverse().map(async (receipt) => {
+      const stored = await getReceiptForJob(job.id, receipt.id);
+      let image = `<span class="receipt-thumb">▧</span>`;
+      if (stored?.blob) {
+        const url = URL.createObjectURL(stored.blob);
+        activeObjectUrls.push(url);
+        image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
+      }
+      const suggested = Number(receipt.suggestedAmountCents || 0);
+      const suggestedVendor = String(receipt.suggestedVendor || "").trim();
+      const suggestChip = suggested
+        ? `<button type="button" class="receipt-suggest-chip" data-apply-filed="${escapeHtml(receipt.id)}" data-field="amount" data-value="${(suggested / 100).toFixed(2)}">Suggested ${money(suggested)}</button>`
+        : "";
+      const vendorChip = suggestedVendor
+        ? `<button type="button" class="receipt-suggest-chip" data-apply-filed="${escapeHtml(receipt.id)}" data-field="vendor" data-value="${escapeHtml(suggestedVendor)}">Saw ${escapeHtml(suggestedVendor)}</button>`
+        : "";
+      return `
+        <article class="filed-receipt-card" data-filed-id="${escapeHtml(receipt.id)}">
+          <button type="button" class="filed-receipt-photo" data-receipt-id="${escapeHtml(receipt.id)}">${image}</button>
+          <div class="filed-receipt-body">
+            <div class="filed-receipt-chips">${vendorChip}${suggestChip}</div>
+            <label class="field">
+              <span>Vendor</span>
+              <input data-filed-vendor="${escapeHtml(receipt.id)}" value="${escapeHtml(receipt.vendor || "")}" placeholder="Vendor">
+            </label>
+            <label class="field">
+              <span>Receipt amount</span>
+              <span class="money-input"><b>$</b><input data-filed-amount="${escapeHtml(receipt.id)}" inputmode="decimal" value="${(Number(receipt.amountCents || 0) / 100).toFixed(2)}"></span>
+            </label>
+          </div>
+        </article>`;
+    }));
+
+    list.innerHTML = rows.join("");
+    total.innerHTML = `
+      <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} for this job</span>
+      <strong>${money(receiptTotal(job))}</strong>`;
+
+    list.querySelectorAll("[data-receipt-id]").forEach((button) => {
+      button.addEventListener("click", () => viewReceipt(button.dataset.receiptId));
+    });
+    list.querySelectorAll("[data-apply-filed]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const id = button.dataset.applyFiled;
+        const field = button.dataset.field;
+        const value = button.dataset.value || "";
+        const receipt = job.receipts.find((item) => item.id === id);
+        if (!receipt) return;
+        if (field === "vendor") {
+          receipt.vendor = value;
+          const input = list.querySelector(`[data-filed-vendor="${id}"]`);
+          if (input) input.value = value;
+        } else if (field === "amount") {
+          receipt.amountCents = parseCents(value);
+          const input = list.querySelector(`[data-filed-amount="${id}"]`);
+          if (input) input.value = Number(receipt.amountCents / 100).toFixed(2);
+        }
+        queueJobSync(job);
+        if (job.status === "completed" || job.status === "invoiced") upsertInvoice(job);
+        total.innerHTML = `
+          <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} for this job</span>
+          <strong>${money(receiptTotal(job))}</strong>`;
+        notify(field === "vendor" ? "Vendor applied from the scan." : "Suggested amount applied.");
+      });
+    });
+    list.querySelectorAll("[data-filed-vendor]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const receipt = job.receipts.find((item) => item.id === input.dataset.filedVendor);
+        if (!receipt) return;
+        receipt.vendor = input.value.trim();
+        queueJobSync(job);
+        if (job.status === "completed" || job.status === "invoiced") upsertInvoice(job);
+      });
+    });
+    list.querySelectorAll("[data-filed-amount]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const receipt = job.receipts.find((item) => item.id === input.dataset.filedAmount);
+        if (!receipt) return;
+        receipt.amountCents = parseCents(input.value);
+        queueJobSync(job);
+        if (job.status === "completed" || job.status === "invoiced") upsertInvoice(job);
+        total.innerHTML = `
+          <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} for this job</span>
+          <strong>${money(receiptTotal(job))}</strong>`;
+      });
+    });
+  }
+
+  function openReceiptDialog(jobIdValue) {
+    receiptJobId = jobIdValue;
+    clearReceiptCapture();
+    refreshFiledReceiptsPanel();
     receiptDialog.showModal();
   }
 
   function closeReceiptDialog() {
     if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
     receiptPreviewUrl = null;
+    pendingScan = { vendor: "", amount: 0 };
     receiptDialog.close();
+    if (selectedJobId) renderJob();
   }
 
   function setScanStatus(message, tone = "") {
@@ -1221,6 +1338,45 @@
     if (!element) return;
     element.textContent = message || "";
     element.className = `receipt-scan-status${tone ? ` ${tone}` : ""}${message ? "" : " hidden"}`;
+  }
+
+  function clearSuggestRow() {
+    const row = $("receiptSuggestRow");
+    if (!row) return;
+    row.innerHTML = "";
+    row.classList.add("hidden");
+  }
+
+  function renderSuggestRow(vendor, amount) {
+    const row = $("receiptSuggestRow");
+    if (!row) return;
+    const chips = [];
+    if (vendor) {
+      chips.push(`<button type="button" class="receipt-suggest-chip" data-apply="vendor" data-value="${escapeHtml(vendor)}">Vendor · ${escapeHtml(vendor)}</button>`);
+    }
+    if (amount) {
+      chips.push(`<button type="button" class="receipt-suggest-chip" data-apply="amount" data-value="${amount.toFixed(2)}">Subtotal · $${amount.toFixed(2)}</button>`);
+    }
+    if (!chips.length) {
+      clearSuggestRow();
+      return;
+    }
+    row.innerHTML = `<p class="receipt-suggest-label">Tap if correct — or type it below</p>${chips.join("")}`;
+    row.classList.remove("hidden");
+    row.querySelectorAll("[data-apply]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const field = button.dataset.apply;
+        const value = button.dataset.value || "";
+        if (field === "vendor") {
+          const input = receiptForm.querySelector('[name="vendor"]');
+          if (input) input.value = value;
+        } else if (field === "amount") {
+          const input = receiptForm.querySelector('[name="amount"]');
+          if (input) input.value = value;
+        }
+        button.classList.add("is-applied");
+      });
+    });
   }
 
   function loadTesseract() {
@@ -1275,24 +1431,36 @@
       .filter((value) => Number.isFinite(value));
   }
 
-  function readTotal(lines) {
-    const priority = [
-      /\b(grand\s*total|amount\s*due|balance\s*due|total\s*due)\b/i,
-      /\btotal\b/i
-    ];
-    for (const pattern of priority) {
+  function readAmountFromLines(lines, patterns) {
+    for (const pattern of patterns) {
       for (const line of [...lines].reverse()) {
-        if (/\bsub\s*total\b/i.test(line) || !pattern.test(line)) continue;
+        if (!pattern.test(line)) continue;
         const values = amountsIn(line);
         if (values.length) return values[values.length - 1];
       }
     }
+    return 0;
+  }
+
+  function readSubtotal(lines) {
+    const subtotal = readAmountFromLines(lines, [
+      /\bsub[\s-]*total\b/i,
+      /\bmerchandise\s*total\b/i
+    ]);
+    if (subtotal) return subtotal;
+    const total = readAmountFromLines(lines, [
+      /\b(grand\s*total|amount\s*due|balance\s*due|total\s*due)\b/i,
+      /\btotal\b/i
+    ]);
+    if (total) return total;
     const all = lines.flatMap(amountsIn);
     return all.length ? Math.max(...all) : 0;
   }
 
   async function scanReceipt(file) {
     setScanStatus("Reading receipt…");
+    clearSuggestRow();
+    pendingScan = { vendor: "", amount: 0 };
     try {
       const worker = await ocrWorker();
       const { data } = await worker.recognize(file);
@@ -1301,25 +1469,22 @@
         .map((line) => line.trim())
         .filter(Boolean);
       if (!lines.length) {
-        setScanStatus("Could not read this photo. Type the vendor and total.", "warn");
+        setScanStatus("Could not read this photo. Type the vendor and amount.", "warn");
         return;
       }
 
-      const vendorInput = receiptForm.querySelector('[name="vendor"]');
-      const amountInput = receiptForm.querySelector('[name="amount"]');
       const vendor = readVendor(lines);
-      const total = readTotal(lines);
+      const amount = readSubtotal(lines);
+      pendingScan = { vendor, amount };
+      renderSuggestRow(vendor, amount);
 
-      if (vendor && vendorInput && !vendorInput.value.trim()) vendorInput.value = vendor;
-      if (total && amountInput && !amountInput.value.trim()) amountInput.value = total.toFixed(2);
-
-      if (vendor || total) {
-        setScanStatus(`Read ${vendor || "vendor not found"} · ${total ? `$${total.toFixed(2)}` : "total not found"}. Check it before filing.`, "ok");
+      if (vendor || amount) {
+        setScanStatus("Tap a suggestion if it looks right, or enter vendor and amount yourself.");
       } else {
-        setScanStatus("Could not read this photo. Type the vendor and total.", "warn");
+        setScanStatus("Could not read this photo. Type the vendor and amount.", "warn");
       }
     } catch {
-      setScanStatus("Scanner unavailable. Type the vendor and total.", "warn");
+      setScanStatus("Scanner unavailable. Type the vendor and amount.", "warn");
     }
   }
 
@@ -1330,6 +1495,10 @@
     receiptPreviewUrl = URL.createObjectURL(file);
     $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
     $("receiptPreview").classList.remove("hidden");
+    const vendorInput = receiptForm.querySelector('[name="vendor"]');
+    const amountInput = receiptForm.querySelector('[name="amount"]');
+    if (vendorInput) vendorInput.value = "";
+    if (amountInput) amountInput.value = "";
     scanReceipt(file);
   });
 
@@ -1343,30 +1512,40 @@
       return;
     }
 
+    const data = new FormData(receiptForm);
+    const vendor = String(data.get("vendor") || "").trim();
+    const amountCents = parseCents(data.get("amount"));
+    if (!vendor || !amountCents) {
+      $("receiptFormError").textContent = "Fill both vendor and receipt amount before filing.";
+      $("receiptFormError").classList.remove("hidden");
+      return;
+    }
+
     try {
       const blob = await compressReceipt(file);
-      const data = new FormData(receiptForm);
       const receipt = {
         id: uid(),
         filename: file.name || `receipt-${Date.now()}.jpg`,
-        vendor: String(data.get("vendor") || "").trim(),
-        amountCents: parseCents(data.get("amount")),
+        vendor,
+        amountCents,
+        suggestedVendor: pendingScan.vendor || "",
+        suggestedAmountCents: pendingScan.amount ? Math.round(pendingScan.amount * 100) : 0,
         createdAt: new Date().toISOString()
       };
       await storeReceipt(receipt.id, blob);
       job.receipts.push(receipt);
       queueReceiptSync(job.id, receipt.id);
-      closeReceiptDialog();
       if (job.status === "completed" || job.status === "invoiced") {
-        const invoice = upsertInvoice(job);
-        await renderJob();
-        notify(`${invoice.invoiceNumber} updated with this receipt — share to collect.`);
+        upsertInvoice(job);
+        notify("Receipt filed. Keep going or close when this job's receipts are done.");
       } else {
         job.receiptReview = false;
         queueJobSync(job);
-        await renderJob();
-        notify("Receipt filed. Parts total updated on the running invoice.");
+        notify("Receipt filed. Parts total updated — take the next photo or close.");
       }
+      clearReceiptCapture();
+      await renderJob();
+      await refreshFiledReceiptsPanel();
     } catch {
       $("receiptFormError").textContent = "The receipt could not be saved. Check available phone storage and retry.";
       $("receiptFormError").classList.remove("hidden");

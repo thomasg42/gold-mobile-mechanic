@@ -160,24 +160,30 @@
         <input id="receiptFile" name="receiptFile" type="file" accept="image/*" capture="environment" required>
         <span class="camera-icon" aria-hidden="true">◎</span>
         <strong>Take receipt photo</strong>
-        <small>Vendor and total are read from the photo</small>
+        <small>Reads the top vendor and the subtotal — tap a suggestion if it looks right</small>
       </label>
       <div class="receipt-preview hidden" id="receiptPreview"></div>
       <p class="receipt-scan-status hidden" id="receiptScanStatus"></p>
+      <div class="receipt-suggest-row hidden" id="receiptSuggestRow"></div>
       <div class="form-grid">
         <label class="field">
           <span>Vendor</span>
-          <input name="vendor" placeholder="NAPA Auto Parts">
+          <input name="vendor" placeholder="NAPA Auto Parts" autocomplete="off">
         </label>
         <label class="field">
           <span>Receipt amount</span>
-          <span class="money-input"><b>$</b><input name="amount" inputmode="decimal" placeholder="0.00"></span>
+          <span class="money-input"><b>$</b><input name="amount" inputmode="decimal" placeholder="0.00" autocomplete="off"></span>
         </label>
       </div>
       <p class="form-error hidden" id="receiptFormError"></p>
       <div class="sheet-actions">
         <button class="button button-quiet" id="cancelReceiptButton" type="button">Cancel</button>
         <button class="button button-gold" type="submit">File receipt</button>
+      </div>
+      <div class="filed-receipts" id="filedReceiptsPanel">
+        <p class="eyebrow">Filed receipts</p>
+        <div class="receipt-list" id="filedReceiptsList"></div>
+        <div class="receipt-total" id="filedReceiptsTotal"></div>
       </div>
     </form>
   </dialog>

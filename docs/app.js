@@ -390,11 +390,9 @@
       }, 0);
   }
 
-  function materialTotal(job) {
-    return (job.materials || []).reduce(
-      (total, item) => total + Math.round(Number(item.quantity || 0) * Number(item.unitCostCents || 0)),
-      0
-    );
+  function materialTotal(_job) {
+    // Approved materials are a checklist only. Money comes from receipt capture.
+    return 0;
   }
 
   function receiptTotal(job) {
@@ -405,7 +403,7 @@
   }
 
   function partsTotal(job) {
-    return materialTotal(job) + receiptTotal(job);
+    return receiptTotal(job);
   }
 
   function invoiceDraft(job) {
@@ -586,7 +584,7 @@
         <span class="card-stats">
           <span><span>Work</span><strong>${duration(elapsedSeconds(job, "work"))}</strong></span>
           <span><span>Receipts</span><strong>${job.receipts.length}</strong></span>
-          <span><span>Estimate</span><strong>${money(materialTotal(job))}</strong></span>
+          <span><span>Materials</span><strong>${job.materials.length}</strong></span>
         </span>
       </button>
     `).join("");
@@ -623,22 +621,29 @@
     return `<button class="button button-quiet" type="button" disabled>${job.status === "invoiced" ? "Invoice filed" : "Job complete"}</button>`;
   }
 
-  function materialsMarkup(job) {
-    if (!job.materials.length) return `<p class="materials-empty">No approved materials were entered for this job.</p>`;
+  function materialsMarkup(job, locked) {
+    const items = Array.isArray(job.materials) ? job.materials : [];
+    if (locked) {
+      if (!items.length) return `<p class="materials-empty">No approved materials were entered for this job.</p>`;
+      return `<ul class="materials-list">${items.map((item) => `<li>${escapeHtml(item.description || "")}</li>`).join("")}</ul>`;
+    }
+
+    const rows = items.length ? items : [{ id: uid(), description: "" }];
     return `
-      <table class="materials-table">
-        <thead><tr><th>Material</th><th>Qty</th><th>Unit</th><th>Total</th></tr></thead>
-        <tbody>
-          ${job.materials.map((item) => `
-            <tr>
-              <td>${escapeHtml(item.description)}</td>
-              <td>${Number(item.quantity).toFixed(2).replace(/\.00$/, "")}</td>
-              <td>${money(item.unitCostCents)}</td>
-              <td>${money(Math.round(item.quantity * item.unitCostCents))}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>`;
+      <div id="jobMaterialRows">
+        ${rows.map((item) => `
+          <div class="material-row" data-material-id="${escapeHtml(item.id || uid())}">
+            <label class="field">
+              <span>Material</span>
+              <input name="jobMaterialDescription" autocomplete="off" value="${escapeHtml(item.description || "")}" placeholder="Alternator">
+            </label>
+            <button class="icon-button" type="button" data-remove-material aria-label="Remove material">×</button>
+          </div>`).join("")}
+      </div>
+      <div class="save-row materials-actions">
+        <button class="button button-quiet" id="addJobMaterialButton" type="button">+ Add material</button>
+        <button class="button button-quiet" id="saveMaterialsButton" type="button">Save materials</button>
+      </div>`;
   }
 
   function invoiceMarkup(job) {
@@ -655,7 +660,7 @@
         </div>
         <div class="invoice-meta">
           <span>Labor · ${money(job.invoice.laborCents)}</span>
-          <span>Materials · ${money(job.invoice.materialsCents)}</span>
+          <span>Parts · ${money(job.invoice.materialsCents)}</span>
           <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} filed</span>
         </div>
         <div class="invoice-total"><span>Total</span><strong>${money(job.invoice.totalCents)}</strong></div>
@@ -781,12 +786,12 @@
           <article class="content-card">
             <div class="card-heading">
               <div>
-                <p class="eyebrow">Customer-approved costs</p>
+                <p class="eyebrow">Agreed parts list</p>
                 <h2>Materials</h2>
+                <p>Checklist of what is needed for the job. Prices come from receipts later.</p>
               </div>
-              <strong>${money(materialTotal(job))}</strong>
             </div>
-            ${materialsMarkup(job)}
+            ${materialsMarkup(job, locked)}
           </article>
 
           <article class="content-card">
@@ -879,6 +884,64 @@
       });
     }
 
+    const jobMaterialRows = $("jobMaterialRows");
+    if (jobMaterialRows) {
+      jobMaterialRows.querySelectorAll("[data-remove-material]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const row = button.closest(".material-row");
+          if (!row) return;
+          if (jobMaterialRows.children.length === 1) {
+            const input = row.querySelector('[name="jobMaterialDescription"]');
+            if (input) input.value = "";
+            row.dataset.materialId = uid();
+          } else {
+            row.remove();
+          }
+        });
+      });
+    }
+
+    const addJobMaterialButton = $("addJobMaterialButton");
+    if (addJobMaterialButton && jobMaterialRows) {
+      addJobMaterialButton.addEventListener("click", () => {
+        const row = document.createElement("div");
+        row.className = "material-row";
+        row.dataset.materialId = uid();
+        row.innerHTML = `
+          <label class="field">
+            <span>Material</span>
+            <input name="jobMaterialDescription" autocomplete="off" value="" placeholder="Alternator">
+          </label>
+          <button class="icon-button" type="button" data-remove-material aria-label="Remove material">×</button>`;
+        row.querySelector("[data-remove-material]").addEventListener("click", () => {
+          if (jobMaterialRows.children.length === 1) {
+            const input = row.querySelector('[name="jobMaterialDescription"]');
+            if (input) input.value = "";
+            row.dataset.materialId = uid();
+          } else {
+            row.remove();
+          }
+        });
+        jobMaterialRows.appendChild(row);
+        row.querySelector("input")?.focus();
+      });
+    }
+
+    const saveMaterialsButton = $("saveMaterialsButton");
+    if (saveMaterialsButton && jobMaterialRows) {
+      saveMaterialsButton.addEventListener("click", () => {
+        job.materials = [...jobMaterialRows.querySelectorAll(".material-row")]
+          .map((row) => ({
+            id: row.dataset.materialId || uid(),
+            description: row.querySelector('[name="jobMaterialDescription"]')?.value.trim() || ""
+          }))
+          .filter((item) => item.description);
+        queueJobSync(job);
+        renderJob();
+        notify("Materials list saved.");
+      });
+    }
+
     const reviewInput = $("receiptReviewInput");
     if (reviewInput && !reviewInput.disabled) {
       reviewInput.addEventListener("change", () => {
@@ -963,23 +1026,16 @@
     row.dataset.materialId = values.id || uid();
     row.innerHTML = `
       <label class="field">
-        <span>Description</span>
-        <input name="materialDescription" value="${escapeHtml(values.description || "")}" placeholder="Alternator">
-      </label>
-      <label class="field">
-        <span>Qty</span>
-        <input name="materialQuantity" inputmode="decimal" value="${escapeHtml(values.quantity || "1")}">
-      </label>
-      <label class="field">
-        <span>Unit cost</span>
-        <span class="money-input"><b>$</b><input name="materialCost" inputmode="decimal" value="${escapeHtml(values.unitCost || "")}" placeholder="0.00"></span>
+        <span>Material</span>
+        <input name="materialDescription" autocomplete="off" value="" placeholder="Alternator">
       </label>
       <button class="icon-button" type="button" aria-label="Remove material">×</button>`;
+    const input = row.querySelector('[name="materialDescription"]');
+    if (values.description) input.value = String(values.description);
     row.querySelector("button").addEventListener("click", () => {
       if (materialRows.children.length === 1) {
-        row.querySelectorAll("input").forEach((input) => {
-          input.value = input.name === "materialQuantity" ? "1" : "";
-        });
+        input.value = "";
+        row.dataset.materialId = uid();
       } else {
         row.remove();
       }
@@ -1016,13 +1072,9 @@
     const materials = [...materialRows.querySelectorAll(".material-row")]
       .map((row) => {
         const description = row.querySelector('[name="materialDescription"]').value.trim();
-        const quantity = Number.parseFloat(row.querySelector('[name="materialQuantity"]').value);
-        const unitCostCents = parseCents(row.querySelector('[name="materialCost"]').value);
         return {
-          id: row.dataset.materialId,
-          description,
-          quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1,
-          unitCostCents
+          id: row.dataset.materialId || uid(),
+          description
         };
       })
       .filter((item) => item.description);
@@ -1160,13 +1212,9 @@
         </section>`);
     }
 
-    const materialRowsMarkup = job.materials.map((item) => `
-      <tr>
-        <td>${escapeHtml(item.description)}</td>
-        <td>${Number(item.quantity).toFixed(2).replace(/\.00$/, "")}</td>
-        <td>${money(item.unitCostCents)}</td>
-        <td>${money(Math.round(item.quantity * item.unitCostCents))}</td>
-      </tr>`).join("");
+    const agreedMaterialsMarkup = (job.materials || []).length
+      ? `<div class="box"><span class="eyebrow">Agreed materials</span><ul>${job.materials.map((item) => `<li>${escapeHtml(item.description || "")}</li>`).join("")}</ul></div>`
+      : "";
 
     const receiptRowsMarkup = (job.receipts || [])
       .filter((receipt) => Number(receipt.amountCents || 0) > 0)
@@ -1192,7 +1240,7 @@
     table{width:100%;border-collapse:collapse;margin:24px 0}th,td{border-bottom:1px solid #ddd;padding:12px 8px;text-align:left}th:last-child,td:last-child{text-align:right}
     .totals{margin-left:auto;width:320px}.totals div{display:flex;justify-content:space-between;padding:8px 0}.total{border-top:2px solid #171717;font-size:20px;font-weight:800}
     .notes{margin-top:36px;white-space:pre-wrap}.receipt-page{break-before:page;padding-top:24px}.receipt-page img{max-width:100%;max-height:930px;object-fit:contain;border:1px solid #ddd}
-    @media(max-width:600px){body{padding:22px}.grid{grid-template-columns:1fr}.totals{width:100%}}@media print{body{padding:0}}
+    ul{margin:8px 0 0;padding-left:18px}@media(max-width:600px){body{padding:22px}.grid{grid-template-columns:1fr}.totals{width:100%}}@media print{body{padding:0}}
   </style>
 </head>
 <body>
@@ -1206,17 +1254,17 @@
       <div class="box"><span class="eyebrow">Vehicle</span><br><strong>${escapeHtml(vehicleName(job))}</strong><br>${escapeHtml(job.vehiclePlate || "No plate recorded")}</div>
     </div>
     <div class="box"><span class="eyebrow">Agreed work</span><p>${escapeHtml(job.agreedWork)}</p></div>
+    ${agreedMaterialsMarkup}
     <table>
-      <thead><tr><th>Service / material</th><th>Qty / hours</th><th>Rate</th><th>Amount</th></tr></thead>
+      <thead><tr><th>Service / part</th><th>Qty / hours</th><th>Rate</th><th>Amount</th></tr></thead>
       <tbody>
         <tr><td>Mobile mechanic labor</td><td>${(job.invoice.workSeconds / 3600).toFixed(2)} hrs</td><td>${money(job.laborRateCents)}/hr</td><td>${money(job.invoice.laborCents)}</td></tr>
-        ${materialRowsMarkup}
         ${receiptRowsMarkup}
       </tbody>
     </table>
     <div class="totals">
       <div><span>Labor</span><strong>${money(job.invoice.laborCents)}</strong></div>
-      <div><span>Parts (materials + receipts)</span><strong>${money(job.invoice.materialsCents)}</strong></div>
+      <div><span>Parts (from receipts)</span><strong>${money(job.invoice.materialsCents)}</strong></div>
       <div class="total"><span>Total</span><span>${money(job.invoice.totalCents)}</span></div>
     </div>
     <div class="notes box"><span class="eyebrow">Mechanic's suggestions</span><p>${escapeHtml(job.suggestions || "No additional suggestions.")}</p></div>

@@ -1011,10 +1011,28 @@ button {
 
 .material-row {
   display: grid;
-  grid-template-columns: 1fr 0.35fr 0.55fr 38px;
+  grid-template-columns: 1fr 38px;
   gap: 9px;
   margin-top: 9px;
   align-items: end;
+}
+
+.materials-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.materials-list li + li {
+  margin-top: 6px;
+}
+
+.materials-actions {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .material-row .icon-button {
@@ -1253,11 +1271,7 @@ button {
   }
 
   .material-row {
-    grid-template-columns: 1fr 0.45fr 0.7fr 38px;
-  }
-
-  .material-row .field:first-child {
-    grid-column: 1 / -1;
+    grid-template-columns: 1fr 38px;
   }
 
   .sheet-actions {

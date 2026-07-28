@@ -156,12 +156,20 @@
         </div>
         <button class="icon-button" id="closeReceiptDialog" type="button" aria-label="Close">×</button>
       </div>
-      <label class="camera-button">
-        <input id="receiptFile" name="receiptFile" type="file" accept="image/*" capture="environment">
-        <span class="camera-icon" aria-hidden="true">◎</span>
-        <strong>Take receipt photo</strong>
-        <small>Tap vendor and subtotal if they look right, then Add a Receipt</small>
-      </label>
+      <div class="receipt-capture-options">
+        <label class="camera-button">
+          <input id="receiptFile" name="receiptFile" type="file" accept="image/*" capture="environment">
+          <span class="camera-icon" aria-hidden="true">◎</span>
+          <strong>Take receipt photo</strong>
+          <small>One at a time with the camera</small>
+        </label>
+        <label class="camera-button library-button">
+          <input id="receiptLibrary" type="file" accept="image/*" multiple>
+          <span class="camera-icon" aria-hidden="true">▦</span>
+          <strong>Choose from library</strong>
+          <small>Select one or many receipts already on the phone</small>
+        </label>
+      </div>
       <div class="receipt-preview hidden" id="receiptPreview"></div>
       <p class="receipt-scan-status hidden" id="receiptScanStatus"></p>
       <div class="receipt-suggest-row hidden" id="receiptSuggestRow"></div>

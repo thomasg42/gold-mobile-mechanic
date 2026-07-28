@@ -36,7 +36,7 @@
   let toastTimer = null;
   let syncInFlight = null;
   let ocrWorkerPromise = null;
-  let pendingScan = { vendor: "", amount: 0 };
+  let pendingScan = { vendor: "", amount: 0, orderId: "" };
 
   function arrayFromStorage(key) {
     try {
@@ -82,10 +82,24 @@
       ...job,
       materials: Array.isArray(job.materials) ? job.materials : [],
       timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
-      receipts: Array.isArray(job.receipts) ? job.receipts : [],
+      receipts: (Array.isArray(job.receipts) ? job.receipts : []).map((receipt) => ({
+        ...receipt,
+        orderId: receipt.orderId || "",
+        addCents: Number.isFinite(Number(receipt.addCents)) ? Math.max(0, Math.round(Number(receipt.addCents))) : 0,
+        subtractCents: Number.isFinite(Number(receipt.subtractCents)) ? Math.max(0, Math.round(Number(receipt.subtractCents))) : 0
+      })),
       manualWorkSeconds: Number.isFinite(Number(job.manualWorkSeconds))
         ? Math.max(0, Math.round(Number(job.manualWorkSeconds)))
         : 0,
+      laborAmountCents: job.laborAmountCents === null || job.laborAmountCents === undefined || job.laborAmountCents === ""
+        ? null
+        : (Number.isFinite(Number(job.laborAmountCents))
+          ? Math.max(0, Math.round(Number(job.laborAmountCents)))
+          : null),
+      laborAdjustmentCents: Number.isFinite(Number(job.laborAdjustmentCents))
+        ? Math.round(Number(job.laborAdjustmentCents))
+        : 0,
+      difficultyLevel: String(job.difficultyLevel || "Standard"),
       eventHistory: Array.isArray(job.eventHistory) && job.eventHistory.length
         ? job.eventHistory
         : derivedEventHistory(job)
@@ -347,6 +361,11 @@
     return Number.isFinite(amount) ? Math.max(0, Math.round(amount * 100)) : 0;
   }
 
+  function parseSignedCents(value) {
+    const amount = Number.parseFloat(String(value || "").replaceAll(",", ""));
+    return Number.isFinite(amount) ? Math.round(amount * 100) : 0;
+  }
+
   function money(cents) {
     return new Intl.NumberFormat("en-US", {
       style: "currency",
@@ -424,9 +443,15 @@
     return 0;
   }
 
+  function receiptEffectiveCents(receipt) {
+    return Number(receipt.amountCents || 0)
+      + Math.max(0, Number(receipt.addCents || 0))
+      - Math.max(0, Number(receipt.subtractCents || 0));
+  }
+
   function receiptTotal(job) {
     return (job.receipts || []).reduce(
-      (total, receipt) => total + Number(receipt.amountCents || 0),
+      (total, receipt) => total + receiptEffectiveCents(receipt),
       0
     );
   }
@@ -437,16 +462,29 @@
 
   function invoiceDraft(job) {
     const workSeconds = billableSeconds(job);
-    const laborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
+    const timedLaborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
+    const hasOwnLabor = job.laborAmountCents !== null && job.laborAmountCents !== undefined
+      && Number.isFinite(Number(job.laborAmountCents));
+    const baseLaborCents = hasOwnLabor
+      ? Math.max(0, Math.round(Number(job.laborAmountCents)))
+      : timedLaborCents;
+    const laborAdjustmentCents = Number.isFinite(Number(job.laborAdjustmentCents))
+      ? Math.round(Number(job.laborAdjustmentCents))
+      : 0;
+    const laborCents = Math.max(0, baseLaborCents + laborAdjustmentCents);
     const materialsCents = partsTotal(job);
     return {
       invoiceNumber: job.id.replace(/^GMM-/, "GMM-INV-"),
       createdAt: job.invoice?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       workSeconds,
+      timedLaborCents,
+      baseLaborCents,
+      laborAdjustmentCents,
       laborCents,
       materialsCents,
-      totalCents: laborCents + materialsCents
+      totalCents: laborCents + materialsCents,
+      difficultyLevel: String(job.difficultyLevel || "Standard")
     };
   }
 
@@ -776,6 +814,7 @@
   async function receiptMarkup(job) {
     revokeObjectUrls();
     if (!job.receipts.length) return `<p class="receipt-empty">No receipts filed yet.</p>`;
+    const locked = job.status === "invoiced";
     const rows = await Promise.all(job.receipts.map(async (receipt) => {
       const stored = await getReceiptForJob(job.id, receipt.id);
       let image = `<span class="receipt-thumb">▧</span>`;
@@ -784,19 +823,38 @@
         activeObjectUrls.push(url);
         image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
       }
-      const suggestedVendor = String(receipt.suggestedVendor || "").trim();
+      const effective = receiptEffectiveCents(receipt);
       return `
-        <div class="receipt-row">
-          <button type="button" data-receipt-id="${escapeHtml(receipt.id)}">
-            ${image}
-            <span class="receipt-copy">
-              <strong>${escapeHtml(receipt.vendor || receipt.filename)}</strong>
-              <small>${calendarDate(receipt.createdAt)}${suggestedVendor ? ` · saw ${escapeHtml(suggestedVendor)}` : ""}</small>
-              ${receiptSuggestLabel(receipt)}
-            </span>
-          </button>
-          <strong>${money(receipt.amountCents)}</strong>
-        </div>`;
+        <article class="filed-receipt-card folder-receipt-card" data-folder-receipt="${escapeHtml(receipt.id)}">
+          <button type="button" class="filed-receipt-photo" data-receipt-id="${escapeHtml(receipt.id)}">${image}</button>
+          <div class="filed-receipt-body">
+            <label class="field">
+              <span>Vendor</span>
+              <input data-folder-vendor="${escapeHtml(receipt.id)}" value="${escapeHtml(receipt.vendor || "")}" placeholder="Auto Zone" ${locked ? "disabled" : ""}>
+            </label>
+            <label class="field">
+              <span>Order ID</span>
+              <input data-folder-order="${escapeHtml(receipt.id)}" value="${escapeHtml(receipt.orderId || "")}" placeholder="Order / ticket #" ${locked ? "disabled" : ""}>
+            </label>
+            <div class="folder-receipt-amount">
+              <span class="detail-label">Receipt amount</span>
+              <strong>${money(receipt.amountCents)}</strong>
+            </div>
+            ${locked ? "" : `
+              <label class="field">
+                <span>Add to this receipt</span>
+                <span class="money-input"><b>$</b><input data-folder-add="${escapeHtml(receipt.id)}" inputmode="decimal" value="${Number(receipt.addCents || 0) ? (Number(receipt.addCents) / 100).toFixed(2) : ""}" placeholder="0.00"></span>
+              </label>
+              <label class="field">
+                <span>Subtract amount from that receipt</span>
+                <span class="money-input"><b>$</b><input data-folder-subtract="${escapeHtml(receipt.id)}" inputmode="decimal" value="${Number(receipt.subtractCents || 0) ? (Number(receipt.subtractCents) / 100).toFixed(2) : ""}" placeholder="0.00"></span>
+              </label>`}
+            <div class="folder-receipt-subtotal">
+              <span>Subtotal to that receipt</span>
+              <strong data-folder-subtotal="${escapeHtml(receipt.id)}">${money(effective)}</strong>
+            </div>
+          </div>
+        </article>`;
     }));
     return `${rows.join("")}
       <div class="receipt-total">
@@ -840,7 +898,6 @@
     const adjustment = hoursMinutes(manualWorkSeconds(job));
     const receipts = await receiptMarkup(job);
     const locked = job.status === "invoiced";
-    const canReview = job.status === "completed" || job.status === "invoiced";
     const draft = invoiceDraft(job);
 
     jobView.innerHTML = `
@@ -880,7 +937,7 @@
                 <span class="detail-label">Billable hours on the invoice</span>
                 <strong id="billableSummary">${duration(workSeconds)}</strong>
               </div>
-              <p class="time-edit-note">Timer ${duration(timedSeconds)}${manualWorkSeconds(job) ? ` · added ${adjustment.hours}h ${adjustment.minutes}m` : ""}</p>
+              <p class="time-edit-note">Timer ${duration(timedSeconds)}${manualWorkSeconds(job) ? ` · added ${adjustment.hours}h ${adjustment.minutes}m` : ""} · timer labor ${money(draft.timedLaborCents)}</p>
               ${locked ? "" : `
                 <div class="time-edit-fields">
                   <label class="field">
@@ -895,6 +952,35 @@
                 <div class="save-row time-edit-actions">
                   <button class="button button-quiet" id="setManualTimeButton" type="button">Set added time</button>
                   <button class="button button-quiet" id="addManualTimeButton" type="button">Add to total</button>
+                </div>
+                <div class="labor-cash">
+                  <p class="detail-label">Labor dollar total</p>
+                  <p class="time-edit-note">Enter your own labor total, then plus or minus more. Difficulty stays with the job.</p>
+                  <div class="time-edit-fields">
+                    <label class="field">
+                      <span>Own labor total</span>
+                      <span class="money-input"><b>$</b><input id="laborAmountInput" inputmode="decimal" value="${job.laborAmountCents !== null && job.laborAmountCents !== undefined ? (Number(job.laborAmountCents) / 100).toFixed(2) : ""}" placeholder="${(draft.timedLaborCents / 100).toFixed(2)}"></span>
+                    </label>
+                    <label class="field">
+                      <span>Plus or minus</span>
+                      <span class="money-input"><b>$</b><input id="laborAdjustInput" inputmode="decimal" value="${Number(job.laborAdjustmentCents || 0) ? (Number(job.laborAdjustmentCents) / 100).toFixed(2) : ""}" placeholder="0.00"></span>
+                    </label>
+                  </div>
+                  <label class="field">
+                    <span>Difficulty level</span>
+                    <select id="difficultySelect">
+                      ${["Standard", "Easy", "Moderate", "Hard", "Expert"].map((level) => `
+                        <option value="${level}" ${String(job.difficultyLevel || "Standard") === level ? "selected" : ""}>${level}</option>`).join("")}
+                    </select>
+                  </label>
+                  <div class="folder-receipt-subtotal">
+                    <span>Labor for invoice</span>
+                    <strong>${money(draft.laborCents)}</strong>
+                  </div>
+                  <div class="save-row time-edit-actions">
+                    <button class="button button-quiet" id="saveLaborButton" type="button">Save labor</button>
+                    <button class="button button-quiet" id="clearOwnLaborButton" type="button">Use timer labor</button>
+                  </div>
                 </div>`}
             </div>
             <div class="history-panel">
@@ -949,10 +1035,14 @@
               <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
             </div>
             <div class="receipt-list">${receipts}</div>
-            <label class="review-check">
-              <input id="receiptReviewInput" type="checkbox" ${job.receiptReview ? "checked" : ""} ${canReview ? "" : "disabled"}>
-              <span><strong>Receipt folder reviewed</strong><br>Optional double-check. Clock-out and receipt capture already file the invoice for payment.</span>
-            </label>
+            ${locked ? `
+              <p class="time-edit-note">${job.receiptReview ? "Receipt folder saved." : "Receipt folder not saved yet."}</p>
+            ` : `
+              <div class="save-row">
+                <button class="button button-gold" id="saveReceiptFolderButton" type="button">Save receipt folder</button>
+              </div>
+              <p class="time-edit-note">Saves vendor, order ID, and add/subtract amounts for every receipt on this job. Then use Clock out & invoice.</p>
+            `}
           </article>
 
           ${job.status !== "invoiced" ? `
@@ -1122,6 +1212,68 @@
       });
     }
 
+    const saveReceiptFolderButton = $("saveReceiptFolderButton");
+    if (saveReceiptFolderButton) {
+      saveReceiptFolderButton.addEventListener("click", () => {
+        job.receipts.forEach((receipt) => {
+          const vendorInput = document.querySelector(`[data-folder-vendor="${receipt.id}"]`);
+          const orderInput = document.querySelector(`[data-folder-order="${receipt.id}"]`);
+          const addInput = document.querySelector(`[data-folder-add="${receipt.id}"]`);
+          const subtractInput = document.querySelector(`[data-folder-subtract="${receipt.id}"]`);
+          if (vendorInput) receipt.vendor = canonicalizeVendor(vendorInput.value, job);
+          if (orderInput) receipt.orderId = orderInput.value.trim();
+          if (addInput) receipt.addCents = parseCents(addInput.value);
+          if (subtractInput) receipt.subtractCents = parseCents(subtractInput.value);
+        });
+        job.receiptReview = true;
+        job.receiptFolderSavedAt = new Date().toISOString();
+        if (job.invoice) job.invoice = invoiceDraft(job);
+        queueJobSync(job);
+        renderJob();
+        notify(`Receipt folder saved · parts ${money(receiptTotal(job))}.`);
+      });
+    }
+
+    const saveLaborButton = $("saveLaborButton");
+    if (saveLaborButton) {
+      saveLaborButton.addEventListener("click", () => {
+        const amountRaw = String($("laborAmountInput")?.value || "").trim();
+        const adjustRaw = String($("laborAdjustInput")?.value || "").trim();
+        job.laborAmountCents = amountRaw === "" ? null : parseCents(amountRaw);
+        job.laborAdjustmentCents = adjustRaw === "" ? 0 : parseSignedCents(adjustRaw);
+        job.difficultyLevel = $("difficultySelect")?.value || "Standard";
+        if (job.invoice) job.invoice = invoiceDraft(job);
+        queueJobSync(job);
+        renderJob();
+        notify(`Labor saved · ${money(invoiceDraft(job).laborCents)} · ${job.difficultyLevel}.`);
+      });
+    }
+
+    const clearOwnLaborButton = $("clearOwnLaborButton");
+    if (clearOwnLaborButton) {
+      clearOwnLaborButton.addEventListener("click", () => {
+        job.laborAmountCents = null;
+        job.laborAdjustmentCents = 0;
+        if (job.invoice) job.invoice = invoiceDraft(job);
+        queueJobSync(job);
+        renderJob();
+        notify("Using timer labor for the invoice.");
+      });
+    }
+
+    document.querySelectorAll("[data-folder-add], [data-folder-subtract]").forEach((input) => {
+      input.addEventListener("input", () => {
+        const id = input.dataset.folderAdd || input.dataset.folderSubtract;
+        const receipt = job.receipts.find((item) => item.id === id);
+        if (!receipt) return;
+        const addValue = document.querySelector(`[data-folder-add="${id}"]`)?.value;
+        const subtractValue = document.querySelector(`[data-folder-subtract="${id}"]`)?.value;
+        const effective = Number(receipt.amountCents || 0) + parseCents(addValue) - parseCents(subtractValue);
+        const label = document.querySelector(`[data-folder-subtotal="${id}"]`);
+        if (label) label.textContent = money(effective);
+      });
+    });
+
     const createInvoiceButton = $("createInvoiceButton");
     if (createInvoiceButton) {
       createInvoiceButton.addEventListener("click", async () => {
@@ -1265,6 +1417,9 @@
       suggestions: "",
       status: "draft",
       receiptReview: false,
+      laborAmountCents: null,
+      laborAdjustmentCents: 0,
+      difficultyLevel: "Standard",
       createdAt: new Date().toISOString(),
       startedAt: null,
       endedAt: null,
@@ -1303,12 +1458,22 @@
     return names;
   }
 
+  function cleanVendorName(value) {
+    return String(value || "")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/\s+(?:store\s*)?#?\d[\w-]*$/i, "")
+      .replace(/\s+#\d[\w-]*$/g, "")
+      .replace(/\s+\d{2,}[\w-]*$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function canonicalizeVendor(candidate, job = findJob(receiptJobId)) {
-    const cleaned = String(candidate || "").trim();
+    const cleaned = cleanVendorName(candidate);
     if (!cleaned) return "";
     const key = vendorKey(cleaned);
     if (!key) return cleaned;
-    const known = knownVendorSpellings(job);
+    const known = knownVendorSpellings(job).map(cleanVendorName);
     for (const name of known) {
       if (vendorKey(name) === key) return name;
     }
@@ -1339,6 +1504,8 @@
     const fileInput = $("receiptFile");
     if (fileInput) fileInput.value = "";
     receiptForm.querySelector('[name="vendor"]').value = "";
+    const orderInput = receiptForm.querySelector('[name="orderId"]');
+    if (orderInput) orderInput.value = "";
     receiptForm.querySelector('[name="amount"]').value = "";
     $("receiptFormError").classList.add("hidden");
     $("receiptFormError").textContent = "";
@@ -1346,7 +1513,7 @@
     $("receiptPreview").innerHTML = "";
     setScanStatus("");
     clearSuggestRow();
-    pendingScan = { vendor: "", amount: 0 };
+    pendingScan = { vendor: "", amount: 0, orderId: "" };
     pendingCapture = null;
     if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
     receiptPreviewUrl = null;
@@ -1533,12 +1700,15 @@
     row.classList.add("hidden");
   }
 
-  function renderSuggestRow(vendor, amount) {
+  function renderSuggestRow(vendor, amount, orderId = "") {
     const row = $("receiptSuggestRow");
     if (!row) return;
     const chips = [];
     if (vendor) {
       chips.push(`<button type="button" class="receipt-suggest-chip" data-apply="vendor" data-value="${escapeHtml(vendor)}">Vendor · ${escapeHtml(vendor)}</button>`);
+    }
+    if (orderId) {
+      chips.push(`<button type="button" class="receipt-suggest-chip" data-apply="orderId" data-value="${escapeHtml(orderId)}">Order ID · ${escapeHtml(orderId)}</button>`);
     }
     if (amount) {
       chips.push(`<button type="button" class="receipt-suggest-chip" data-apply="amount" data-value="${amount.toFixed(2)}">Subtotal · $${amount.toFixed(2)}</button>`);
@@ -1556,6 +1726,9 @@
         if (field === "vendor") {
           const input = receiptForm.querySelector('[name="vendor"]');
           if (input) input.value = canonicalizeVendor(value);
+        } else if (field === "orderId") {
+          const input = receiptForm.querySelector('[name="orderId"]');
+          if (input) input.value = value;
         } else if (field === "amount") {
           const input = receiptForm.querySelector('[name="amount"]');
           if (input) input.value = value;
@@ -1600,13 +1773,30 @@
       const cleaned = line.replace(/[^A-Za-z0-9&'’.\- ]/g, " ").replace(/\s+/g, " ").trim();
       const letters = cleaned.replace(/[^A-Za-z]/g, "");
       if (letters.length < 3 || skip.test(cleaned)) continue;
-      return cleaned
-        .split(" ")
-        .map((word) => (word.length > 2 && word === word.toUpperCase()
-          ? word.charAt(0) + word.slice(1).toLowerCase()
-          : word))
-        .join(" ")
-        .slice(0, 48);
+      return cleanVendorName(
+        cleaned
+          .split(" ")
+          .map((word) => (word.length > 2 && word === word.toUpperCase()
+            ? word.charAt(0) + word.slice(1).toLowerCase()
+            : word))
+          .join(" ")
+          .slice(0, 48)
+      );
+    }
+    return "";
+  }
+
+  function readOrderId(lines) {
+    const patterns = [
+      /\b(?:order|ord|invoice|inv|ticket|trans(?:action)?|auth)\s*(?:id|no\.?|number|#)?\s*[:#]?\s*([A-Z0-9-]{4,})\b/i,
+      /\b(?:order|ticket)\s+#?\s*([A-Z0-9-]{4,})\b/i,
+      /#\s*([A-Z0-9]{5,})\b/
+    ];
+    for (const pattern of patterns) {
+      for (const line of lines) {
+        const match = pattern.exec(line);
+        if (match?.[1]) return String(match[1]).trim().slice(0, 32);
+      }
     }
     return "";
   }
@@ -1650,10 +1840,11 @@
       .split("\n")
       .map((line) => line.trim())
       .filter(Boolean);
-    if (!lines.length) return { vendor: "", amount: 0, lines: [] };
+    if (!lines.length) return { vendor: "", amount: 0, orderId: "", lines: [] };
     return {
       vendor: readVendor(lines),
       amount: readSubtotal(lines),
+      orderId: readOrderId(lines),
       lines
     };
   }
@@ -1661,17 +1852,17 @@
   async function scanReceipt(file) {
     setScanStatus("Reading receipt…");
     clearSuggestRow();
-    pendingScan = { vendor: "", amount: 0 };
+    pendingScan = { vendor: "", amount: 0, orderId: "" };
     try {
-      const { vendor, amount, lines } = await readReceiptScan(file);
+      const { vendor, amount, orderId, lines } = await readReceiptScan(file);
       if (!lines.length) {
         setScanStatus("Could not read this photo. Type the vendor and amount.", "warn");
         return;
       }
       const matchedVendor = canonicalizeVendor(vendor);
-      pendingScan = { vendor: matchedVendor, amount };
-      renderSuggestRow(matchedVendor, amount);
-      if (matchedVendor || amount) {
+      pendingScan = { vendor: matchedVendor, amount, orderId };
+      renderSuggestRow(matchedVendor, amount, orderId);
+      if (matchedVendor || amount || orderId) {
         setScanStatus("Tap a suggestion if it looks right, or enter vendor and amount yourself.");
       } else {
         setScanStatus("Could not read this photo. Type the vendor and amount.", "warn");
@@ -1684,6 +1875,7 @@
   async function stageCompressedReceipt(blob, filename, scan = {}) {
     const vendor = canonicalizeVendor(scan.vendor || "");
     const amount = Number(scan.amount || 0);
+    const orderId = String(scan.orderId || "").trim();
     const previewUrl = URL.createObjectURL(blob);
     draftReceipts.push({
       id: uid(),
@@ -1691,7 +1883,10 @@
       previewUrl,
       filename: filename || `receipt-${Date.now()}.jpg`,
       vendor,
+      orderId,
       amountCents: amount ? Math.round(amount * 100) : 0,
+      addCents: 0,
+      subtractCents: 0,
       suggestedVendor: vendor,
       suggestedAmountCents: amount ? Math.round(amount * 100) : 0,
       createdAt: new Date().toISOString()
@@ -1706,10 +1901,12 @@
       const file = files[0];
       setScanStatus("Saving photo…");
       clearSuggestRow();
-      pendingScan = { vendor: "", amount: 0 };
+      pendingScan = { vendor: "", amount: 0, orderId: "" };
       const vendorInput = receiptForm.querySelector('[name="vendor"]');
+      const orderInput = receiptForm.querySelector('[name="orderId"]');
       const amountInput = receiptForm.querySelector('[name="amount"]');
       if (vendorInput) vendorInput.value = "";
+      if (orderInput) orderInput.value = "";
       if (amountInput) amountInput.value = "";
       const blob = await compressReceipt(file);
       if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
@@ -1789,6 +1986,7 @@
 
     const data = new FormData(receiptForm);
     const vendor = canonicalizeVendor(String(data.get("vendor") || "").trim());
+    const orderId = String(data.get("orderId") || pendingScan.orderId || "").trim();
     const amountCents = parseCents(data.get("amount"));
     if (!vendor || !amountCents) {
       $("receiptFormError").textContent = "Fill both vendor and receipt amount before adding.";
@@ -1803,7 +2001,10 @@
       previewUrl,
       filename: pendingCapture.filename,
       vendor,
+      orderId,
       amountCents,
+      addCents: 0,
+      subtractCents: 0,
       suggestedVendor: pendingScan.vendor || "",
       suggestedAmountCents: pendingScan.amount ? Math.round(pendingScan.amount * 100) : 0,
       createdAt: new Date().toISOString()
@@ -1836,7 +2037,10 @@
           id: draft.id,
           filename: draft.filename,
           vendor: draft.vendor,
+          orderId: draft.orderId || "",
           amountCents: draft.amountCents,
+          addCents: Number(draft.addCents || 0),
+          subtractCents: Number(draft.subtractCents || 0),
           suggestedVendor: draft.suggestedVendor,
           suggestedAmountCents: draft.suggestedAmountCents,
           createdAt: draft.createdAt
@@ -1905,7 +2109,7 @@
       receiptPages.push(`
         <section class="receipt-page">
           <p class="eyebrow">Receipt ${index + 1} of ${job.receipts.length}</p>
-          <h2>${escapeHtml(receipt.vendor || receipt.filename)} · ${money(receipt.amountCents)}</h2>
+          <h2>${escapeHtml(receipt.vendor || receipt.filename)}${receipt.orderId ? ` · #${escapeHtml(receipt.orderId)}` : ""} · ${money(receiptEffectiveCents(receipt))}</h2>
           <img src="${dataUrl}" alt="Receipt ${index + 1}">
         </section>`);
     }
@@ -1915,13 +2119,13 @@
       : "";
 
     const receiptRowsMarkup = (job.receipts || [])
-      .filter((receipt) => Number(receipt.amountCents || 0) > 0)
+      .filter((receipt) => receiptEffectiveCents(receipt) !== 0)
       .map((receipt) => `
       <tr>
-        <td>Receipt — ${escapeHtml(receipt.vendor || receipt.filename)}</td>
+        <td>Receipt — ${escapeHtml(receipt.vendor || receipt.filename)}${receipt.orderId ? ` (#${escapeHtml(receipt.orderId)})` : ""}</td>
         <td>1</td>
-        <td>${money(receipt.amountCents)}</td>
-        <td>${money(receipt.amountCents)}</td>
+        <td>${money(receiptEffectiveCents(receipt))}</td>
+        <td>${money(receiptEffectiveCents(receipt))}</td>
       </tr>`).join("");
 
     return `<!doctype html>
@@ -1966,6 +2170,7 @@
       <div class="total"><span>Total</span><span>${money(job.invoice.totalCents)}</span></div>
     </div>
     <div class="notes box"><span class="eyebrow">Mechanic's suggestions</span><p>${escapeHtml(job.suggestions || "No additional suggestions.")}</p></div>
+    <div class="notes box"><span class="eyebrow">Difficulty</span><p>${escapeHtml(job.difficultyLevel || "Standard")}</p></div>
     <p>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} filed with this invoice.</p>
   </main>
   ${receiptPages.join("")}

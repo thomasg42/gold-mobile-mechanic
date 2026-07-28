@@ -1013,21 +1013,40 @@ button {
   gap: 0;
 }
 
-.amount-sign-toggle {
-  appearance: none;
-  flex: 0 0 42px;
-  height: 100%;
+.folder-receipt-card {
+  align-items: start;
+}
+
+.folder-receipt-amount,
+.folder-receipt-subtotal {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.folder-receipt-subtotal {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.labor-cash {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.labor-cash select {
+  width: 100%;
   min-height: 42px;
-  margin: 0;
-  border: 0;
-  border-left: 1px solid #c8c5be;
-  border-radius: 0 7px 7px 0;
-  background: #f3efe4;
-  color: var(--ink);
+  border: 1px solid #c8c5be;
+  border-radius: 7px;
+  background: var(--white);
+  padding: 0 12px;
   font: inherit;
-  font-size: 18px;
-  font-weight: 800;
-  cursor: pointer;
 }
 
 .material-row {

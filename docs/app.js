@@ -78,6 +78,9 @@
       materials: Array.isArray(job.materials) ? job.materials : [],
       timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
       receipts: Array.isArray(job.receipts) ? job.receipts : [],
+      manualWorkSeconds: Number.isFinite(Number(job.manualWorkSeconds))
+        ? Math.max(0, Math.round(Number(job.manualWorkSeconds)))
+        : 0,
       eventHistory: Array.isArray(job.eventHistory) && job.eventHistory.length
         ? job.eventHistory
         : derivedEventHistory(job)
@@ -390,6 +393,20 @@
       }, 0);
   }
 
+  function manualWorkSeconds(job) {
+    const value = Number(job?.manualWorkSeconds);
+    return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+  }
+
+  function billableSeconds(job, now = Date.now()) {
+    return elapsedSeconds(job, "work", now) + manualWorkSeconds(job);
+  }
+
+  function hoursMinutes(seconds) {
+    const total = Math.max(0, Math.round(seconds / 60));
+    return { hours: Math.floor(total / 60), minutes: total % 60 };
+  }
+
   function materialTotal(_job) {
     // Approved materials are a checklist only. Money comes from receipt capture.
     return 0;
@@ -407,7 +424,7 @@
   }
 
   function invoiceDraft(job) {
-    const workSeconds = elapsedSeconds(job, "work");
+    const workSeconds = billableSeconds(job);
     const laborCents = Math.round((workSeconds / 3600) * job.laborRateCents);
     const materialsCents = partsTotal(job);
     return {
@@ -582,7 +599,7 @@
         <h3>${escapeHtml(vehicleName(job) || "Vehicle not named")}</h3>
         <p class="customer">${escapeHtml(job.customerName)}</p>
         <span class="card-stats">
-          <span><span>Work</span><strong>${duration(elapsedSeconds(job, "work"))}</strong></span>
+          <span><span>Work</span><strong>${duration(billableSeconds(job))}</strong></span>
           <span><span>Receipts</span><strong>${job.receipts.length}</strong></span>
           <span><span>Materials</span><strong>${job.materials.length}</strong></span>
         </span>
@@ -727,8 +744,10 @@
       showBoard();
       return;
     }
-    const workSeconds = elapsedSeconds(job, "work");
+    const workSeconds = billableSeconds(job);
     const breakSeconds = elapsedSeconds(job, "break");
+    const timedSeconds = elapsedSeconds(job, "work");
+    const adjustment = hoursMinutes(manualWorkSeconds(job));
     const receipts = await receiptMarkup(job);
     const locked = job.status === "invoiced";
     const canReview = job.status === "completed" || job.status === "invoiced";
@@ -766,6 +785,28 @@
               <div><span class="detail-label">Break time</span><strong id="liveBreakTimer">${duration(breakSeconds)}</strong></div>
             </div>
             <div class="timer-buttons">${timerControls(job)}</div>
+            <div class="time-edit">
+              <div class="time-edit-heading">
+                <span class="detail-label">Billable hours on the invoice</span>
+                <strong id="billableSummary">${duration(workSeconds)}</strong>
+              </div>
+              <p class="time-edit-note">Timer ${duration(timedSeconds)}${manualWorkSeconds(job) ? ` · added ${adjustment.hours}h ${adjustment.minutes}m` : ""}</p>
+              ${locked ? "" : `
+                <div class="time-edit-fields">
+                  <label class="field">
+                    <span>Hours</span>
+                    <input id="manualHoursInput" inputmode="numeric" value="${adjustment.hours}">
+                  </label>
+                  <label class="field">
+                    <span>Minutes</span>
+                    <input id="manualMinutesInput" inputmode="numeric" value="${adjustment.minutes}">
+                  </label>
+                </div>
+                <div class="save-row time-edit-actions">
+                  <button class="button button-quiet" id="setManualTimeButton" type="button">Set added time</button>
+                  <button class="button button-quiet" id="addManualTimeButton" type="button">Add to total</button>
+                </div>`}
+            </div>
             <div class="history-panel">
               <p class="eyebrow">Permanent audit trail</p>
               <h3>Clock history</h3>
@@ -881,6 +922,45 @@
         job.suggestions = $("suggestionsInput").value.trim();
         queueJobSync(job);
         notify("Mechanic's suggestions saved.");
+      });
+    }
+
+    function readManualEntry() {
+      const hours = Number.parseInt($("manualHoursInput")?.value ?? "", 10);
+      const minutes = Number.parseInt($("manualMinutesInput")?.value ?? "", 10);
+      const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 0;
+      const safeMinutes = Number.isFinite(minutes) && minutes > 0 ? minutes : 0;
+      return safeHours * 3600 + safeMinutes * 60;
+    }
+
+    function applyManualSeconds(seconds, message) {
+      job.manualWorkSeconds = Math.max(0, Math.round(seconds));
+      if (job.invoice) job.invoice = invoiceDraft(job);
+      queueJobSync(job);
+      renderJob();
+      notify(message);
+    }
+
+    const setManualTimeButton = $("setManualTimeButton");
+    if (setManualTimeButton) {
+      setManualTimeButton.addEventListener("click", () => {
+        const entered = readManualEntry();
+        const summary = hoursMinutes(entered);
+        applyManualSeconds(entered, `Added time set to ${summary.hours}h ${summary.minutes}m.`);
+      });
+    }
+
+    const addManualTimeButton = $("addManualTimeButton");
+    if (addManualTimeButton) {
+      addManualTimeButton.addEventListener("click", () => {
+        const entered = readManualEntry();
+        if (!entered) {
+          notify("Enter hours or minutes before adding time.", true);
+          return;
+        }
+        const total = manualWorkSeconds(job) + entered;
+        const summary = hoursMinutes(total);
+        applyManualSeconds(total, `Added time now ${summary.hours}h ${summary.minutes}m.`);
       });
     }
 
@@ -1016,8 +1096,10 @@
     if (!job) return;
     const work = $("liveWorkTimer");
     const rest = $("liveBreakTimer");
-    if (work) work.textContent = duration(elapsedSeconds(job, "work"));
+    const summary = $("billableSummary");
+    if (work) work.textContent = duration(billableSeconds(job));
     if (rest) rest.textContent = duration(elapsedSeconds(job, "break"));
+    if (summary) summary.textContent = duration(billableSeconds(job));
   }
 
   function addMaterialRow(values = {}) {

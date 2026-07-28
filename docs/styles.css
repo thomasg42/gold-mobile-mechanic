@@ -1017,10 +1017,48 @@ button {
   align-items: end;
 }
 
+.time-edit {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.time-edit-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.time-edit-heading strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.time-edit-note {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--slate);
+}
+
+.time-edit-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.time-edit-actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .materials-list {
   margin: 0;
   padding-left: 18px;
-  color: var(--ink);
+  color: var(--ink-soft);
   line-height: 1.55;
 }
 

@@ -6,6 +6,7 @@
   const RECEIPT_STORE = "receipts";
   const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
   const SYNC_KEY_STORAGE = "gold-mobile-mechanic-sync-key-v1";
+  const OCR_BASE = "./vendor/tesseract";
   const PENDING_JOBS_STORAGE = "gold-mobile-mechanic-pending-jobs-v1";
   const PENDING_RECEIPTS_STORAGE = "gold-mobile-mechanic-pending-receipts-v1";
   const STATUS_COPY = {
@@ -32,6 +33,7 @@
   let activeObjectUrls = [];
   let toastTimer = null;
   let syncInFlight = null;
+  let ocrWorkerPromise = null;
 
   function arrayFromStorage(key) {
     try {
@@ -712,7 +714,11 @@
           <strong>${money(receipt.amountCents)}</strong>
         </div>`;
     }));
-    return rows.join("");
+    return `${rows.join("")}
+      <div class="receipt-total">
+        <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} added together</span>
+        <strong>${money(receiptTotal(job))}</strong>
+      </div>`;
   }
 
   function clockHistoryMarkup(job) {
@@ -1198,6 +1204,7 @@
     $("receiptFormError").classList.add("hidden");
     $("receiptPreview").classList.add("hidden");
     $("receiptPreview").innerHTML = "";
+    setScanStatus("");
     if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
     receiptPreviewUrl = null;
     receiptDialog.showModal();
@@ -1209,6 +1216,113 @@
     receiptDialog.close();
   }
 
+  function setScanStatus(message, tone = "") {
+    const element = $("receiptScanStatus");
+    if (!element) return;
+    element.textContent = message || "";
+    element.className = `receipt-scan-status${tone ? ` ${tone}` : ""}${message ? "" : " hidden"}`;
+  }
+
+  function loadTesseract() {
+    if (window.Tesseract) return Promise.resolve(window.Tesseract);
+    return new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = `${OCR_BASE}/tesseract.min.js`;
+      script.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("Scanner failed to load.")));
+      script.onerror = () => reject(new Error("Scanner failed to load."));
+      document.head.appendChild(script);
+    });
+  }
+
+  function ocrWorker() {
+    if (!ocrWorkerPromise) {
+      ocrWorkerPromise = (async () => {
+        const Tesseract = await loadTesseract();
+        return Tesseract.createWorker("eng", 1, {
+          workerPath: `${OCR_BASE}/worker.min.js`,
+          corePath: `${OCR_BASE}/`,
+          langPath: `${OCR_BASE}/`,
+          gzip: true
+        });
+      })().catch((error) => {
+        ocrWorkerPromise = null;
+        throw error;
+      });
+    }
+    return ocrWorkerPromise;
+  }
+
+  function readVendor(lines) {
+    const skip = /(receipt|invoice|order|customer|copy|thank|welcome|store\s*#|tel|phone|www\.|http|\d{3}[-.\s]\d{3}[-.\s]\d{4})/i;
+    for (const line of lines.slice(0, 8)) {
+      const cleaned = line.replace(/[^A-Za-z0-9&'’.\- ]/g, " ").replace(/\s+/g, " ").trim();
+      const letters = cleaned.replace(/[^A-Za-z]/g, "");
+      if (letters.length < 3 || skip.test(cleaned)) continue;
+      return cleaned
+        .split(" ")
+        .map((word) => (word.length > 2 && word === word.toUpperCase()
+          ? word.charAt(0) + word.slice(1).toLowerCase()
+          : word))
+        .join(" ")
+        .slice(0, 48);
+    }
+    return "";
+  }
+
+  function amountsIn(line) {
+    return [...line.matchAll(/(\d{1,3}(?:,\d{3})+|\d+)[.,](\d{2})(?!\d)/g)]
+      .map((match) => Number.parseFloat(`${match[1].replace(/,/g, "")}.${match[2]}`))
+      .filter((value) => Number.isFinite(value));
+  }
+
+  function readTotal(lines) {
+    const priority = [
+      /\b(grand\s*total|amount\s*due|balance\s*due|total\s*due)\b/i,
+      /\btotal\b/i
+    ];
+    for (const pattern of priority) {
+      for (const line of [...lines].reverse()) {
+        if (/\bsub\s*total\b/i.test(line) || !pattern.test(line)) continue;
+        const values = amountsIn(line);
+        if (values.length) return values[values.length - 1];
+      }
+    }
+    const all = lines.flatMap(amountsIn);
+    return all.length ? Math.max(...all) : 0;
+  }
+
+  async function scanReceipt(file) {
+    setScanStatus("Reading receipt…");
+    try {
+      const worker = await ocrWorker();
+      const { data } = await worker.recognize(file);
+      const lines = String(data?.text || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (!lines.length) {
+        setScanStatus("Could not read this photo. Type the vendor and total.", "warn");
+        return;
+      }
+
+      const vendorInput = receiptForm.querySelector('[name="vendor"]');
+      const amountInput = receiptForm.querySelector('[name="amount"]');
+      const vendor = readVendor(lines);
+      const total = readTotal(lines);
+
+      if (vendor && vendorInput && !vendorInput.value.trim()) vendorInput.value = vendor;
+      if (total && amountInput && !amountInput.value.trim()) amountInput.value = total.toFixed(2);
+
+      if (vendor || total) {
+        setScanStatus(`Read ${vendor || "vendor not found"} · ${total ? `$${total.toFixed(2)}` : "total not found"}. Check it before filing.`, "ok");
+      } else {
+        setScanStatus("Could not read this photo. Type the vendor and total.", "warn");
+      }
+    } catch {
+      setScanStatus("Scanner unavailable. Type the vendor and total.", "warn");
+    }
+  }
+
   $("receiptFile").addEventListener("change", () => {
     const file = $("receiptFile").files?.[0];
     if (!file) return;
@@ -1216,6 +1330,7 @@
     receiptPreviewUrl = URL.createObjectURL(file);
     $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
     $("receiptPreview").classList.remove("hidden");
+    scanReceipt(file);
   });
 
   receiptForm.addEventListener("submit", async (event) => {

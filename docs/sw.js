@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v6-manual-time";
+const CACHE = "gold-mobile-mechanic-v7-receipt-scanner";
 const APP_SHELL = [
   "./",
   "./index.html",

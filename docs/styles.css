@@ -1017,6 +1017,44 @@ button {
   align-items: end;
 }
 
+.receipt-scan-status {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--slate);
+}
+
+.receipt-scan-status.ok {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.receipt-scan-status.warn {
+  border-color: var(--gold-dark);
+  color: var(--gold-dark);
+}
+
+.receipt-total {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 2px solid var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.receipt-total strong {
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+}
+
 .time-edit {
   margin-top: 16px;
   padding-top: 16px;

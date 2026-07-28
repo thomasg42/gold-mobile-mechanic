@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v8-receipt-suggest";
+const CACHE = "gold-mobile-mechanic-v9-receipt-batch";
 const APP_SHELL = [
   "./",
   "./index.html",

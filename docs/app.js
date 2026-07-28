@@ -30,6 +30,8 @@
   let selectedJobId = null;
   let receiptJobId = null;
   let receiptPreviewUrl = null;
+  let pendingCapture = null;
+  let draftReceipts = [];
   let activeObjectUrls = [];
   let toastTimer = null;
   let syncInFlight = null;
@@ -484,26 +486,40 @@
     return new Promise((resolve, reject) => {
       const transaction = database.transaction(RECEIPT_STORE, mode);
       const store = transaction.objectStore(RECEIPT_STORE);
-      let result;
+      let request;
       try {
-        result = action(store);
+        request = action(store);
       } catch (error) {
         database.close();
         reject(error);
         return;
       }
+      if (request && typeof request === "object" && "onsuccess" in request) {
+        request.onsuccess = () => {};
+        request.onerror = () => {
+          database.close();
+          reject(request.error || new Error("Receipt storage request failed."));
+        };
+      }
       transaction.oncomplete = () => {
         database.close();
-        resolve(result && "result" in result ? result.result : result);
+        resolve(request && "result" in request ? request.result : request);
       };
       transaction.onerror = () => {
         database.close();
-        reject(transaction.error);
+        reject(transaction.error || new Error("Receipt storage transaction failed."));
+      };
+      transaction.onabort = () => {
+        database.close();
+        reject(transaction.error || new Error("Receipt storage aborted."));
       };
     });
   }
 
   function storeReceipt(id, blob) {
+    if (!(blob instanceof Blob) || !blob.size) {
+      return Promise.reject(new Error("Receipt photo is empty."));
+    }
     return receiptDatabaseAction("readwrite", (store) => store.put({ id, blob }));
   }
 
@@ -549,23 +565,48 @@
   }
 
   async function compressReceipt(file) {
-    try {
-      const bitmap = await createImageBitmap(file);
+    const source = file instanceof Blob ? file : null;
+    if (!source || !source.size) throw new Error("No receipt photo to compress.");
+
+    const drawToJpeg = async (bitmapLike) => {
+      const width = bitmapLike.width || bitmapLike.naturalWidth || 0;
+      const height = bitmapLike.height || bitmapLike.naturalHeight || 0;
+      if (!width || !height) throw new Error("Could not read receipt photo size.");
       const limit = 1600;
-      const scale = Math.min(1, limit / Math.max(bitmap.width, bitmap.height));
+      const scale = Math.min(1, limit / Math.max(width, height));
       const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      bitmap.close();
-      for (const quality of [0.82, 0.72, 0.62, 0.52]) {
+      canvas.width = Math.max(1, Math.round(width * scale));
+      canvas.height = Math.max(1, Math.round(height * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Receipt canvas unavailable.");
+      context.drawImage(bitmapLike, 0, 0, canvas.width, canvas.height);
+      if (typeof bitmapLike.close === "function") bitmapLike.close();
+      for (const quality of [0.82, 0.72, 0.62, 0.52, 0.42]) {
         const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
-        if (blob && blob.size <= 850_000) return blob;
+        if (blob && blob.size) return blob;
       }
-      const fallback = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.42));
-      return fallback || file;
+      throw new Error("Could not encode receipt JPEG.");
+    };
+
+    try {
+      if (typeof createImageBitmap === "function") {
+        return await drawToJpeg(await createImageBitmap(source));
+      }
     } catch {
-      return file;
+      // Fall through to HTMLImageElement path for older/quirky WebKit.
+    }
+
+    const objectUrl = URL.createObjectURL(source);
+    try {
+      const image = await new Promise((resolve, reject) => {
+        const element = new Image();
+        element.onload = () => resolve(element);
+        element.onerror = () => reject(new Error("Could not open receipt photo."));
+        element.src = objectUrl;
+      });
+      return await drawToJpeg(image);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
     }
   }
 
@@ -1207,115 +1248,125 @@
     openJob(job.id);
   });
 
+  function draftTotalCents() {
+    return draftReceipts.reduce((total, receipt) => total + Math.max(0, Number(receipt.amountCents || 0)), 0);
+  }
+
+  function clearDraftReceipts() {
+    draftReceipts.forEach((receipt) => {
+      if (receipt.previewUrl) URL.revokeObjectURL(receipt.previewUrl);
+    });
+    draftReceipts = [];
+  }
+
   function clearReceiptCapture() {
-    receiptForm.reset();
+    const fileInput = $("receiptFile");
+    if (fileInput) fileInput.value = "";
+    receiptForm.querySelector('[name="vendor"]').value = "";
+    receiptForm.querySelector('[name="amount"]').value = "";
     $("receiptFormError").classList.add("hidden");
+    $("receiptFormError").textContent = "";
     $("receiptPreview").classList.add("hidden");
     $("receiptPreview").innerHTML = "";
     setScanStatus("");
     clearSuggestRow();
     pendingScan = { vendor: "", amount: 0 };
+    pendingCapture = null;
     if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
     receiptPreviewUrl = null;
   }
 
+  function receiptErrorMessage(error) {
+    const message = String(error?.message || error || "").trim();
+    if (/quota|storage|space/i.test(message)) {
+      return "Phone storage for this app is full. Free space or clear old jobs, then retry.";
+    }
+    if (message) return message;
+    return "The receipt could not be saved. Retry the photo.";
+  }
+
+  function updateFileAllButton() {
+    const button = $("fileAllReceiptsButton");
+    if (!button) return;
+    button.disabled = !draftReceipts.length;
+    button.textContent = draftReceipts.length
+      ? `File All Receipts (${draftReceipts.length})`
+      : "File All Receipts";
+  }
+
   async function refreshFiledReceiptsPanel() {
     const job = findJob(receiptJobId);
-    const list = $("filedReceiptsList");
+    const draftList = $("draftReceiptsList");
+    const filedList = $("filedReceiptsList");
     const total = $("filedReceiptsTotal");
-    if (!list || !total) return;
-    if (!job || !job.receipts.length) {
-      list.innerHTML = `<p class="receipt-empty">No receipts filed yet. Take a photo, confirm vendor and amount, then file.</p>`;
-      total.innerHTML = `<span>Job receipt total</span><strong>$0.00</strong>`;
-      return;
+    if (!draftList || !filedList || !total) return;
+
+    if (!draftReceipts.length) {
+      draftList.innerHTML = `<p class="receipt-empty">No receipts staged yet. Take a photo, tap vendor and amount, then Add a Receipt.</p>`;
+    } else {
+      draftList.innerHTML = draftReceipts.map((receipt) => `
+        <article class="filed-receipt-card">
+          <button type="button" class="filed-receipt-photo" data-draft-preview="${escapeHtml(receipt.id)}">
+            <span class="receipt-thumb"><img src="${escapeHtml(receipt.previewUrl)}" alt=""></span>
+          </button>
+          <div class="filed-receipt-body">
+            <div class="filed-receipt-chips">
+              ${receipt.suggestedVendor ? `<span class="receipt-suggest-chip is-static">Saw ${escapeHtml(receipt.suggestedVendor)}</span>` : ""}
+              ${receipt.suggestedAmountCents ? `<span class="receipt-suggest-chip is-static">Suggested ${money(receipt.suggestedAmountCents)}</span>` : ""}
+            </div>
+            <strong>${escapeHtml(receipt.vendor || "Vendor")}</strong>
+            <small>${money(receipt.amountCents)}</small>
+            <button type="button" class="button button-quiet" data-remove-draft="${escapeHtml(receipt.id)}">Remove</button>
+          </div>
+        </article>`).join("");
+      draftList.querySelectorAll("[data-remove-draft]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const id = button.dataset.removeDraft;
+          const index = draftReceipts.findIndex((item) => item.id === id);
+          if (index === -1) return;
+          const [removed] = draftReceipts.splice(index, 1);
+          if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+          refreshFiledReceiptsPanel();
+        });
+      });
     }
 
-    const rows = await Promise.all([...job.receipts].reverse().map(async (receipt) => {
-      const stored = await getReceiptForJob(job.id, receipt.id);
-      let image = `<span class="receipt-thumb">▧</span>`;
-      if (stored?.blob) {
-        const url = URL.createObjectURL(stored.blob);
-        activeObjectUrls.push(url);
-        image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
-      }
-      const suggested = Number(receipt.suggestedAmountCents || 0);
-      const suggestedVendor = String(receipt.suggestedVendor || "").trim();
-      const suggestChip = suggested
-        ? `<button type="button" class="receipt-suggest-chip" data-apply-filed="${escapeHtml(receipt.id)}" data-field="amount" data-value="${(suggested / 100).toFixed(2)}">Suggested ${money(suggested)}</button>`
-        : "";
-      const vendorChip = suggestedVendor
-        ? `<button type="button" class="receipt-suggest-chip" data-apply-filed="${escapeHtml(receipt.id)}" data-field="vendor" data-value="${escapeHtml(suggestedVendor)}">Saw ${escapeHtml(suggestedVendor)}</button>`
-        : "";
-      return `
-        <article class="filed-receipt-card" data-filed-id="${escapeHtml(receipt.id)}">
-          <button type="button" class="filed-receipt-photo" data-receipt-id="${escapeHtml(receipt.id)}">${image}</button>
-          <div class="filed-receipt-body">
-            <div class="filed-receipt-chips">${vendorChip}${suggestChip}</div>
-            <label class="field">
-              <span>Vendor</span>
-              <input data-filed-vendor="${escapeHtml(receipt.id)}" value="${escapeHtml(receipt.vendor || "")}" placeholder="Vendor">
-            </label>
-            <label class="field">
-              <span>Receipt amount</span>
-              <span class="money-input"><b>$</b><input data-filed-amount="${escapeHtml(receipt.id)}" inputmode="decimal" value="${(Number(receipt.amountCents || 0) / 100).toFixed(2)}"></span>
-            </label>
-          </div>
-        </article>`;
-    }));
-
-    list.innerHTML = rows.join("");
-    total.innerHTML = `
-      <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} for this job</span>
-      <strong>${money(receiptTotal(job))}</strong>`;
-
-    list.querySelectorAll("[data-receipt-id]").forEach((button) => {
-      button.addEventListener("click", () => viewReceipt(button.dataset.receiptId));
-    });
-    list.querySelectorAll("[data-apply-filed]").forEach((button) => {
-      button.addEventListener("click", () => {
-        const id = button.dataset.applyFiled;
-        const field = button.dataset.field;
-        const value = button.dataset.value || "";
-        const receipt = job.receipts.find((item) => item.id === id);
-        if (!receipt) return;
-        if (field === "vendor") {
-          receipt.vendor = value;
-          const input = list.querySelector(`[data-filed-vendor="${id}"]`);
-          if (input) input.value = value;
-        } else if (field === "amount") {
-          receipt.amountCents = parseCents(value);
-          const input = list.querySelector(`[data-filed-amount="${id}"]`);
-          if (input) input.value = Number(receipt.amountCents / 100).toFixed(2);
+    if (!job || !job.receipts.length) {
+      filedList.innerHTML = `<p class="receipt-empty">None filed on this job yet.</p>`;
+    } else {
+      const rows = await Promise.all([...job.receipts].reverse().map(async (receipt) => {
+        const stored = await getReceiptForJob(job.id, receipt.id);
+        let image = `<span class="receipt-thumb">▧</span>`;
+        if (stored?.blob) {
+          const url = URL.createObjectURL(stored.blob);
+          activeObjectUrls.push(url);
+          image = `<span class="receipt-thumb"><img src="${escapeHtml(url)}" alt=""></span>`;
         }
-        queueJobSync(job);
-        if (job.status === "completed" || job.status === "invoiced") upsertInvoice(job);
-        total.innerHTML = `
-          <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} for this job</span>
-          <strong>${money(receiptTotal(job))}</strong>`;
-        notify(field === "vendor" ? "Vendor applied from the scan." : "Suggested amount applied.");
+        return `
+          <article class="filed-receipt-card">
+            <button type="button" class="filed-receipt-photo" data-receipt-id="${escapeHtml(receipt.id)}">${image}</button>
+            <div class="filed-receipt-body">
+              <strong>${escapeHtml(receipt.vendor || receipt.filename)}</strong>
+              <small>${calendarDate(receipt.createdAt)} · ${money(receipt.amountCents)}</small>
+            </div>
+          </article>`;
+      }));
+      filedList.innerHTML = rows.join("");
+      filedList.querySelectorAll("[data-receipt-id]").forEach((button) => {
+        button.addEventListener("click", () => viewReceipt(button.dataset.receiptId));
       });
-    });
-    list.querySelectorAll("[data-filed-vendor]").forEach((input) => {
-      input.addEventListener("change", () => {
-        const receipt = job.receipts.find((item) => item.id === input.dataset.filedVendor);
-        if (!receipt) return;
-        receipt.vendor = input.value.trim();
-        queueJobSync(job);
-        if (job.status === "completed" || job.status === "invoiced") upsertInvoice(job);
-      });
-    });
-    list.querySelectorAll("[data-filed-amount]").forEach((input) => {
-      input.addEventListener("change", () => {
-        const receipt = job.receipts.find((item) => item.id === input.dataset.filedAmount);
-        if (!receipt) return;
-        receipt.amountCents = parseCents(input.value);
-        queueJobSync(job);
-        if (job.status === "completed" || job.status === "invoiced") upsertInvoice(job);
-        total.innerHTML = `
-          <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} for this job</span>
-          <strong>${money(receiptTotal(job))}</strong>`;
-      });
-    });
+    }
+
+    const filedCents = job ? receiptTotal(job) : 0;
+    const stagedCents = draftTotalCents();
+    const combined = filedCents + stagedCents;
+    const stagedNote = draftReceipts.length
+      ? ` · ${draftReceipts.length} ready to file (${money(stagedCents)})`
+      : "";
+    total.innerHTML = `
+      <span>${(job?.receipts.length || 0)} filed${stagedNote}</span>
+      <strong>${money(combined)}</strong>`;
+    updateFileAllButton();
   }
 
   function openReceiptDialog(jobIdValue) {
@@ -1326,9 +1377,12 @@
   }
 
   function closeReceiptDialog() {
-    if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
-    receiptPreviewUrl = null;
-    pendingScan = { vendor: "", amount: 0 };
+    if (draftReceipts.length) {
+      const proceed = window.confirm(`Discard ${draftReceipts.length} receipt${draftReceipts.length === 1 ? "" : "s"} that are ready to file?`);
+      if (!proceed) return;
+      clearDraftReceipts();
+    }
+    clearReceiptCapture();
     receiptDialog.close();
     if (selectedJobId) renderJob();
   }
@@ -1488,25 +1542,47 @@
     }
   }
 
-  $("receiptFile").addEventListener("change", () => {
+  $("receiptFile").addEventListener("change", async () => {
     const file = $("receiptFile").files?.[0];
     if (!file) return;
-    if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
-    receiptPreviewUrl = URL.createObjectURL(file);
-    $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
-    $("receiptPreview").classList.remove("hidden");
+    $("receiptFormError").classList.add("hidden");
+    $("receiptFormError").textContent = "";
+    setScanStatus("Saving photo…");
+    clearSuggestRow();
+    pendingScan = { vendor: "", amount: 0 };
     const vendorInput = receiptForm.querySelector('[name="vendor"]');
     const amountInput = receiptForm.querySelector('[name="amount"]');
     if (vendorInput) vendorInput.value = "";
     if (amountInput) amountInput.value = "";
-    scanReceipt(file);
+
+    try {
+      const blob = await compressReceipt(file);
+      if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
+      receiptPreviewUrl = URL.createObjectURL(blob);
+      pendingCapture = {
+        blob,
+        filename: file.name || `receipt-${Date.now()}.jpg`
+      };
+      $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
+      $("receiptPreview").classList.remove("hidden");
+      scanReceipt(blob);
+    } catch (error) {
+      pendingCapture = null;
+      setScanStatus(receiptErrorMessage(error), "warn");
+      $("receiptFormError").textContent = receiptErrorMessage(error);
+      $("receiptFormError").classList.remove("hidden");
+    }
   });
 
   receiptForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const job = findJob(receiptJobId);
-    const file = $("receiptFile").files?.[0];
-    if (!job || !file) {
+    if (!job) {
+      $("receiptFormError").textContent = "Open a job before adding receipts.";
+      $("receiptFormError").classList.remove("hidden");
+      return;
+    }
+    if (!pendingCapture?.blob) {
       $("receiptFormError").textContent = "Take or choose a receipt photo first.";
       $("receiptFormError").classList.remove("hidden");
       return;
@@ -1516,39 +1592,63 @@
     const vendor = String(data.get("vendor") || "").trim();
     const amountCents = parseCents(data.get("amount"));
     if (!vendor || !amountCents) {
-      $("receiptFormError").textContent = "Fill both vendor and receipt amount before filing.";
+      $("receiptFormError").textContent = "Fill both vendor and receipt amount before adding.";
       $("receiptFormError").classList.remove("hidden");
       return;
     }
 
+    const previewUrl = URL.createObjectURL(pendingCapture.blob);
+    draftReceipts.push({
+      id: uid(),
+      blob: pendingCapture.blob,
+      previewUrl,
+      filename: pendingCapture.filename,
+      vendor,
+      amountCents,
+      suggestedVendor: pendingScan.vendor || "",
+      suggestedAmountCents: pendingScan.amount ? Math.round(pendingScan.amount * 100) : 0,
+      createdAt: new Date().toISOString()
+    });
+    clearReceiptCapture();
+    await refreshFiledReceiptsPanel();
+    notify(`Receipt added. ${draftReceipts.length} ready — take another or File All Receipts.`);
+  });
+
+  $("fileAllReceiptsButton").addEventListener("click", async () => {
+    const job = findJob(receiptJobId);
+    const button = $("fileAllReceiptsButton");
+    if (!job || !draftReceipts.length) return;
+    button.disabled = true;
+    $("receiptFormError").classList.add("hidden");
     try {
-      const blob = await compressReceipt(file);
-      const receipt = {
-        id: uid(),
-        filename: file.name || `receipt-${Date.now()}.jpg`,
-        vendor,
-        amountCents,
-        suggestedVendor: pendingScan.vendor || "",
-        suggestedAmountCents: pendingScan.amount ? Math.round(pendingScan.amount * 100) : 0,
-        createdAt: new Date().toISOString()
-      };
-      await storeReceipt(receipt.id, blob);
-      job.receipts.push(receipt);
-      queueReceiptSync(job.id, receipt.id);
+      const staged = [...draftReceipts];
+      for (const draft of staged) {
+        await storeReceipt(draft.id, draft.blob);
+        job.receipts.push({
+          id: draft.id,
+          filename: draft.filename,
+          vendor: draft.vendor,
+          amountCents: draft.amountCents,
+          suggestedVendor: draft.suggestedVendor,
+          suggestedAmountCents: draft.suggestedAmountCents,
+          createdAt: draft.createdAt
+        });
+        queueReceiptSync(job.id, draft.id);
+      }
+      clearDraftReceipts();
       if (job.status === "completed" || job.status === "invoiced") {
         upsertInvoice(job);
-        notify("Receipt filed. Keep going or close when this job's receipts are done.");
       } else {
         job.receiptReview = false;
         queueJobSync(job);
-        notify("Receipt filed. Parts total updated — take the next photo or close.");
       }
-      clearReceiptCapture();
-      await renderJob();
       await refreshFiledReceiptsPanel();
-    } catch {
-      $("receiptFormError").textContent = "The receipt could not be saved. Check available phone storage and retry.";
+      await renderJob();
+      notify(`${staged.length} receipt${staged.length === 1 ? "" : "s"} filed · parts ${money(receiptTotal(job))}.`);
+    } catch (error) {
+      $("receiptFormError").textContent = receiptErrorMessage(error);
       $("receiptFormError").classList.remove("hidden");
+      updateFileAllButton();
     }
   });
 

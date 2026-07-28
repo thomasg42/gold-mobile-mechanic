@@ -152,15 +152,15 @@
       <div class="sheet-header">
         <div>
           <p class="eyebrow">Receipt folder</p>
-          <h2>Add receipt</h2>
+          <h2>Add receipts</h2>
         </div>
         <button class="icon-button" id="closeReceiptDialog" type="button" aria-label="Close">×</button>
       </div>
       <label class="camera-button">
-        <input id="receiptFile" name="receiptFile" type="file" accept="image/*" capture="environment" required>
+        <input id="receiptFile" name="receiptFile" type="file" accept="image/*" capture="environment">
         <span class="camera-icon" aria-hidden="true">◎</span>
         <strong>Take receipt photo</strong>
-        <small>Reads the top vendor and the subtotal — tap a suggestion if it looks right</small>
+        <small>Tap vendor and subtotal if they look right, then Add a Receipt</small>
       </label>
       <div class="receipt-preview hidden" id="receiptPreview"></div>
       <p class="receipt-scan-status hidden" id="receiptScanStatus"></p>
@@ -178,12 +178,15 @@
       <p class="form-error hidden" id="receiptFormError"></p>
       <div class="sheet-actions">
         <button class="button button-quiet" id="cancelReceiptButton" type="button">Cancel</button>
-        <button class="button button-gold" type="submit">File receipt</button>
+        <button class="button button-dark" id="addReceiptDraftButton" type="submit">Add a Receipt</button>
       </div>
       <div class="filed-receipts" id="filedReceiptsPanel">
-        <p class="eyebrow">Filed receipts</p>
+        <p class="eyebrow">Ready to file</p>
+        <div class="receipt-list" id="draftReceiptsList"></div>
+        <p class="eyebrow filed-receipts-label">Already on this job</p>
         <div class="receipt-list" id="filedReceiptsList"></div>
         <div class="receipt-total" id="filedReceiptsTotal"></div>
+        <button class="button button-gold file-all-button" id="fileAllReceiptsButton" type="button" disabled>File All Receipts</button>
       </div>
     </form>
   </dialog>

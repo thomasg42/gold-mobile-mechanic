@@ -1071,6 +1071,11 @@ button {
   color: var(--gold-light);
 }
 
+.receipt-suggest-chip.is-static {
+  cursor: default;
+  pointer-events: none;
+}
+
 .receipt-suggested {
   display: block;
   margin-top: 4px;
@@ -1087,6 +1092,20 @@ button {
 
 .filed-receipts > .eyebrow {
   margin: 0 0 12px;
+}
+
+.filed-receipts-label {
+  margin-top: 18px !important;
+}
+
+.file-all-button {
+  width: 100%;
+  margin-top: 16px;
+}
+
+.file-all-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .filed-receipt-card {

@@ -1009,6 +1009,27 @@ button {
   box-shadow: none !important;
 }
 
+.draft-amount-input {
+  gap: 0;
+}
+
+.amount-sign-toggle {
+  appearance: none;
+  flex: 0 0 42px;
+  height: 100%;
+  min-height: 42px;
+  margin: 0;
+  border: 0;
+  border-left: 1px solid #c8c5be;
+  border-radius: 0 7px 7px 0;
+  background: #f3efe4;
+  color: var(--ink);
+  font: inherit;
+  font-size: 18px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
 .material-row {
   display: grid;
   grid-template-columns: 1fr 38px;

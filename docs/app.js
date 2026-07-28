@@ -426,7 +426,7 @@
 
   function receiptTotal(job) {
     return (job.receipts || []).reduce(
-      (total, receipt) => total + Math.max(0, Number(receipt.amountCents || 0)),
+      (total, receipt) => total + Number(receipt.amountCents || 0),
       0
     );
   }
@@ -1283,7 +1283,49 @@
   });
 
   function draftTotalCents() {
-    return draftReceipts.reduce((total, receipt) => total + Math.max(0, Number(receipt.amountCents || 0)), 0);
+    return draftReceipts.reduce((total, receipt) => total + Number(receipt.amountCents || 0), 0);
+  }
+
+  function vendorKey(value) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  function knownVendorSpellings(job) {
+    const names = [];
+    for (const receipt of job?.receipts || []) {
+      const name = String(receipt.vendor || "").trim();
+      if (name) names.push(name);
+    }
+    for (const draft of draftReceipts) {
+      const name = String(draft.vendor || "").trim();
+      if (name) names.push(name);
+    }
+    return names;
+  }
+
+  function canonicalizeVendor(candidate, job = findJob(receiptJobId)) {
+    const cleaned = String(candidate || "").trim();
+    if (!cleaned) return "";
+    const key = vendorKey(cleaned);
+    if (!key) return cleaned;
+    const known = knownVendorSpellings(job);
+    for (const name of known) {
+      if (vendorKey(name) === key) return name;
+    }
+    for (const name of known) {
+      const prior = vendorKey(name);
+      if (!prior || prior[0] !== key[0]) continue;
+      if (key.startsWith(prior) || prior.startsWith(key)) return name;
+    }
+    return cleaned;
+  }
+
+  function draftAmountAbs(receipt) {
+    return Math.abs(Number(receipt.amountCents || 0));
+  }
+
+  function draftAmountSign(receipt) {
+    return Number(receipt.amountCents || 0) < 0 ? -1 : 1;
   }
 
   function clearDraftReceipts() {
@@ -1354,7 +1396,11 @@
             </label>
             <label class="field">
               <span>Receipt amount</span>
-              <span class="money-input"><b>$</b><input data-draft-amount="${escapeHtml(receipt.id)}" inputmode="decimal" value="${receipt.amountCents ? (receipt.amountCents / 100).toFixed(2) : ""}" placeholder="0.00"></span>
+              <span class="money-input draft-amount-input">
+                <b>$</b>
+                <input data-draft-amount="${escapeHtml(receipt.id)}" inputmode="decimal" value="${draftAmountAbs(receipt) ? (draftAmountAbs(receipt) / 100).toFixed(2) : ""}" placeholder="0.00">
+                <button type="button" class="amount-sign-toggle" data-draft-sign="${escapeHtml(receipt.id)}" aria-label="Toggle add or subtract">${draftAmountSign(receipt) < 0 ? "−" : "+"}</button>
+              </span>
             </label>
             <button type="button" class="button button-quiet" data-remove-draft="${escapeHtml(receipt.id)}">Remove</button>
           </div>
@@ -1374,13 +1420,14 @@
           const draft = draftReceipts.find((item) => item.id === button.dataset.draftApply);
           if (!draft) return;
           if (button.dataset.field === "vendor") {
-            draft.vendor = button.dataset.value || "";
+            draft.vendor = canonicalizeVendor(button.dataset.value || "");
             const input = draftList.querySelector(`[data-draft-vendor="${draft.id}"]`);
             if (input) input.value = draft.vendor;
           } else {
-            draft.amountCents = parseCents(button.dataset.value);
+            const sign = draftAmountSign(draft);
+            draft.amountCents = sign * parseCents(button.dataset.value);
             const input = draftList.querySelector(`[data-draft-amount="${draft.id}"]`);
-            if (input) input.value = (draft.amountCents / 100).toFixed(2);
+            if (input) input.value = (draftAmountAbs(draft) / 100).toFixed(2);
           }
           button.classList.add("is-applied");
           refreshFiledReceiptsPanel();
@@ -1389,14 +1436,28 @@
       draftList.querySelectorAll("[data-draft-vendor]").forEach((input) => {
         input.addEventListener("change", () => {
           const draft = draftReceipts.find((item) => item.id === input.dataset.draftVendor);
-          if (draft) draft.vendor = input.value.trim();
+          if (!draft) return;
+          draft.vendor = canonicalizeVendor(input.value.trim());
+          input.value = draft.vendor;
         });
       });
       draftList.querySelectorAll("[data-draft-amount]").forEach((input) => {
         input.addEventListener("change", () => {
           const draft = draftReceipts.find((item) => item.id === input.dataset.draftAmount);
           if (!draft) return;
-          draft.amountCents = parseCents(input.value);
+          draft.amountCents = draftAmountSign(draft) * parseCents(input.value);
+          refreshFiledReceiptsPanel();
+        });
+      });
+      draftList.querySelectorAll("[data-draft-sign]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const draft = draftReceipts.find((item) => item.id === button.dataset.draftSign);
+          if (!draft || !draft.amountCents) {
+            if (draft) draft.amountCents = draft.amountCents ? -Math.abs(draft.amountCents) : 0;
+            refreshFiledReceiptsPanel();
+            return;
+          }
+          draft.amountCents = -draft.amountCents;
           refreshFiledReceiptsPanel();
         });
       });
@@ -1494,7 +1555,7 @@
         const value = button.dataset.value || "";
         if (field === "vendor") {
           const input = receiptForm.querySelector('[name="vendor"]');
-          if (input) input.value = value;
+          if (input) input.value = canonicalizeVendor(value);
         } else if (field === "amount") {
           const input = receiptForm.querySelector('[name="amount"]');
           if (input) input.value = value;
@@ -1607,9 +1668,10 @@
         setScanStatus("Could not read this photo. Type the vendor and amount.", "warn");
         return;
       }
-      pendingScan = { vendor, amount };
-      renderSuggestRow(vendor, amount);
-      if (vendor || amount) {
+      const matchedVendor = canonicalizeVendor(vendor);
+      pendingScan = { vendor: matchedVendor, amount };
+      renderSuggestRow(matchedVendor, amount);
+      if (matchedVendor || amount) {
         setScanStatus("Tap a suggestion if it looks right, or enter vendor and amount yourself.");
       } else {
         setScanStatus("Could not read this photo. Type the vendor and amount.", "warn");
@@ -1620,7 +1682,7 @@
   }
 
   async function stageCompressedReceipt(blob, filename, scan = {}) {
-    const vendor = String(scan.vendor || "").trim();
+    const vendor = canonicalizeVendor(scan.vendor || "");
     const amount = Number(scan.amount || 0);
     const previewUrl = URL.createObjectURL(blob);
     draftReceipts.push({
@@ -1726,7 +1788,7 @@
     }
 
     const data = new FormData(receiptForm);
-    const vendor = String(data.get("vendor") || "").trim();
+    const vendor = canonicalizeVendor(String(data.get("vendor") || "").trim());
     const amountCents = parseCents(data.get("amount"));
     if (!vendor || !amountCents) {
       $("receiptFormError").textContent = "Fill both vendor and receipt amount before adding.";

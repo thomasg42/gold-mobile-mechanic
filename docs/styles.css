@@ -430,6 +430,64 @@ button {
   gap: 17px;
 }
 
+.job-swipe {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  background: #2a2d31;
+}
+
+.job-swipe-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 0;
+  display: flex;
+  width: 148px;
+}
+
+.job-swipe-action {
+  flex: 1 1 50%;
+  border: 0;
+  padding: 12px 8px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 850;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.job-swipe-action.archive,
+.job-swipe-action.restore {
+  background: #5c6670;
+}
+
+.job-swipe-action.delete {
+  background: #b42318;
+}
+
+.job-swipe-front {
+  position: relative;
+  z-index: 1;
+  transition: transform 0.2s ease;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.job-archive-toggle {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: center;
+  padding-top: 4px;
+}
+
+.job-grid > .empty-state {
+  grid-column: 1 / -1;
+}
+
 .job-card,
 .content-card {
   border: 1px solid var(--line);
@@ -469,6 +527,10 @@ button {
 .job-card[data-status="completed"]::after,
 .job-card[data-status="invoiced"]::after {
   background: var(--ink);
+}
+
+.job-card[data-status="archived"]::after {
+  background: #8a8f94;
 }
 
 .job-card-top {
@@ -511,6 +573,11 @@ button {
 .status-pill.invoiced {
   background: #191d20;
   color: var(--gold-light);
+}
+
+.status-pill.archived {
+  background: #e1e3e5;
+  color: #5a6066;
 }
 
 .job-card h3 {

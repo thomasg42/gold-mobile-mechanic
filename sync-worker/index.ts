@@ -1,6 +1,5 @@
 interface Env {
   DB: D1Database;
-  SYNC_KEY: string;
 }
 
 type StoredJobRow = {
@@ -25,7 +24,7 @@ function allowedOrigin(request: Request): string | null {
 
 function corsHeaders(request: Request): Headers {
   const headers = new Headers({
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "GET, PUT, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
@@ -44,11 +43,6 @@ function json(
   headers.set("Content-Type", "application/json; charset=utf-8");
   headers.set("Cache-Control", "no-store");
   return new Response(JSON.stringify(payload), { status, headers });
-}
-
-function authorized(request: Request, env: Env): boolean {
-  const header = request.headers.get("Authorization");
-  return Boolean(env.SYNC_KEY && header === `Bearer ${env.SYNC_KEY}`);
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -327,10 +321,6 @@ export default {
 
     if (url.pathname === "/api/health" && request.method === "GET") {
       return json(request, { ok: true, service: "gold-mobile-mechanic-sync" });
-    }
-
-    if (!authorized(request, env)) {
-      return json(request, { error: "Sync key required." }, 401);
     }
 
     if (url.pathname === "/api/jobs" && request.method === "GET") {

@@ -5,16 +5,17 @@
   const RECEIPT_DB = "gold-mobile-mechanic-receipts";
   const RECEIPT_STORE = "receipts";
   const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
-  const SYNC_KEY_STORAGE = "gold-mobile-mechanic-sync-key-v1";
   const OCR_BASE = "./vendor/tesseract";
   const PENDING_JOBS_STORAGE = "gold-mobile-mechanic-pending-jobs-v1";
   const PENDING_RECEIPTS_STORAGE = "gold-mobile-mechanic-pending-receipts-v1";
+  const PENDING_DELETES_STORAGE = "gold-mobile-mechanic-pending-deletes-v1";
   const STATUS_COPY = {
     draft: "Ready",
     in_progress: "On the clock",
     on_break: "On break",
     completed: "Clocked out",
-    invoiced: "Invoice ready"
+    invoiced: "Invoice ready",
+    archived: "Archived"
   };
 
   const $ = (id) => document.getElementById(id);
@@ -80,6 +81,7 @@
   function normalizeJob(job) {
     const normalized = {
       ...job,
+      archived: Boolean(job.archived),
       materials: Array.isArray(job.materials) ? job.materials : [],
       timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
       receipts: (Array.isArray(job.receipts) ? job.receipts : []).map((receipt) => {
@@ -141,42 +143,13 @@
 
   let state = loadState();
 
-  function consumePairingKey() {
-    const match = /^#sync=(\d{6})$/.exec(window.location.hash);
-    if (!match) return false;
-    localStorage.setItem(SYNC_KEY_STORAGE, match[1]);
-    history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-    return true;
-  }
-
-  const pairedFromUrl = consumePairingKey();
-
-  function syncKey() {
-    return localStorage.getItem(SYNC_KEY_STORAGE) || "";
-  }
-
-  function normalizeOwnerPin(value) {
-    const digits = String(value || "").replace(/\D/g, "");
-    return /^\d{6}$/.test(digits) ? digits : "";
-  }
-
   async function ensureCloudSync() {
-    if (!syncKey()) {
-      const entered = window.prompt("Enter your 6-digit Gold Mobile PIN:");
-      const pin = normalizeOwnerPin(entered);
-      if (!pin) {
-        notify("Cloud sync needs your 6-digit PIN before creating or changing jobs.", true);
-        return false;
-      }
-      localStorage.setItem(SYNC_KEY_STORAGE, pin);
-    }
     try {
       await syncFromCloud();
       return true;
     } catch (error) {
-      localStorage.removeItem(SYNC_KEY_STORAGE);
-      setSyncStatus("disconnected");
-      notify(error instanceof Error ? error.message : "Cloud sync could not connect. Check the 6-digit PIN.", true);
+      setSyncStatus("error");
+      notify(error instanceof Error ? error.message : "Cloud sync could not connect.", true);
       return false;
     }
   }
@@ -215,8 +188,7 @@
         ? "Job list storage is full on this phone browser. Receipt photos may still be saved — free Safari/Chrome site data and retry File All."
         : `Could not save job list: ${message || "unknown error"}`);
     }
-    if (!syncKey()) setSyncStatus("disconnected");
-    else if (pendingJobIds().length || pendingReceipts().length) {
+    if (pendingJobIds().length || pendingReceipts().length || pendingDeletes().length) {
       setSyncStatus(navigator.onLine ? "syncing" : "pending");
     }
   }
@@ -228,6 +200,35 @@
     else state.jobs[index] = normalized;
   }
 
+  function pendingDeletes() {
+    return arrayFromStorage(PENDING_DELETES_STORAGE).filter((id) => typeof id === "string");
+  }
+
+  function queueJobDelete(jobIdValue) {
+    const pending = new Set(pendingDeletes());
+    pending.add(jobIdValue);
+    writeStorageArray(PENDING_DELETES_STORAGE, [...pending]);
+    const jobsPending = pendingJobIds().filter((id) => id !== jobIdValue);
+    writeStorageArray(PENDING_JOBS_STORAGE, jobsPending);
+    const receipts = pendingReceipts().filter((item) => item.jobId !== jobIdValue);
+    writeStorageArray(PENDING_RECEIPTS_STORAGE, receipts);
+  }
+
+  async function deleteJobEverywhere(jobIdValue) {
+    state.jobs = state.jobs.filter((job) => job.id !== jobIdValue);
+    queueJobDelete(jobIdValue);
+    saveState();
+    try {
+      if (navigator.onLine) {
+        await cloudFetch(`/api/jobs/${encodeURIComponent(jobIdValue)}`, { method: "DELETE" });
+        writeStorageArray(PENDING_DELETES_STORAGE, pendingDeletes().filter((id) => id !== jobIdValue));
+      }
+    } catch {
+      // Keep the delete queued for the next successful sync.
+    }
+    void flushSyncQueue().catch(() => {});
+  }
+
   function queueJobSync(job) {
     job.updatedAt = new Date().toISOString();
     const ids = new Set(pendingJobIds());
@@ -235,6 +236,20 @@
     writeStorageArray(PENDING_JOBS_STORAGE, [...ids]);
     saveState();
     void flushSyncQueue().catch(() => {});
+  }
+
+  function archiveJob(jobIdValue) {
+    const job = findJob(jobIdValue);
+    if (!job) return;
+    job.archived = true;
+    queueJobSync(job);
+  }
+
+  function unarchiveJob(jobIdValue) {
+    const job = findJob(jobIdValue);
+    if (!job) return;
+    job.archived = false;
+    queueJobSync(job);
   }
 
   function queueReceiptSync(jobIdValue, receiptId) {
@@ -248,10 +263,7 @@
   }
 
   async function cloudFetch(path, options = {}) {
-    const key = syncKey();
-    if (!key) throw new Error("Cloud sync is not connected.");
     const headers = new Headers(options.headers || {});
-    headers.set("Authorization", `Bearer ${key}`);
     const response = await fetch(`${SYNC_API}${path}`, {
       ...options,
       cache: "no-store",
@@ -272,14 +284,21 @@
 
   async function flushSyncQueue() {
     if (syncInFlight) return syncInFlight;
-    if (!navigator.onLine || !syncKey()) {
-      setSyncStatus(syncKey() ? "pending" : "disconnected");
+    if (!navigator.onLine) {
+      setSyncStatus("pending");
       return;
     }
 
     syncInFlight = (async () => {
       setSyncStatus("syncing");
       try {
+        let deleteIds = pendingDeletes();
+        for (const id of deleteIds) {
+          await cloudFetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+          deleteIds = deleteIds.filter((value) => value !== id);
+          writeStorageArray(PENDING_DELETES_STORAGE, deleteIds);
+        }
+
         let jobIds = pendingJobIds();
         for (const id of jobIds) {
           const job = findJob(id);
@@ -329,8 +348,8 @@
   }
 
   async function syncFromCloud() {
-    if (!syncKey() || !navigator.onLine) {
-      setSyncStatus(syncKey() ? "pending" : "disconnected");
+    if (!navigator.onLine) {
+      setSyncStatus("pending");
       return;
     }
 
@@ -340,13 +359,16 @@
     const remoteJobs = Array.isArray(payload.jobs) ? payload.jobs.map(normalizeJob) : [];
     const remoteIds = new Set(remoteJobs.map((job) => job.id));
     const pendingIds = new Set(pendingJobIds());
+    const deleteIds = new Set(pendingDeletes());
 
     remoteJobs.forEach((remote) => {
+      if (deleteIds.has(remote.id)) return;
       const local = findJob(remote.id);
       if (!local || !pendingIds.has(remote.id)) replaceJob(remote);
     });
 
     state.jobs.forEach((local) => {
+      if (deleteIds.has(local.id)) return;
       if (!remoteIds.has(local.id)) {
         const ids = new Set(pendingJobIds());
         ids.add(local.id);
@@ -583,6 +605,14 @@
     toastTimer = setTimeout(() => toastElement.classList.add("hidden"), 3600);
   }
 
+  let lastAutosaveToastAt = 0;
+  function notifyAutoSaved() {
+    const now = Date.now();
+    if (now - lastAutosaveToastAt < 900) return;
+    lastAutosaveToastAt = now;
+    notify("Auto saved");
+  }
+
   function revokeObjectUrls() {
     activeObjectUrls.forEach((url) => URL.revokeObjectURL(url));
     activeObjectUrls = [];
@@ -677,7 +707,7 @@
 
   async function getReceiptForJob(jobIdValue, receiptId) {
     const local = await getReceipt(receiptId).catch(() => null);
-    if (local?.blob || !syncKey() || !navigator.onLine) return local;
+    if (local?.blob || !navigator.onLine) return local;
     try {
       const response = await cloudFetch(
         `/api/jobs/${encodeURIComponent(jobIdValue)}/receipts/${encodeURIComponent(receiptId)}`
@@ -759,6 +789,7 @@
   }
 
   function showBoard() {
+    flushOpenJobAutosave = null;
     selectedJobId = null;
     window.location.hash = "";
     jobView.classList.add("hidden");
@@ -768,10 +799,124 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  function closeOpenSwipes(exceptRow = null) {
+    document.querySelectorAll(".job-swipe.is-open").forEach((row) => {
+      if (exceptRow && row === exceptRow) return;
+      row.classList.remove("is-open");
+      const front = row.querySelector(".job-swipe-front");
+      if (front) front.style.transform = "";
+    });
+  }
+
+  function bindJobSwipe(row) {
+    const front = row.querySelector(".job-swipe-front");
+    if (!front) return;
+    const reveal = 148;
+    let startX = 0;
+    let startY = 0;
+    let currentX = 0;
+    let tracking = false;
+    let horizontal = null;
+    let moved = false;
+    let suppressClick = false;
+
+    const setOffset = (x) => {
+      currentX = Math.max(-reveal, Math.min(0, x));
+      front.style.transform = `translateX(${currentX}px)`;
+    };
+
+    const finish = () => {
+      if (!tracking) return;
+      tracking = false;
+      front.style.transition = "";
+      if (!moved) {
+        if (row.classList.contains("is-open")) {
+          row.classList.remove("is-open");
+          front.style.transform = "";
+          suppressClick = true;
+          return;
+        }
+        suppressClick = true;
+        openJob(row.dataset.jobId);
+        return;
+      }
+      if (currentX <= -reveal / 2) {
+        row.classList.add("is-open");
+        front.style.transform = `translateX(${-reveal}px)`;
+      } else {
+        row.classList.remove("is-open");
+        front.style.transform = "";
+      }
+      suppressClick = true;
+    };
+
+    front.addEventListener(
+      "touchstart",
+      (event) => {
+        if (!event.touches.length) return;
+        closeOpenSwipes(row);
+        tracking = true;
+        horizontal = null;
+        moved = false;
+        startX = event.touches[0].clientX;
+        startY = event.touches[0].clientY;
+        currentX = row.classList.contains("is-open") ? -reveal : 0;
+        front.style.transition = "none";
+      },
+      { passive: true }
+    );
+
+    front.addEventListener(
+      "touchmove",
+      (event) => {
+        if (!tracking || !event.touches.length) return;
+        const dx = event.touches[0].clientX - startX;
+        const dy = event.touches[0].clientY - startY;
+        if (horizontal === null) {
+          if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+          horizontal = Math.abs(dx) > Math.abs(dy);
+          if (!horizontal) {
+            tracking = false;
+            return;
+          }
+        }
+        if (!horizontal) return;
+        moved = true;
+        event.preventDefault();
+        const base = row.classList.contains("is-open") ? -reveal : 0;
+        setOffset(base + dx);
+      },
+      { passive: false }
+    );
+
+    front.addEventListener("touchend", finish, { passive: true });
+    front.addEventListener("touchcancel", finish, { passive: true });
+
+    front.addEventListener("click", (event) => {
+      if (suppressClick) {
+        event.preventDefault();
+        event.stopPropagation();
+        suppressClick = false;
+        return;
+      }
+      if (row.classList.contains("is-open")) {
+        event.preventDefault();
+        row.classList.remove("is-open");
+        front.style.transform = "";
+        return;
+      }
+      openJob(row.dataset.jobId);
+    });
+  }
+
   function renderBoard() {
     saveState();
-    const jobs = [...state.jobs].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-    if (!jobs.length) {
+    const showArchived = Boolean(state.showArchivedJobs);
+    const allJobs = [...state.jobs].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const archivedCount = allJobs.filter((job) => job.archived).length;
+    const jobs = allJobs.filter((job) => (showArchived ? job.archived : !job.archived));
+
+    if (!allJobs.length) {
       $("jobGrid").innerHTML = `
         <div class="empty-state">
           <strong>No work orders yet.</strong>
@@ -782,24 +927,99 @@
       return;
     }
 
-    $("jobGrid").innerHTML = jobs.map((job) => `
-      <button class="job-card" type="button" data-job-id="${escapeHtml(job.id)}" data-status="${escapeHtml(job.status)}">
-        <span class="job-card-top">
-          <span class="job-id">${escapeHtml(job.id)}</span>
-          <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status] || job.status)}</span>
-        </span>
-        <h3>${escapeHtml(vehicleName(job) || "Vehicle not named")}</h3>
-        <p class="customer">${escapeHtml(job.customerName)}</p>
-        <span class="card-stats">
-          <span><span>Work</span><strong>${duration(billableSeconds(job))}</strong></span>
-          <span><span>Receipts</span><strong>${job.receipts.length}</strong></span>
-          <span><span>Materials</span><strong>${job.materials.length}</strong></span>
-        </span>
-      </button>
-    `).join("");
+    const emptyCopy = showArchived
+      ? `<div class="empty-state"><strong>No archived jobs.</strong><p>Swipe left on a job to archive one that was started by mistake.</p></div>`
+      : `<div class="empty-state"><strong>No active jobs.</strong><p>Create a work order, or show archived jobs below.</p><button class="button button-dark" id="emptyNewJob" type="button">Create job</button></div>`;
 
-    document.querySelectorAll("[data-job-id]").forEach((button) => {
-      button.addEventListener("click", () => openJob(button.dataset.jobId));
+    const listMarkup = jobs.length
+      ? jobs
+          .map((job) => {
+            const statusLabel = job.archived
+              ? "Archived"
+              : STATUS_COPY[job.status] || job.status;
+            const restoreButton = job.archived
+              ? `<button class="job-swipe-action restore" type="button" data-restore-job="${escapeHtml(job.id)}">Restore</button>`
+              : `<button class="job-swipe-action archive" type="button" data-archive-job="${escapeHtml(job.id)}">Archive</button>`;
+            return `
+      <div class="job-swipe" data-job-id="${escapeHtml(job.id)}">
+        <div class="job-swipe-actions" aria-hidden="true">
+          ${restoreButton}
+          <button class="job-swipe-action delete" type="button" data-delete-job="${escapeHtml(job.id)}">Delete</button>
+        </div>
+        <button class="job-card job-swipe-front" type="button" data-status="${escapeHtml(job.archived ? "archived" : job.status)}">
+          <span class="job-card-top">
+            <span class="job-id">${escapeHtml(job.id)}</span>
+            <span class="status-pill ${escapeHtml(job.archived ? "archived" : job.status)}">${escapeHtml(statusLabel)}</span>
+          </span>
+          <h3>${escapeHtml(vehicleName(job) || "Vehicle not named")}</h3>
+          <p class="customer">${escapeHtml(job.customerName)}</p>
+          <span class="card-stats">
+            <span><span>Work</span><strong>${duration(billableSeconds(job))}</strong></span>
+            <span><span>Receipts</span><strong>${job.receipts.length}</strong></span>
+            <span><span>Materials</span><strong>${job.materials.length}</strong></span>
+          </span>
+        </button>
+      </div>`;
+          })
+          .join("")
+      : emptyCopy;
+
+    const archivedToggle =
+      archivedCount > 0
+        ? `<div class="job-archive-toggle">
+            <button class="button button-quiet" id="toggleArchivedJobs" type="button">
+              ${showArchived ? "Hide archived jobs" : `Show archived (${archivedCount})`}
+            </button>
+          </div>`
+        : "";
+
+    $("jobGrid").innerHTML = `${listMarkup}${archivedToggle}`;
+
+    const emptyNew = $("emptyNewJob");
+    if (emptyNew) emptyNew.addEventListener("click", openNewJob);
+
+    const toggle = $("toggleArchivedJobs");
+    if (toggle) {
+      toggle.addEventListener("click", () => {
+        state.showArchivedJobs = !state.showArchivedJobs;
+        renderBoard();
+      });
+    }
+
+    document.querySelectorAll(".job-swipe").forEach((row) => bindJobSwipe(row));
+
+    document.querySelectorAll("[data-archive-job]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        archiveJob(button.dataset.archiveJob);
+        closeOpenSwipes();
+        renderBoard();
+      });
+    });
+
+    document.querySelectorAll("[data-restore-job]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        unarchiveJob(button.dataset.restoreJob);
+        closeOpenSwipes();
+        renderBoard();
+      });
+    });
+
+    document.querySelectorAll("[data-delete-job]").forEach((button) => {
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = button.dataset.deleteJob;
+        const job = findJob(id);
+        const label = job ? vehicleName(job) || job.id : id;
+        if (!window.confirm(`Delete ${label}? This cannot be undone.`)) return;
+        await deleteJobEverywhere(id);
+        closeOpenSwipes();
+        renderBoard();
+      });
     });
   }
 
@@ -852,7 +1072,8 @@
       <div class="save-row materials-actions">
         <button class="button button-quiet" id="addJobMaterialButton" type="button">+ Add material</button>
         <button class="button button-quiet" id="saveMaterialsButton" type="button">Save materials</button>
-      </div>`;
+      </div>
+      <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>`;
   }
 
   function invoiceMarkup(job) {
@@ -1062,6 +1283,7 @@
                   <div class="save-row time-edit-actions">
                     <button class="button button-quiet" id="saveLaborButton" type="button">Save labor</button>
                   </div>
+                  <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>
                 </div>`}
             </div>
             <div class="history-panel">
@@ -1101,7 +1323,8 @@
               </div>
             </div>
             <textarea class="suggestions" id="suggestionsInput" ${locked ? "disabled" : ""} placeholder="Example: Front brake pads are nearing replacement thickness. Recheck within 3,000 miles.">${escapeHtml(job.suggestions || "")}</textarea>
-            ${locked ? "" : `<div class="save-row"><button class="button button-quiet" id="saveSuggestionsButton" type="button">Save suggestions</button></div>`}
+            ${locked ? "" : `<div class="save-row"><button class="button button-quiet" id="saveSuggestionsButton" type="button">Save suggestions</button></div>
+              <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>`}
           </article>
         </div>
 
@@ -1122,7 +1345,7 @@
               <div class="save-row">
                 <button class="button button-gold" id="saveReceiptFolderButton" type="button">Save receipt folder</button>
               </div>
-              <p class="time-edit-note">Saves vendor, receipt parts, receipt amount, and +/- adjust for every receipt. Stars (*) are required before Clock out & invoice. Edits also auto-save.</p>
+              <p class="time-edit-note">Tap away or scroll to auto-save vendor, receipt parts, amount, and +/-. Stars (*) required before Clock out & invoice.</p>
             `}
           </article>
 
@@ -1161,10 +1384,160 @@
     updateLiveTimer();
   }
 
+  let flushOpenJobAutosave = null;
+  let scrollAutosaveTimer = null;
+  window.addEventListener(
+    "scroll",
+    () => {
+      if (typeof flushOpenJobAutosave !== "function") return;
+      clearTimeout(scrollAutosaveTimer);
+      scrollAutosaveTimer = setTimeout(() => flushOpenJobAutosave(), 250);
+    },
+    { passive: true }
+  );
+  jobView.addEventListener("focusout", () => {
+    if (typeof flushOpenJobAutosave !== "function") return;
+    setTimeout(() => {
+      if (typeof flushOpenJobAutosave === "function") flushOpenJobAutosave();
+    }, 0);
+  });
+
   function bindJobEvents(job) {
-    $("backButton").addEventListener("click", showBoard);
+    function persistSuggestions() {
+      const input = $("suggestionsInput");
+      if (!input || input.disabled) return false;
+      const next = input.value.trim();
+      if (next === (job.suggestions || "")) return false;
+      job.suggestions = next;
+      queueJobSync(job);
+      return true;
+    }
+
+    function persistMaterials() {
+      const rows = $("jobMaterialRows");
+      if (!rows) return false;
+      const next = [...rows.querySelectorAll(".material-row")]
+        .map((row) => ({
+          id: row.dataset.materialId || uid(),
+          description: row.querySelector('[name="jobMaterialDescription"]')?.value.trim() || ""
+        }))
+        .filter((item) => item.description);
+      const before = JSON.stringify((job.materials || []).map((item) => [item.id, item.description]));
+      const after = JSON.stringify(next.map((item) => [item.id, item.description]));
+      if (before === after) return false;
+      job.materials = next;
+      queueJobSync(job);
+      return true;
+    }
+
+    function applyLaborFromForm(targetJob) {
+      const rateCents = parseCents($("laborRateInput")?.value);
+      if (rateCents) targetJob.laborRateCents = rateCents;
+      targetJob.laborAmountCents = null;
+      const magnitude = parseCents($("laborAdjustInput")?.value);
+      const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
+      targetJob.laborAdjustmentCents = sign * magnitude;
+      targetJob.laborAdjustSign = sign;
+      if ($("difficultySelect")) targetJob.difficultyLevel = $("difficultySelect").value || "Standard";
+      if (targetJob.invoice) targetJob.invoice = invoiceDraft(targetJob);
+    }
+
+    function persistLabor() {
+      if (!$("laborRateInput")) return false;
+      const before = JSON.stringify({
+        rate: job.laborRateCents || 0,
+        adj: job.laborAdjustmentCents || 0,
+        diff: job.difficultyLevel || "Standard"
+      });
+      applyLaborFromForm(job);
+      const after = JSON.stringify({
+        rate: job.laborRateCents || 0,
+        adj: job.laborAdjustmentCents || 0,
+        diff: job.difficultyLevel || "Standard"
+      });
+      if (before === after) return false;
+      queueJobSync(job);
+      return true;
+    }
+
+    function readFolderReceiptInputs(targetJob) {
+      targetJob.receipts.forEach((receipt) => {
+        const vendorInput = document.querySelector(`[data-folder-vendor="${receipt.id}"]`);
+        const partsInput = document.querySelector(`[data-folder-parts="${receipt.id}"]`);
+        const amountInput = document.querySelector(`[data-folder-amount="${receipt.id}"]`);
+        const adjustInput = document.querySelector(`[data-folder-adjust="${receipt.id}"]`);
+        const signButton = document.querySelector(`[data-folder-sign="${receipt.id}"]`);
+        if (vendorInput) receipt.vendor = canonicalizeVendor(vendorInput.value, targetJob);
+        if (partsInput) {
+          receipt.receiptParts = partsInput.value.trim();
+          receipt.orderId = receipt.receiptParts;
+        }
+        if (amountInput) receipt.amountCents = parseCents(amountInput.value);
+        if (adjustInput) receipt.adjustCents = parseCents(adjustInput.value);
+        if (signButton) {
+          receipt.adjustSign = (signButton.textContent || "+").includes("−") || (signButton.textContent || "").includes("-") ? -1 : 1;
+        }
+        if (receipt.adjustSign < 0) {
+          receipt.addCents = 0;
+          receipt.subtractCents = receipt.adjustCents;
+        } else {
+          receipt.addCents = receipt.adjustCents;
+          receipt.subtractCents = 0;
+        }
+      });
+    }
+
+    function folderSnapshot(targetJob) {
+      return JSON.stringify(
+        (targetJob.receipts || []).map((receipt) => [
+          receipt.id,
+          receipt.vendor || "",
+          receipt.receiptParts || receipt.orderId || "",
+          receipt.amountCents || 0,
+          receipt.adjustCents || 0,
+          receipt.adjustSign || 1
+        ])
+      );
+    }
+
+    function persistFolder() {
+      if (!job.receipts.length) return false;
+      if (!document.querySelector("[data-folder-vendor], [data-folder-parts], [data-folder-amount], [data-folder-adjust]")) {
+        return false;
+      }
+      const before = folderSnapshot(job);
+      readFolderReceiptInputs(job);
+      const after = folderSnapshot(job);
+      if (before === after) return false;
+      job.receiptReview = !jobReadyForInvoice(job);
+      job.receiptFolderSavedAt = new Date().toISOString();
+      if (job.invoice) job.invoice = invoiceDraft(job);
+      queueJobSync(job);
+      return true;
+    }
+
+    function flushJobAutosave() {
+      if (job.status === "invoiced") return false;
+      const changed =
+        persistSuggestions() ||
+        persistMaterials() ||
+        persistLabor() ||
+        persistFolder();
+      if (changed) notifyAutoSaved();
+      return changed;
+    }
+
+    flushOpenJobAutosave = () => flushJobAutosave();
+
+    $("backButton").addEventListener("click", () => {
+      flushJobAutosave();
+      showBoard();
+    });
     document.querySelectorAll("[data-timer-action]").forEach((button) => {
-      button.addEventListener("click", () => timerAction(job, button.dataset.timerAction));
+      button.addEventListener("click", () => {
+        flushJobAutosave();
+        timerAction(job, button.dataset.timerAction);
+      });
     });
 
     const clockOutButton = $("clockOutButton");
@@ -1172,6 +1545,8 @@
       clockOutButton.addEventListener("click", () => {
         if ($("laborRateInput")) applyLaborFromForm(job);
         if (job.receipts.length) readFolderReceiptInputs(job);
+        persistSuggestions();
+        persistMaterials();
         const blocked = jobReadyForInvoice(job);
         if (blocked) {
           notify(blocked, true);
@@ -1182,7 +1557,12 @@
     }
 
     const addReceiptButton = $("addReceiptButton");
-    if (addReceiptButton) addReceiptButton.addEventListener("click", () => openReceiptDialog(job.id));
+    if (addReceiptButton) {
+      addReceiptButton.addEventListener("click", () => {
+        flushJobAutosave();
+        openReceiptDialog(job.id);
+      });
+    }
 
     document.querySelectorAll("[data-receipt-id]").forEach((button) => {
       button.addEventListener("click", () => viewReceipt(button.dataset.receiptId));
@@ -1191,9 +1571,8 @@
     const saveSuggestionsButton = $("saveSuggestionsButton");
     if (saveSuggestionsButton) {
       saveSuggestionsButton.addEventListener("click", () => {
-        job.suggestions = $("suggestionsInput").value.trim();
-        queueJobSync(job);
-        notify("Mechanic's suggestions saved.");
+        persistSuggestions();
+        notifyAutoSaved();
       });
     }
 
@@ -1206,6 +1585,7 @@
     }
 
     function applyManualSeconds(seconds, message) {
+      flushJobAutosave();
       job.manualWorkSeconds = Math.max(0, Math.round(seconds));
       if (job.invoice) job.invoice = invoiceDraft(job);
       queueJobSync(job);
@@ -1249,6 +1629,7 @@
           } else {
             row.remove();
           }
+          if (persistMaterials()) notifyAutoSaved();
         });
       });
     }
@@ -1273,6 +1654,7 @@
           } else {
             row.remove();
           }
+          if (persistMaterials()) notifyAutoSaved();
         });
         jobMaterialRows.appendChild(row);
         row.querySelector("input")?.focus();
@@ -1282,15 +1664,8 @@
     const saveMaterialsButton = $("saveMaterialsButton");
     if (saveMaterialsButton && jobMaterialRows) {
       saveMaterialsButton.addEventListener("click", () => {
-        job.materials = [...jobMaterialRows.querySelectorAll(".material-row")]
-          .map((row) => ({
-            id: row.dataset.materialId || uid(),
-            description: row.querySelector('[name="jobMaterialDescription"]')?.value.trim() || ""
-          }))
-          .filter((item) => item.description);
-        queueJobSync(job);
-        renderJob();
-        notify("Materials list saved.");
+        persistMaterials();
+        notifyAutoSaved();
       });
     }
 
@@ -1316,8 +1691,7 @@
         job.receiptFolderSavedAt = new Date().toISOString();
         if (job.invoice) job.invoice = invoiceDraft(job);
         queueJobSync(job);
-        renderJob();
-        notify(`Receipt folder saved · parts ${money(receiptTotal(job))}.`);
+        notifyAutoSaved();
       });
     }
 
@@ -1337,28 +1711,6 @@
           ? `Adjusted by ${sign < 0 ? "−" : "+"}${money(magnitude)} · original ${money(timed)} → new ${money(total)}`
           : "No labor adjustment.";
       }
-      scheduleLaborAutoSave();
-    }
-
-    function applyLaborFromForm(targetJob) {
-      const rateCents = parseCents($("laborRateInput")?.value);
-      if (rateCents) targetJob.laborRateCents = rateCents;
-      targetJob.laborAmountCents = null;
-      const magnitude = parseCents($("laborAdjustInput")?.value);
-      const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
-      targetJob.laborAdjustmentCents = sign * magnitude;
-      targetJob.laborAdjustSign = sign;
-      if ($("difficultySelect")) targetJob.difficultyLevel = $("difficultySelect").value || "Standard";
-      if (targetJob.invoice) targetJob.invoice = invoiceDraft(targetJob);
-    }
-
-    let laborAutoSaveTimer = null;
-    function scheduleLaborAutoSave() {
-      clearTimeout(laborAutoSaveTimer);
-      laborAutoSaveTimer = setTimeout(() => {
-        applyLaborFromForm(job);
-        queueJobSync(job);
-      }, 500);
     }
 
     const saveLaborButton = $("saveLaborButton");
@@ -1371,8 +1723,7 @@
         }
         applyLaborFromForm(job);
         queueJobSync(job);
-        renderJob();
-        notify(`Labor saved · ${money(invoiceDraft(job).laborCents)} · ${job.difficultyLevel}.`);
+        notifyAutoSaved();
       });
     }
 
@@ -1382,6 +1733,7 @@
         const next = (laborAdjustSign.textContent || "+").includes("−") || (laborAdjustSign.textContent || "").includes("-") ? "+" : "−";
         laborAdjustSign.textContent = next;
         liveLaborTotal();
+        if (persistLabor()) notifyAutoSaved();
       });
     }
     ["laborRateInput", "laborAdjustInput"].forEach((id) => {
@@ -1389,45 +1741,10 @@
       if (input) input.addEventListener("input", liveLaborTotal);
     });
     const difficultySelect = $("difficultySelect");
-    if (difficultySelect) difficultySelect.addEventListener("change", scheduleLaborAutoSave);
-
-    function readFolderReceiptInputs(targetJob) {
-      targetJob.receipts.forEach((receipt) => {
-        const vendorInput = document.querySelector(`[data-folder-vendor="${receipt.id}"]`);
-        const partsInput = document.querySelector(`[data-folder-parts="${receipt.id}"]`);
-        const amountInput = document.querySelector(`[data-folder-amount="${receipt.id}"]`);
-        const adjustInput = document.querySelector(`[data-folder-adjust="${receipt.id}"]`);
-        const signButton = document.querySelector(`[data-folder-sign="${receipt.id}"]`);
-        if (vendorInput) receipt.vendor = canonicalizeVendor(vendorInput.value, targetJob);
-        if (partsInput) {
-          receipt.receiptParts = partsInput.value.trim();
-          receipt.orderId = receipt.receiptParts;
-        }
-        if (amountInput) receipt.amountCents = parseCents(amountInput.value);
-        if (adjustInput) receipt.adjustCents = parseCents(adjustInput.value);
-        if (signButton) {
-          receipt.adjustSign = (signButton.textContent || "+").includes("−") || (signButton.textContent || "").includes("-") ? -1 : 1;
-        }
-        if (receipt.adjustSign < 0) {
-          receipt.addCents = 0;
-          receipt.subtractCents = receipt.adjustCents;
-        } else {
-          receipt.addCents = receipt.adjustCents;
-          receipt.subtractCents = 0;
-        }
+    if (difficultySelect) {
+      difficultySelect.addEventListener("change", () => {
+        if (persistLabor()) notifyAutoSaved();
       });
-    }
-
-    let folderAutoSaveTimer = null;
-    function scheduleFolderAutoSave() {
-      clearTimeout(folderAutoSaveTimer);
-      folderAutoSaveTimer = setTimeout(() => {
-        readFolderReceiptInputs(job);
-        job.receiptReview = !jobReadyForInvoice(job);
-        job.receiptFolderSavedAt = new Date().toISOString();
-        if (job.invoice) job.invoice = invoiceDraft(job);
-        queueJobSync(job);
-      }, 500);
     }
 
     function refreshFolderSubtotal(id) {
@@ -1456,14 +1773,12 @@
         });
         parts.textContent = money(total);
       }
-      scheduleFolderAutoSave();
     }
 
     document.querySelectorAll("[data-folder-amount], [data-folder-adjust], [data-folder-vendor], [data-folder-parts]").forEach((input) => {
       input.addEventListener("input", () => {
         const id = input.dataset.folderAmount || input.dataset.folderAdjust || input.dataset.folderVendor || input.dataset.folderParts;
         if (input.dataset.folderAmount || input.dataset.folderAdjust) refreshFolderSubtotal(id);
-        else scheduleFolderAutoSave();
       });
     });
     document.querySelectorAll("[data-folder-sign]").forEach((button) => {
@@ -1471,12 +1786,14 @@
         const next = (button.textContent || "+").includes("−") || (button.textContent || "").includes("-") ? "+" : "−";
         button.textContent = next;
         refreshFolderSubtotal(button.dataset.folderSign);
+        if (persistFolder()) notifyAutoSaved();
       });
     });
 
     const createInvoiceButton = $("createInvoiceButton");
     if (createInvoiceButton) {
       createInvoiceButton.addEventListener("click", async () => {
+        flushJobAutosave();
         createInvoice(job);
         await shareInvoice(job);
       });
@@ -2541,7 +2858,7 @@
       })
       .catch(() => setSyncStatus("error"));
   });
-  window.addEventListener("offline", () => setSyncStatus(syncKey() ? "pending" : "disconnected"));
+  window.addEventListener("offline", () => setSyncStatus("pending"));
 
   setInterval(updateLiveTimer, 1000);
 
@@ -2551,14 +2868,11 @@
 
   async function initialize() {
     saveState();
-    if (syncKey()) {
-      try {
-        await syncFromCloud();
-        if (pairedFromUrl) notify("This phone is connected to the permanent cloud ledger.");
-      } catch (error) {
-        setSyncStatus("error");
-        notify(error instanceof Error ? error.message : "Cloud sync could not connect.", true);
-      }
+    try {
+      await syncFromCloud();
+    } catch (error) {
+      setSyncStatus("error");
+      notify(error instanceof Error ? error.message : "Cloud sync could not connect.", true);
     }
     const initialMatch = /^#job\/(.+)$/.exec(window.location.hash);
     if (initialMatch && findJob(decodeURIComponent(initialMatch[1]))) {

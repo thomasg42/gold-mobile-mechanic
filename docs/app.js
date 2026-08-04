@@ -13,7 +13,7 @@
     draft: "Ready",
     in_progress: "On the clock",
     on_break: "On break",
-    completed: "Clocked out",
+    completed: "Finished job",
     invoiced: "Invoice ready",
     archived: "Archived"
   };
@@ -553,14 +553,14 @@
 
   function jobReadyForInvoice(job) {
     if (!Number(job.laborRateCents || 0)) {
-      return "Enter the hourly labor rate before clock out & invoice.";
+      return "Enter the hourly labor rate before Finish Project.";
     }
     for (const receipt of job.receipts || []) {
-      if (!String(receipt.vendor || "").trim()) return "Every receipt needs a vendor before clock out & invoice.";
+      if (!String(receipt.vendor || "").trim()) return "Every receipt needs a vendor before Finish Project.";
       if (!String(receipt.receiptParts || receipt.orderId || "").trim()) {
-        return "Every receipt needs receipt parts before clock out & invoice.";
+        return "Every receipt needs receipt parts before Finish Project.";
       }
-      if (!Number(receipt.amountCents || 0)) return "Every receipt needs a total amount before clock out & invoice.";
+      if (!Number(receipt.amountCents || 0)) return "Every receipt needs a total amount before Finish Project.";
     }
     return "";
   }
@@ -1047,7 +1047,7 @@
     if (job.status === "on_break") {
       return `<button class="button button-green" data-timer-action="break_end" type="button">End break</button>`;
     }
-    return `<button class="button button-quiet" type="button" disabled>${job.status === "invoiced" ? "Invoice filed" : "Job complete"}</button>`;
+    return `<button class="button button-quiet" type="button" disabled>${job.status === "invoiced" ? "Invoice filed" : "Finished job"}</button>`;
   }
 
   function materialsMarkup(job, locked) {
@@ -1168,7 +1168,7 @@
       clock_in: "Clocked in",
       break_start: "Paused for break",
       break_end: "Resumed work",
-      clock_out: "Clocked out"
+      clock_out: "Finished project"
     };
     const events = [...(job.eventHistory || [])]
       .sort((a, b) => String(b.occurredAt).localeCompare(String(a.occurredAt)));
@@ -1345,7 +1345,7 @@
               <div class="save-row">
                 <button class="button button-gold" id="saveReceiptFolderButton" type="button">Save receipt folder</button>
               </div>
-              <p class="time-edit-note">Tap away or scroll to auto-save vendor, receipt parts, amount, and +/-. Stars (*) required before Clock out & invoice.</p>
+              <p class="time-edit-note">Tap away or scroll to auto-save vendor, receipt parts, amount, and +/-. Stars (*) required before Finish Project.</p>
             `}
           </article>
 
@@ -1355,7 +1355,7 @@
                 <div>
                   <p class="eyebrow">Invoice at capture</p>
                   <h2>${job.status === "completed" ? "Ready to bill" : "Running invoice"}</h2>
-                  <p>Receipt photos roll into parts the moment you file them. Clock out files the invoice so you can share it for payment.</p>
+                  <p>Receipt photos roll into parts the moment you file them. Finish Project files the invoice so you can share it for payment.</p>
                 </div>
               </div>
               <div class="invoice-meta">
@@ -1375,9 +1375,9 @@
         <div>
           <p class="eyebrow">Bottom of work order</p>
           <h3>${job.status === "completed" || job.status === "invoiced" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
-          <p>${job.status === "on_break" ? "End the current break before clocking out." : job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Clocking out closes the timer and files the invoice in the same step so you can get paid."}</p>
+          <p>${job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Finish Project closes the timer and files the invoice so you can get paid. Clocking out or taking a break for the day doesn't affect it — come back whenever and hit Finish Project when the job is actually done."}</p>
         </div>
-        <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" ? "" : "disabled"}>Clock out & invoice</button>
+        <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "on_break" ? "" : "disabled"}>Finish Project</button>
       </section>`;
 
     bindJobEvents(job);
@@ -1828,8 +1828,8 @@
       job.timeEntries.push({ id: uid(), kind: "work", startedAt: now, endedAt: null });
       job.status = "in_progress";
       notify("Break ended. Billable time resumed.");
-    } else if (action === "clock_out" && job.status === "in_progress") {
-      if (!window.confirm("Clock out, close the timer, and file the invoice for payment?")) return;
+    } else if (action === "clock_out" && (job.status === "in_progress" || job.status === "on_break")) {
+      if (!window.confirm("Finish this project, close the timer, and file the invoice for payment?")) return;
       if (openEntry) openEntry.endedAt = now;
       job.status = "completed";
       job.endedAt = now;
@@ -2621,7 +2621,7 @@
 
   function createInvoice(job) {
     if (job.status !== "completed" && job.status !== "invoiced") {
-      notify("Clock out first so labor is closed, then the invoice files automatically.", true);
+      notify("Hit Finish Project first so labor is closed, then the invoice files automatically.", true);
       return;
     }
     const invoice = upsertInvoice(job);

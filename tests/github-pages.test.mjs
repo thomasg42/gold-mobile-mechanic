@@ -33,7 +33,7 @@ test("GitHub phone app syncs durable jobs, receipts, and clock history", async (
   assert.match(script, /receiptReview/);
   assert.match(script, /invoice-at-capture|Invoice at capture|upsertInvoice/);
   assert.match(script, /partsTotal|receiptTotal/);
-  assert.match(script, /Clock out.*invoice|clock out.*file the invoice/i);
+  assert.match(script, /Finish Project.*invoice/i);
   assert.match(script, /invoiceHtml/);
   assert.match(script, /navigator\.share/);
   assert.match(script, /mailto:/);

@@ -111,6 +111,7 @@
       manualWorkSeconds: Number.isFinite(Number(job.manualWorkSeconds))
         ? Math.max(0, Math.round(Number(job.manualWorkSeconds)))
         : 0,
+      manualWorkSign: Number(job.manualWorkSign) < 0 ? -1 : 1,
       laborAmountCents: job.laborAmountCents === null || job.laborAmountCents === undefined || job.laborAmountCents === ""
         ? null
         : (Number.isFinite(Number(job.laborAmountCents))
@@ -441,6 +442,14 @@
     }).format(new Date(value));
   }
 
+  function toDatetimeLocalValue(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (character) => ({
       "&": "&amp;",
@@ -470,8 +479,16 @@
     return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
   }
 
+  function manualWorkSignValue(job) {
+    return Number(job?.manualWorkSign) < 0 ? -1 : 1;
+  }
+
+  function manualWorkSignedSeconds(job) {
+    return manualWorkSignValue(job) * manualWorkSeconds(job);
+  }
+
   function billableSeconds(job, now = Date.now()) {
-    return elapsedSeconds(job, "work", now) + manualWorkSeconds(job);
+    return Math.max(0, elapsedSeconds(job, "work", now) + manualWorkSignedSeconds(job));
   }
 
   function hoursMinutes(seconds) {
@@ -1237,8 +1254,19 @@
                 <span class="detail-label">Billable hours on the invoice</span>
                 <strong id="billableSummary">${duration(workSeconds)}</strong>
               </div>
-              <p class="time-edit-note">Timer ${duration(timedSeconds)}${manualWorkSeconds(job) ? ` · added ${adjustment.hours}h ${adjustment.minutes}m` : ""} · timer labor ${money(draft.timedLaborCents)}</p>
+              <p class="time-edit-note">Timer ${duration(timedSeconds)}${manualWorkSeconds(job) ? ` · ${manualWorkSignValue(job) < 0 ? "subtracted" : "added"} ${adjustment.hours}h ${adjustment.minutes}m` : ""} · timer labor ${money(draft.timedLaborCents)}</p>
               ${locked ? "" : `
+                ${job.startedAt ? `
+                  <div class="time-edit-fields">
+                    <label class="field clock-in-edit-field">
+                      <span>Clocked in</span>
+                      <input id="clockInTimeInput" type="datetime-local" value="${toDatetimeLocalValue(job.startedAt)}">
+                    </label>
+                  </div>
+                  <div class="save-row time-edit-actions">
+                    <button class="button button-quiet" id="setClockInButton" type="button">Save clock-in time</button>
+                  </div>
+                  <p class="time-edit-note">Fixes the clock-in stamp if the timer got left running by mistake.</p>` : ""}
                 <div class="time-edit-fields">
                   <label class="field">
                     <span>Hours</span>
@@ -1250,8 +1278,9 @@
                   </label>
                 </div>
                 <div class="save-row time-edit-actions">
-                  <button class="button button-quiet" id="setManualTimeButton" type="button">Set added time</button>
-                  <button class="button button-quiet" id="addManualTimeButton" type="button">Add to total</button>
+                  <button class="button button-quiet" id="manualTimeSign" type="button" aria-label="Toggle add or subtract">${manualWorkSignValue(job) < 0 ? "− Subtract" : "+ Add"}</button>
+                  <button class="button button-quiet" id="setManualTimeButton" type="button">Set adjustment</button>
+                  <button class="button button-quiet" id="addManualTimeButton" type="button">Add to adjustment</button>
                 </div>
                 <div class="labor-cash">
                   <p class="detail-label">Labor charge</p>
@@ -1576,6 +1605,41 @@
       });
     }
 
+    const setClockInButton = $("setClockInButton");
+    if (setClockInButton) {
+      setClockInButton.addEventListener("click", () => {
+        const raw = $("clockInTimeInput")?.value;
+        if (!raw) {
+          notify("Pick a clock-in date and time first.", true);
+          return;
+        }
+        const parsed = new Date(raw);
+        if (Number.isNaN(parsed.getTime())) {
+          notify("That clock-in time isn't valid.", true);
+          return;
+        }
+        if (parsed.getTime() > Date.now()) {
+          notify("Clock-in time can't be in the future.", true);
+          return;
+        }
+        flushJobAutosave();
+        const iso = parsed.toISOString();
+        job.startedAt = iso;
+        const firstEntry = [...job.timeEntries]
+          .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))[0];
+        if (firstEntry) firstEntry.startedAt = iso;
+        job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
+        const clockInEvent = [...job.eventHistory]
+          .sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)))
+          .find((event) => event.action === "clock_in");
+        if (clockInEvent) clockInEvent.occurredAt = iso;
+        if (job.invoice) job.invoice = invoiceDraft(job);
+        queueJobSync(job);
+        renderJob();
+        notify(`Clock-in time corrected to ${clockTime(iso)}.`);
+      });
+    }
+
     function readManualEntry() {
       const hours = Number.parseInt($("manualHoursInput")?.value ?? "", 10);
       const minutes = Number.parseInt($("manualMinutesInput")?.value ?? "", 10);
@@ -1584,21 +1648,39 @@
       return safeHours * 3600 + safeMinutes * 60;
     }
 
-    function applyManualSeconds(seconds, message) {
+    function readManualSign() {
+      const text = $("manualTimeSign")?.textContent || "";
+      return text.includes("−") || text.includes("-") ? -1 : 1;
+    }
+
+    function applyManualSeconds(seconds, sign, message) {
       flushJobAutosave();
       job.manualWorkSeconds = Math.max(0, Math.round(seconds));
+      job.manualWorkSign = sign < 0 ? -1 : 1;
       if (job.invoice) job.invoice = invoiceDraft(job);
       queueJobSync(job);
       renderJob();
       notify(message);
     }
 
+    const manualTimeSign = $("manualTimeSign");
+    if (manualTimeSign) {
+      manualTimeSign.addEventListener("click", () => {
+        manualTimeSign.textContent = manualTimeSign.textContent.includes("−") ? "+ Add" : "− Subtract";
+      });
+    }
+
     const setManualTimeButton = $("setManualTimeButton");
     if (setManualTimeButton) {
       setManualTimeButton.addEventListener("click", () => {
         const entered = readManualEntry();
+        const sign = readManualSign();
         const summary = hoursMinutes(entered);
-        applyManualSeconds(entered, `Added time set to ${summary.hours}h ${summary.minutes}m.`);
+        applyManualSeconds(
+          entered,
+          sign,
+          `Adjustment set to ${sign < 0 ? "−" : "+"}${summary.hours}h ${summary.minutes}m.`
+        );
       });
     }
 
@@ -1607,12 +1689,19 @@
       addManualTimeButton.addEventListener("click", () => {
         const entered = readManualEntry();
         if (!entered) {
-          notify("Enter hours or minutes before adding time.", true);
+          notify("Enter hours or minutes before adjusting time.", true);
           return;
         }
-        const total = manualWorkSeconds(job) + entered;
-        const summary = hoursMinutes(total);
-        applyManualSeconds(total, `Added time now ${summary.hours}h ${summary.minutes}m.`);
+        const sign = readManualSign();
+        const totalSigned = manualWorkSignedSeconds(job) + sign * entered;
+        const nextSign = totalSigned < 0 ? -1 : 1;
+        const nextMagnitude = Math.abs(totalSigned);
+        const summary = hoursMinutes(nextMagnitude);
+        applyManualSeconds(
+          nextMagnitude,
+          nextSign,
+          `Adjustment now ${nextSign < 0 ? "−" : "+"}${summary.hours}h ${summary.minutes}m.`
+        );
       });
     }
 

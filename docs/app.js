@@ -38,9 +38,6 @@
   let syncInFlight = null;
   let ocrWorkerPromise = null;
   let pendingScan = { vendor: "", amount: 0, orderId: "", receiptParts: "" };
-  // Bumped every time a fresh photo finishes staging, so a voice interview can
-  // tell "a new receipt just arrived" from "the old one is still sitting there".
-  let captureGeneration = 0;
 
   function arrayFromStorage(key) {
     try {
@@ -2556,7 +2553,6 @@
       if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
       receiptPreviewUrl = URL.createObjectURL(blob);
       pendingCapture = { blob, filename: file.name || `receipt-${Date.now()}.jpg` };
-      captureGeneration += 1;
       $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
       $("receiptPreview").classList.remove("hidden");
       scanReceipt(blob);
@@ -3104,23 +3100,58 @@
       });
 
       await speak("Creating the job now.");
+      // Submit through the normal path so every existing validation still runs.
+      jobForm.requestSubmit();
+
+      // The job exists and is open from here, so the clock can be started
+      // without ever putting the phone down.
+      const created = findJob(selectedJobId);
+      if (created?.status === "draft") {
+        const startNow = await ask({
+          name: "clockIn",
+          label: "the clock-in answer",
+          prompt: "Job created. Ready to clock in?",
+          parse: window.GMMVoice.parse.yesNo
+        });
+        if (startNow === true) {
+          timerAction(created, "clock_in");
+          await speak("Clocked in. The billable clock is running.");
+        } else {
+          await speak("Leaving the clock stopped. Tap clock in when you start.");
+        }
+      }
       return true;
     });
 
     if (!outcome.ok) {
       if (outcome.reason === "error") notify(outcome.message, true);
-      notify("Voice stopped — the form is filled in as far as we got.", outcome.reason === "error");
-      return;
+      else notify("Voice stopped — the form is filled in as far as we got.");
     }
-    // Submit through the normal path so every existing validation still runs.
-    jobForm.requestSubmit();
   }
 
-  async function voiceReceipts(job) {
-    if (voiceUnavailable()) return;
-    openReceiptDialog(job.id);
+  /** Waits for File All Receipts to drain, so the invoice sees the parts total. */
+  function waitForReceiptsFiled() {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const poll = setInterval(() => {
+        if (!draftReceipts.length || Date.now() - started > 15000) {
+          clearInterval(poll);
+          resolve();
+        }
+      }, 150);
+    });
+  }
 
-    await window.GMMVoice.run(async ({ speak, ask, confirm, tapAction }) => {
+  /**
+   * The receipt loop, shared by the standalone Receipts-by-voice button and the
+   * closeout — the job is finished once, so the questions must be worded and
+   * ordered the same either way.
+   */
+  async function runReceiptInterview(job, { speak, ask, confirm, capturePhoto }) {
+      openReceiptDialog(job.id);
+      // The receipt sheet is modal and was opened after the panel, so without
+      // this the panel sits under it and none of its buttons can be tapped.
+      window.GMMVoice.raise();
       const anyReceipts = await ask({
         name: "hasReceipts",
         label: "the receipt answer",
@@ -3129,18 +3160,17 @@
       });
       if (anyReceipts !== true) {
         await speak("No receipts then.");
-        return false;
+        closeReceiptDialog();
+        return 0;
       }
 
       let filed = 0;
       while (true) {
         await speak("Go ahead and add the receipt in.");
-        const before = captureGeneration;
-        await tapAction(
-          "Take receipt photo",
-          () => $("receiptFile").click(),
-          () => captureGeneration !== before && Boolean(pendingCapture)
-        );
+        await capturePhoto("Take receipt photo", async (files) => {
+          await ingestReceiptFiles(files, { autoStage: false });
+          if (!pendingCapture) throw new Error("That photo did not save. Try another.");
+        });
 
         let vendor = "";
         let parts = "";
@@ -3195,15 +3225,26 @@
       if (filed) {
         await speak(`Filing ${filed} receipt${filed === 1 ? "" : "s"}.`);
         $("fileAllReceiptsButton").click();
+        await waitForReceiptsFiled();
       }
+      closeReceiptDialog();
       return filed;
-    });
+  }
+
+  async function voiceReceipts(job) {
+    if (voiceUnavailable()) return;
+    await window.GMMVoice.run((helpers) => runReceiptInterview(job, helpers));
+    await renderJob();
   }
 
   async function voiceFinishJob(job) {
     if (voiceUnavailable()) return;
 
-    await window.GMMVoice.run(async ({ speak, ask, confirm }) => {
+    await window.GMMVoice.run(async (helpers) => {
+      const { speak, ask, confirm } = helpers;
+      // Receipts first — they roll into the parts total the invoice reads back.
+      await runReceiptInterview(job, helpers);
+
       const recommendations = await ask({
         name: "suggestions",
         label: "the recommendations",

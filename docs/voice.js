@@ -601,10 +601,15 @@
 
   function buildOverlay() {
     if (overlay) return overlay;
-    overlay = document.createElement("div");
-    overlay.className = "voice-overlay hidden";
+    // A <dialog> rather than a plain div: the job and receipt sheets are opened
+    // with showModal(), which puts them in the browser's top layer where no
+    // z-index can reach them. An overlay that is not itself a modal ends up
+    // underneath, and every button on it — Stop, Type instead, Take receipt
+    // photo — becomes unclickable.
+    overlay = document.createElement("dialog");
+    overlay.className = "voice-overlay";
     overlay.innerHTML = `
-      <div class="voice-panel" role="dialog" aria-modal="true" aria-label="Voice assistant">
+      <div class="voice-panel" aria-label="Voice assistant">
         <div class="voice-status">
           <span class="voice-orb" id="voiceOrb" aria-hidden="true"></span>
           <span class="voice-state" id="voiceStateLabel">Starting</span>
@@ -615,18 +620,30 @@
           <input id="voiceTypedInput" placeholder="Type the answer" autocomplete="off">
           <button class="button button-gold" id="voiceTypedSubmit" type="button">Use this</button>
         </div>
-        <button class="button button-gold voice-tap hidden" id="voiceTapButton" type="button"></button>
+        <div class="voice-tap-holder hidden" id="voiceTapHolder"></div>
         <div class="voice-actions">
           <button class="text-button" id="voiceTypeButton" type="button">Type instead</button>
           <button class="button button-red" id="voiceStopButton" type="button">Stop voice</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
+    // Esc must end the interview rather than just hide the panel, or the flow
+    // would keep asking questions with nothing on screen.
+    overlay.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      stopVoice();
+    });
     overlay.querySelector("#voiceStopButton").addEventListener("click", () => stopVoice());
     overlay.querySelector("#voiceTypeButton").addEventListener("click", () => {
       const row = overlay.querySelector("#voiceTypedRow");
       row.classList.toggle("hidden");
       if (!row.classList.contains("hidden")) overlay.querySelector("#voiceTypedInput").focus();
+    });
+    overlay.querySelector("#voiceTypedSubmit").addEventListener("click", submitTypedAnswer);
+    overlay.querySelector("#voiceTypedInput").addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      submitTypedAnswer();
     });
     return overlay;
   }
@@ -657,81 +674,99 @@
 
   function showOverlay() {
     buildOverlay();
-    overlay.classList.remove("hidden");
+    if (!overlay.open) overlay.showModal();
     setOverlay({ state: "idle", question: "", heard: "" });
+  }
+
+  /**
+   * Re-asserts the overlay as the topmost modal. The top layer is ordered by
+   * when each dialog was shown, so any sheet opened mid-interview (the receipt
+   * sheet) would otherwise cover the panel and swallow its taps.
+   */
+  function raiseOverlay() {
+    if (!overlay?.open) return;
+    overlay.close();
+    overlay.showModal();
   }
 
   function hideOverlay() {
     if (!overlay) return;
-    overlay.classList.add("hidden");
+    pendingTypedResolver = null;
+    if (overlay.open) overlay.close();
     overlay.querySelector("#voiceTypedRow").classList.add("hidden");
     overlay.querySelector("#voiceTypedInput").value = "";
   }
 
-  /** Lets a typed answer satisfy the same await that voice would have. */
+  /**
+   * Lets a typed answer satisfy the same await that voice would have.
+   *
+   * Only ever one resolver is live. Binding a fresh pair of listeners per
+   * question instead would leave the losers of each `Promise.race` attached,
+   * and the first stale handler to fire would clear the input before the real
+   * one read it — which silently broke typing after the first question.
+   */
+  let pendingTypedResolver = null;
+
   function typedAnswer() {
     return new Promise((resolve) => {
-      const input = overlay.querySelector("#voiceTypedInput");
-      const submit = overlay.querySelector("#voiceTypedSubmit");
-      const handler = () => {
-        const value = input.value.trim();
-        if (!value) return;
-        input.value = "";
-        submit.removeEventListener("click", handler);
-        input.removeEventListener("keydown", keyHandler);
-        resolve(value);
-      };
-      const keyHandler = (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          handler();
-        }
-      };
-      submit.addEventListener("click", handler);
-      input.addEventListener("keydown", keyHandler);
+      pendingTypedResolver = resolve;
     });
   }
 
+  function submitTypedAnswer() {
+    const input = overlay?.querySelector("#voiceTypedInput");
+    const value = input?.value.trim();
+    if (!value || !pendingTypedResolver) return;
+    input.value = "";
+    const resolve = pendingTypedResolver;
+    pendingTypedResolver = null;
+    resolve(value);
+  }
+
   /**
-   * Shows one big button and runs `onTap` synchronously inside the click, so
-   * anything needing user activation — opening the camera above all — still
-   * counts as gesture-initiated. Resolves once `settle` says the work landed.
+   * Shows a camera button inside the panel and resolves once `onFiles` has
+   * accepted a photo.
+   *
+   * The picker is a label-wrapped file input rather than a button that calls
+   * .click() on an input elsewhere in the page: the sheet holding that other
+   * input is inert while this panel is the topmost modal, and a camera needs
+   * genuine user activation. Here the mechanic's tap *is* the activation.
    */
-  function tapAction(label, onTap, settle) {
+  function capturePhoto(labelText, onFiles) {
     buildOverlay();
-    const button = overlay.querySelector("#voiceTapButton");
-    button.textContent = label;
-    button.classList.remove("hidden");
+    const holder = overlay.querySelector("#voiceTapHolder");
+    holder.innerHTML = `
+      <label class="button button-gold voice-tap">
+        <span>${escapeHtml(labelText)}</span>
+        <input type="file" accept="image/*" capture="environment">
+      </label>`;
+    holder.classList.remove("hidden");
     setOverlay({ state: "idle" });
 
     return new Promise((resolve, reject) => {
-      let done = false;
+      const input = holder.querySelector("input");
       const cleanup = () => {
-        button.classList.add("hidden");
-        button.removeEventListener("click", handler);
         clearInterval(poll);
-      };
-      const handler = () => {
-        try {
-          onTap();
-        } catch {
-          /* A failed trigger just leaves the button up for another try. */
-        }
+        holder.classList.add("hidden");
+        holder.innerHTML = "";
       };
       const poll = setInterval(() => {
-        if (cancelled) {
-          done = true;
-          cleanup();
-          reject(new VoiceCancelled("Voice stopped."));
-          return;
-        }
-        if (!done && settle()) {
-          done = true;
+        if (!cancelled) return;
+        cleanup();
+        reject(new VoiceCancelled("Voice stopped."));
+      }, 200);
+      input.addEventListener("change", async () => {
+        if (!input.files?.length) return;
+        try {
+          await onFiles(input.files);
           cleanup();
           resolve(true);
+        } catch (error) {
+          // Leave the button up so another photo can be taken.
+          input.value = "";
+          setOverlay({ heard: error instanceof Error ? error.message : "That photo did not save." });
         }
-      }, 200);
-      button.addEventListener("click", handler);
+      });
     });
   }
 
@@ -852,7 +887,7 @@
     unlockAudio();
     showOverlay();
     try {
-      const result = await flow({ speak, ask, confirm, runSection, listen, tapAction });
+      const result = await flow({ speak, ask, confirm, runSection, listen, capturePhoto });
       await speak(flow.farewell || "All set.");
       return { ok: true, result };
     } catch (error) {
@@ -876,6 +911,8 @@
     run,
     /** Call synchronously inside the opening tap; `run` may be several awaits later. */
     prime: unlockAudio,
+    /** Call after opening any modal sheet mid-interview so the panel stays tappable. */
+    raise: raiseOverlay,
     stop: stopVoice,
     speak,
     isRunning: () => running,

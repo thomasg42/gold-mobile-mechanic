@@ -1627,10 +1627,17 @@ button {
   align-items: center;
 }
 
+/* A <dialog> so it lives in the top layer above the job and receipt sheets. */
 .voice-overlay {
   position: fixed;
   inset: 0;
   z-index: 90;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border: 0;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -1639,8 +1646,13 @@ button {
   backdrop-filter: blur(6px);
 }
 
-.voice-overlay.hidden {
+/* Closed dialogs need this back: the display:flex above beats the UA default. */
+.voice-overlay:not([open]) {
   display: none;
+}
+
+.voice-overlay::backdrop {
+  background: rgba(16, 18, 20, 0.55);
 }
 
 .voice-panel {
@@ -1710,11 +1722,28 @@ button {
   font-size: 1.05rem;
 }
 
+.voice-tap-holder.hidden {
+  display: none;
+}
+
 .voice-tap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 100%;
   margin-top: 16px;
   padding-block: 18px;
   font-size: 1.05rem;
+  cursor: pointer;
+}
+
+/* The label is the tap target; the input only needs to be reachable by it. */
+.voice-tap input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .voice-typed {

@@ -36,9 +36,14 @@
           <h1>Field work,<br><em>logged right.</em></h1>
           <p>Clock the job. Capture the proof. Close it with a clean invoice.</p>
         </div>
-        <button class="button button-gold" id="newJobButton" type="button">
-          New job
-        </button>
+        <div class="board-cta">
+          <button class="button button-voice" id="voiceNewJobButton" type="button">
+            <span aria-hidden="true">🎙</span> New job by voice
+          </button>
+          <button class="button button-gold" id="newJobButton" type="button">
+            New job
+          </button>
+        </div>
       </div>
 
       <div class="phone-note">
@@ -205,6 +210,7 @@
 
   <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
 
+  <script src="./voice.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

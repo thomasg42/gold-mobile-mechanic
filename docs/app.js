@@ -38,6 +38,9 @@
   let syncInFlight = null;
   let ocrWorkerPromise = null;
   let pendingScan = { vendor: "", amount: 0, orderId: "", receiptParts: "" };
+  // Bumped every time a fresh photo finishes staging, so a voice interview can
+  // tell "a new receipt just arrived" from "the old one is still sitting there".
+  let captureGeneration = 0;
 
   function arrayFromStorage(key) {
     try {
@@ -1365,7 +1368,10 @@
                 <h2>Receipt folder</h2>
                 <p>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} saved with this cloud job.</p>
               </div>
-              <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
+              <div class="card-cta">
+                <button class="button button-voice" id="voiceReceiptButton" type="button" ${locked ? "disabled" : ""}><span aria-hidden="true">🎙</span> Receipts by voice</button>
+                <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
+              </div>
             </div>
             <div class="receipt-list">${receipts}</div>
             ${locked ? `
@@ -1406,7 +1412,10 @@
           <h3>${job.status === "completed" || job.status === "invoiced" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
           <p>${job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Finish Project closes the timer and files the invoice so you can get paid. Clocking out or taking a break for the day doesn't affect it — come back whenever and hit Finish Project when the job is actually done."}</p>
         </div>
-        <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "on_break" ? "" : "disabled"}>Finish Project</button>
+        <div class="card-cta">
+          <button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "on_break" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
+          <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "on_break" ? "" : "disabled"}>Finish Project</button>
+        </div>
       </section>`;
 
     bindJobEvents(job);
@@ -1590,6 +1599,28 @@
       addReceiptButton.addEventListener("click", () => {
         flushJobAutosave();
         openReceiptDialog(job.id);
+      });
+    }
+
+    const voiceReceiptButton = $("voiceReceiptButton");
+    if (voiceReceiptButton) {
+      voiceReceiptButton.addEventListener("click", () => {
+        // Unlock audio inside the tap itself — iOS ignores a later attempt.
+        window.GMMVoice?.prime();
+        flushJobAutosave();
+        void voiceReceipts(job);
+      });
+    }
+
+    const voiceFinishButton = $("voiceFinishButton");
+    if (voiceFinishButton) {
+      voiceFinishButton.addEventListener("click", () => {
+        window.GMMVoice?.prime();
+        if ($("laborRateInput")) applyLaborFromForm(job);
+        if (job.receipts.length) readFolderReceiptInputs(job);
+        persistSuggestions();
+        persistMaterials();
+        void voiceFinishJob(job);
       });
     }
 
@@ -1898,7 +1929,7 @@
     if (emailInvoiceButton) emailInvoiceButton.addEventListener("click", () => prepareEmail(job));
   }
 
-  function timerAction(job, action) {
+  function timerAction(job, action, { skipConfirm = false } = {}) {
     const now = new Date().toISOString();
     const openEntry = job.timeEntries.find((entry) => !entry.endedAt);
 
@@ -1918,7 +1949,8 @@
       job.status = "in_progress";
       notify("Break ended. Billable time resumed.");
     } else if (action === "clock_out" && (job.status === "in_progress" || job.status === "on_break")) {
-      if (!window.confirm("Finish this project, close the timer, and file the invoice for payment?")) return;
+      // Voice already read the job back and heard an explicit yes.
+      if (!skipConfirm && !window.confirm("Finish this project, close the timer, and file the invoice for payment?")) return;
       if (openEntry) openEntry.endedAt = now;
       job.status = "completed";
       job.endedAt = now;
@@ -2524,6 +2556,7 @@
       if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
       receiptPreviewUrl = URL.createObjectURL(blob);
       pendingCapture = { blob, filename: file.name || `receipt-${Date.now()}.jpg` };
+      captureGeneration += 1;
       $("receiptPreview").innerHTML = `<img src="${escapeHtml(receiptPreviewUrl)}" alt="Receipt preview">`;
       $("receiptPreview").classList.remove("hidden");
       scanReceipt(blob);
@@ -2907,8 +2940,317 @@
     }
   }
 
+  // ---------------------------------------------------------- voice interviews
+  // Each interview writes into the same inputs a thumb would, so an interrupted
+  // run leaves a normal half-filled form instead of a dead end.
+
+  const KNOWN_VENDORS = [
+    "AutoZone", "O'Reilly", "NAPA", "Advance Auto Parts", "Napa Auto Parts",
+    "RockAuto", "Amazon", "Walmart", "Home Depot", "Lowe's", "Harbor Freight",
+    "Costco", "Sam's Club", "Carquest", "Pep Boys", "Dealer", "Summit Racing",
+    "Tractor Supply", "Fastenal", "Grainger", "Ace Hardware"
+  ];
+
+  function setField(form, name, value) {
+    const input = form.querySelector(`[name="${name}"]`);
+    if (!input) return;
+    input.value = value ?? "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  /** "autozone spark plugs" -> { vendor: "AutoZone", parts: "spark plugs" } */
+  function splitVendorAndParts(text) {
+    const raw = String(text || "").trim().replace(/^(it'?s\s+|from\s+|this is\s+)+/i, "");
+    if (!raw) return { vendor: "", parts: "" };
+
+    const normalize = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const candidates = [...KNOWN_VENDORS, ...knownVendorSpellings(findJob(receiptJobId))];
+    // Longest name first so "Advance Auto Parts" wins over a bare "Advance".
+    for (const vendor of candidates.sort((a, b) => b.length - a.length)) {
+      const key = normalize(vendor);
+      if (!key) continue;
+      const flattened = normalize(raw);
+      if (!flattened.startsWith(key)) continue;
+      // Walk the raw string to find where the vendor name actually ends.
+      let seen = "";
+      let index = 0;
+      while (index < raw.length && normalize(seen) !== key) {
+        seen += raw[index];
+        index += 1;
+      }
+      const rest = raw
+        .slice(index)
+        .replace(/^\s*(and|for|,|-)\s*/i, "")
+        .trim();
+      return { vendor: canonicalizeVendor(vendor), parts: rest };
+    }
+
+    // No known vendor matched — treat the first word as the shop name and let
+    // the read-back catch it if that guess was wrong.
+    const parts = raw.split(/\s+/);
+    if (parts.length === 1) return { vendor: canonicalizeVendor(raw), parts: "" };
+    return {
+      vendor: canonicalizeVendor(parts[0]),
+      parts: parts.slice(1).join(" ").replace(/^(and|for)\s+/i, "").trim()
+    };
+  }
+
+  function voiceUnavailable() {
+    if (window.GMMVoice?.supported()) return false;
+    notify("This browser can't do voice. Fill the job in by hand.", true);
+    return true;
+  }
+
+  async function voiceNewJob() {
+    if (voiceUnavailable()) return;
+    if (!(await ensureCloudSync())) return;
+    openJobDialog();
+
+    const outcome = await window.GMMVoice.run(async ({ speak, ask, runSection }) => {
+      await speak("Let's open a new job. I'll ask, you talk, and I'll read it back after each part.");
+
+      await runSection({
+        summary: (captured) =>
+          `I have the customer as ${captured.customerName}${captured.customerEmail ? `, email ${captured.customerEmail}` : ", no email"}.`,
+        steps: [
+          {
+            name: "customerName",
+            label: "the customer name",
+            prompt: "Who are we working for today?",
+            parse: window.GMMVoice.parse.name,
+            apply: (value) => setField(jobForm, "customerName", value)
+          },
+          {
+            name: "customerEmail",
+            label: "the email",
+            optional: true,
+            prompt: "What's their email? Say skip if you don't have it.",
+            parse: window.GMMVoice.parse.email,
+            apply: (value) => setField(jobForm, "customerEmail", value || "")
+          }
+        ]
+      });
+
+      await runSection({
+        summary: (captured) => {
+          const vehicle = [captured.vehicle?.year, captured.vehicle?.make, captured.vehicle?.model]
+            .filter(Boolean)
+            .join(" ");
+          return `That's a ${vehicle}${captured.vehiclePlate ? `, plate ${captured.vehiclePlate.split("").join(" ")}` : ", no plate"}.`;
+        },
+        steps: [
+          {
+            name: "vehicle",
+            label: "the vehicle",
+            prompt: "What car are we working on? Give me the year, make, and model.",
+            parse: window.GMMVoice.parse.vehicle,
+            apply: (value) => {
+              setField(jobForm, "vehicleYear", value?.year || "");
+              setField(jobForm, "vehicleMake", value?.make || "");
+              setField(jobForm, "vehicleModel", value?.model || "");
+            }
+          },
+          {
+            name: "vehiclePlate",
+            label: "the plate",
+            optional: true,
+            prompt: "What's the plate? Say skip if you don't have it.",
+            parse: window.GMMVoice.parse.plate,
+            apply: (value) => setField(jobForm, "vehiclePlate", value || "")
+          }
+        ]
+      });
+
+      await runSection({
+        summary: (captured) =>
+          `The work is: ${captured.agreedWork}. Labor is ${money(captured.laborRateCents)} an hour.`,
+        steps: [
+          {
+            name: "agreedWork",
+            label: "the work",
+            prompt: "What are we working on today?",
+            parse: window.GMMVoice.parse.sentence,
+            apply: (value) => setField(jobForm, "agreedWork", value)
+          },
+          {
+            name: "laborRateCents",
+            label: "the labor rate",
+            prompt: "What's the labor rate per hour?",
+            parse: (heard) => window.GMMVoice.parse.money(heard, "rate"),
+            apply: (value) => setField(jobForm, "laborRate", ((value || 0) / 100).toFixed(2))
+          }
+        ]
+      });
+
+      await runSection({
+        summary: (captured) =>
+          captured.materials?.length
+            ? `Approved parts: ${captured.materials.join(", ")}.`
+            : "No approved parts yet.",
+        steps: [
+          {
+            name: "materials",
+            label: "the parts",
+            optional: true,
+            prompt: "What parts are approved for this job? Say skip if there aren't any yet.",
+            parse: window.GMMVoice.parse.list,
+            apply: (value) => {
+              materialRows.innerHTML = "";
+              (value || []).forEach((description) => addMaterialRow({ description }));
+              if (!value?.length) addMaterialRow();
+            }
+          }
+        ]
+      });
+
+      await speak("Creating the job now.");
+      return true;
+    });
+
+    if (!outcome.ok) {
+      if (outcome.reason === "error") notify(outcome.message, true);
+      notify("Voice stopped — the form is filled in as far as we got.", outcome.reason === "error");
+      return;
+    }
+    // Submit through the normal path so every existing validation still runs.
+    jobForm.requestSubmit();
+  }
+
+  async function voiceReceipts(job) {
+    if (voiceUnavailable()) return;
+    openReceiptDialog(job.id);
+
+    await window.GMMVoice.run(async ({ speak, ask, confirm, tapAction }) => {
+      const anyReceipts = await ask({
+        name: "hasReceipts",
+        label: "the receipt answer",
+        prompt: "Do we have any receipts?",
+        parse: window.GMMVoice.parse.yesNo
+      });
+      if (anyReceipts !== true) {
+        await speak("No receipts then.");
+        return false;
+      }
+
+      let filed = 0;
+      while (true) {
+        await speak("Go ahead and add the receipt in.");
+        const before = captureGeneration;
+        await tapAction(
+          "Take receipt photo",
+          () => $("receiptFile").click(),
+          () => captureGeneration !== before && Boolean(pendingCapture)
+        );
+
+        let vendor = "";
+        let parts = "";
+        for (let attempt = 0; attempt < 3 && !vendor; attempt += 1) {
+          const heard = await ask({
+            name: "receiptFor",
+            label: "the receipt details",
+            prompt: attempt === 0 ? "What is this receipt for?" : "Who was that from, and what did you get?"
+          });
+          const split = splitVendorAndParts(heard);
+          vendor = split.vendor;
+          parts = split.parts;
+        }
+        if (!parts) {
+          parts = await ask({
+            name: "receiptParts",
+            label: "the parts",
+            prompt: `What did you get from ${vendor}?`,
+            parse: window.GMMVoice.parse.sentence
+          });
+        }
+
+        const amountCents = await ask({
+          name: "amount",
+          label: "the receipt amount",
+          prompt: () => `Okay — ${vendor}, ${parts}. How much did that cost?`,
+          parse: (heard) => window.GMMVoice.parse.money(heard, "amount")
+        });
+
+        setField(receiptForm, "vendor", vendor);
+        setField(receiptForm, "receiptParts", parts);
+        setField(receiptForm, "amount", (amountCents / 100).toFixed(2));
+
+        const correct = await confirm(`${vendor}, ${parts}, ${money(amountCents)}.`);
+        if (!correct) {
+          await speak("Let's redo that receipt.");
+          continue;
+        }
+
+        receiptForm.requestSubmit();
+        filed += 1;
+
+        const more = await ask({
+          name: "more",
+          label: "the next answer",
+          prompt: "Got it. Any more receipts?",
+          parse: window.GMMVoice.parse.yesNo
+        });
+        if (more !== true) break;
+      }
+
+      if (filed) {
+        await speak(`Filing ${filed} receipt${filed === 1 ? "" : "s"}.`);
+        $("fileAllReceiptsButton").click();
+      }
+      return filed;
+    });
+  }
+
+  async function voiceFinishJob(job) {
+    if (voiceUnavailable()) return;
+
+    await window.GMMVoice.run(async ({ speak, ask, confirm }) => {
+      const recommendations = await ask({
+        name: "suggestions",
+        label: "the recommendations",
+        optional: true,
+        prompt: "Any recommendations for the customer? Say skip if there aren't any.",
+        parse: window.GMMVoice.parse.sentence
+      });
+      if (recommendations) {
+        const input = $("suggestionsInput");
+        if (input) {
+          input.value = recommendations;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        job.suggestions = recommendations;
+        job.updatedAt = new Date().toISOString();
+        queueJobSync(job);
+      }
+
+      const blocked = jobReadyForInvoice(job);
+      if (blocked) {
+        await speak(blocked);
+        return false;
+      }
+
+      const draft = invoiceDraft(job);
+      const okay = await confirm(
+        `Here's the invoice for ${vehicleName(job) || job.id}. Labor ${money(draft.laborCents)}, parts ${money(draft.materialsCents)}, total ${money(draft.totalCents)}.`
+      );
+      if (!okay) {
+        await speak("Leaving the job open so you can fix it.");
+        return false;
+      }
+
+      timerAction(job, "clock_out", { skipConfirm: true });
+      await speak("Invoice filed.");
+      return true;
+    });
+    await renderJob();
+  }
+
   $("homeButton").addEventListener("click", showBoard);
   $("newJobButton").addEventListener("click", openNewJob);
+  $("voiceNewJobButton").addEventListener("click", () => {
+    // Unlock audio inside the tap itself — iOS ignores a later attempt.
+    window.GMMVoice?.prime();
+    void voiceNewJob();
+  });
   $("syncButton").addEventListener("click", async () => {
     if (await ensureCloudSync()) {
       renderBoard();

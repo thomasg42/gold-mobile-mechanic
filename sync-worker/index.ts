@@ -1,5 +1,13 @@
 interface Env {
   DB: D1Database;
+  /**
+   * Set with `wrangler secret put ELEVENLABS_API_KEY --config wrangler.sync.jsonc`.
+   * When absent the voice routes return 503 and the phone falls back to the
+   * browser's own speech engine, so the app keeps working either way.
+   */
+  ELEVENLABS_API_KEY?: string;
+  /** Optional override for the spoken voice. Defaults to ELEVEN_DEFAULT_VOICE. */
+  ELEVENLABS_VOICE_ID?: string;
 }
 
 type StoredJobRow = {
@@ -14,6 +22,16 @@ type StoredReceiptRow = {
 const GITHUB_ORIGIN = "https://thomasg42.github.io";
 const MAX_RECEIPT_BYTES = 900_000;
 
+// Voice proxy limits. The ElevenLabs key is billable, so every route that
+// spends it is capped on size and on calls-per-minute per caller.
+const ELEVEN_DEFAULT_VOICE = "21m00Tcm4TlvDq8ikWAM";
+const ELEVEN_TTS_MODEL = "eleven_turbo_v2_5";
+const ELEVEN_STT_MODEL = "scribe_v1";
+const MAX_TTS_CHARS = 800;
+const MAX_STT_BYTES = 4_000_000;
+const VOICE_RATE_LIMIT = 60;
+const VOICE_RATE_WINDOW_SECONDS = 60;
+
 function allowedOrigin(request: Request): string | null {
   const origin = request.headers.get("Origin");
   if (!origin) return null;
@@ -25,7 +43,7 @@ function allowedOrigin(request: Request): string | null {
 function corsHeaders(request: Request): Headers {
   const headers = new Headers({
     "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   });
@@ -308,6 +326,114 @@ async function getReceipt(
   return new Response(base64ToBytes(row.data_base64), { headers });
 }
 
+/**
+ * Per-caller call ceiling for the billable voice routes. A single interview is
+ * roughly a dozen calls, so the limit only ever trips on a runaway loop or an
+ * outright abuse attempt — either of which would spend real ElevenLabs credit.
+ */
+async function withinVoiceRateLimit(request: Request, env: Env): Promise<boolean> {
+  const caller = request.headers.get("CF-Connecting-IP") || "unknown";
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const window = Math.floor(nowSeconds / VOICE_RATE_WINDOW_SECONDS);
+  const bucket = `${caller}|${window}`;
+  const expiresAt = (window + 1) * VOICE_RATE_WINDOW_SECONDS;
+  try {
+    const row = await env.DB.prepare(
+      `INSERT INTO voice_usage (bucket, count, expires_at) VALUES (?1, 1, ?2)
+       ON CONFLICT(bucket) DO UPDATE SET count = count + 1
+       RETURNING count`,
+    )
+      .bind(bucket, expiresAt)
+      .first<{ count: number }>();
+    // Opportunistic sweep so the table cannot grow without bound.
+    if ((row?.count ?? 0) === 1) {
+      await env.DB.prepare(`DELETE FROM voice_usage WHERE expires_at < ?1`)
+        .bind(nowSeconds)
+        .run();
+    }
+    return (row?.count ?? 0) <= VOICE_RATE_LIMIT;
+  } catch {
+    // A limiter outage must not take the feature down with it.
+    return true;
+  }
+}
+
+async function speakText(request: Request, env: Env): Promise<Response> {
+  if (!env.ELEVENLABS_API_KEY) {
+    return json(request, { error: "Voice is not configured." }, 503);
+  }
+  let text = "";
+  try {
+    const payload = (await request.json()) as { text?: unknown };
+    text = typeof payload?.text === "string" ? payload.text.trim() : "";
+  } catch {
+    return json(request, { error: "Send JSON with a text field." }, 400);
+  }
+  if (!text) return json(request, { error: "Nothing to say." }, 400);
+  if (text.length > MAX_TTS_CHARS) {
+    return json(request, { error: "That line is too long to speak." }, 413);
+  }
+  if (!(await withinVoiceRateLimit(request, env))) {
+    return json(request, { error: "Voice is busy. Try again in a moment." }, 429);
+  }
+
+  const voiceId = env.ELEVENLABS_VOICE_ID || ELEVEN_DEFAULT_VOICE;
+  const upstream = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_64`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": env.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({ text, model_id: ELEVEN_TTS_MODEL }),
+    },
+  );
+
+  if (!upstream.ok) {
+    // Never surface the upstream body — it can echo account detail.
+    return json(request, { error: "Voice service is unavailable." }, 502);
+  }
+
+  const headers = corsHeaders(request);
+  headers.set("Content-Type", "audio/mpeg");
+  headers.set("Cache-Control", "no-store");
+  return new Response(upstream.body, { status: 200, headers });
+}
+
+async function transcribeAudio(request: Request, env: Env): Promise<Response> {
+  if (!env.ELEVENLABS_API_KEY) {
+    return json(request, { error: "Voice is not configured." }, 503);
+  }
+  const audio = await request.arrayBuffer();
+  if (!audio.byteLength) return json(request, { error: "No audio received." }, 400);
+  if (audio.byteLength > MAX_STT_BYTES) {
+    return json(request, { error: "That clip is too long." }, 413);
+  }
+  if (!(await withinVoiceRateLimit(request, env))) {
+    return json(request, { error: "Voice is busy. Try again in a moment." }, 429);
+  }
+
+  const mimeType = request.headers.get("Content-Type") || "audio/webm";
+  const form = new FormData();
+  form.append("file", new Blob([audio], { type: mimeType }), "speech");
+  form.append("model_id", ELEVEN_STT_MODEL);
+
+  const upstream = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    method: "POST",
+    headers: { "xi-api-key": env.ELEVENLABS_API_KEY },
+    body: form,
+  });
+
+  if (!upstream.ok) {
+    return json(request, { error: "Voice service is unavailable." }, 502);
+  }
+
+  const result = (await upstream.json()) as { text?: unknown };
+  return json(request, { text: typeof result?.text === "string" ? result.text : "" });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -320,7 +446,26 @@ export default {
     }
 
     if (url.pathname === "/api/health" && request.method === "GET") {
-      return json(request, { ok: true, service: "gold-mobile-mechanic-sync" });
+      return json(request, {
+        ok: true,
+        service: "gold-mobile-mechanic-sync",
+        voice: Boolean(env.ELEVENLABS_API_KEY),
+      });
+    }
+
+    // The voice routes spend real ElevenLabs credit, so unlike the sync routes
+    // they refuse anything that is not the app's own origin.
+    if (url.pathname.startsWith("/api/voice/")) {
+      if (!allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      if (url.pathname === "/api/voice/tts" && request.method === "POST") {
+        return speakText(request, env);
+      }
+      if (url.pathname === "/api/voice/stt" && request.method === "POST") {
+        return transcribeAudio(request, env);
+      }
+      return json(request, { error: "Not found." }, 404);
     }
 
     if (url.pathname === "/api/jobs" && request.method === "GET") {

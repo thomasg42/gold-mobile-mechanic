@@ -476,8 +476,16 @@
     return null;
   }
 
+  /**
+   * A bare "no" on its own is a refusal, not an answer — "Do we need any
+   * materials?" / "no" must leave the list empty rather than record a part
+   * called "no". Matched whole-string only, so "no issues found" is still a
+   * real answer.
+   */
+  const BARE_NO = /^\s*(no|nope|nah|none|negative|no thanks|not really|nothing)\s*[.!]?\s*$/i;
+
   function isSkip(text) {
-    return SKIP.test(String(text || ""));
+    return SKIP.test(String(text || "")) || BARE_NO.test(String(text || ""));
   }
 
   const VEHICLE_MAKES = [
@@ -574,6 +582,9 @@
   /** Splits "spark plugs, oil filter and a serpentine belt" into three items. */
   function parseList(text) {
     return String(text || "")
+      // "yeah, spark plugs and a belt" — the lead-in is an answer to the
+      // question, not the first item on the list.
+      .replace(/^\s*(yes|yeah|yep|yup|sure|ok|okay)\b[\s,.-]*/i, "")
       .split(/,|\band\b|\bplus\b|\balso\b/i)
       .map((part) => part.replace(/^\s*(a|an|the|some)\s+/i, "").trim())
       .map((part) => part.replace(/[.]+$/, "").trim())

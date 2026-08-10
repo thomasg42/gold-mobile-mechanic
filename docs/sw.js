@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v20-voice-config";
+const CACHE = "gold-mobile-mechanic-v21-thomas-wording";
 const APP_SHELL = [
   "./",
   "./index.html",

@@ -1,13 +1,11 @@
 /**
- * What the voice assistant asks, for this business.
+ * What the voice assistant asks on a Gold Mobile Mechanic job.
  *
- * This file is data, not logic. Everything trade-specific about the interviews
- * — the questions, their order, which form field each answer lands in, and the
- * exact read-back wording — lives here. The engine in voice.js and the runner
- * in app.js are business-agnostic and are not edited per client.
+ * This file is data, not logic: the questions, their order, which form field
+ * each answer lands in, and the exact read-back wording. Rewording what Ken
+ * asks is an edit here, never a change to voice.js or the runner in app.js.
  *
- * Adding another trade means writing another one of these, not another flow.
- * See voice-config.EXAMPLE.js for a non-automotive one.
+ * The wording below is Thomas's own, dictated 2026-08-09. Keep it his.
  *
  * It ships as a script rather than JSON so it caches with the offline app shell
  * and needs no fetch on a driveway with one bar of signal.
@@ -50,7 +48,7 @@ window.VoiceConfig = {
           {
             name: "customerName",
             label: "the customer name",
-            prompt: "Who are we working for today?",
+            prompt: "Who are we helping today?",
             parse: "name",
             field: "customerName"
           },
@@ -76,7 +74,7 @@ window.VoiceConfig = {
           {
             name: "vehicle",
             label: "the vehicle",
-            prompt: "What car are we working on? Give me the year, make, and model.",
+            prompt: "Whose car are we working on today? Year, make, and model.",
             parse: "vehicle",
             apply: "vehicle"
           },
@@ -100,14 +98,14 @@ window.VoiceConfig = {
           {
             name: "agreedWork",
             label: "the work",
-            prompt: "What are we working on today?",
+            prompt: "What things are we going to get done on it?",
             parse: "sentence",
             field: "agreedWork"
           },
           {
             name: "laborRateCents",
             label: "the labor rate",
-            prompt: "What's the labor rate per hour?",
+            prompt: "What's the rate that we're charging?",
             parse: "money:rate",
             apply: "laborRate"
           }
@@ -129,7 +127,7 @@ window.VoiceConfig = {
             name: "materials",
             label: "the parts",
             optional: true,
-            prompt: "What parts are approved for this job? Say skip if there aren't any yet.",
+            prompt: "Do we need any materials?",
             parse: "list",
             apply: "materials"
           }

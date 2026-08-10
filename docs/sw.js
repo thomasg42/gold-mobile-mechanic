@@ -1,9 +1,10 @@
-const CACHE = "gold-mobile-mechanic-v19-voice";
+const CACHE = "gold-mobile-mechanic-v20-voice-config";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./voice-config.js",
   "./voice.js",
   "./icon-192.png",
   "./icon-512.png",

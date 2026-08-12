@@ -67,3 +67,18 @@ test("Pages assets are project-relative and name GitHub Pages as the public home
   assert.match(files[0], /thomasg42\.github\.io\/gold-mobile-mechanic/);
   assert.doesNotMatch(files.join("\n"), /chatgpt\.site/);
 });
+
+test("Worker owns the public one-car-per-day booking board", async () => {
+  const worker = await read("sync-worker/index.ts");
+  const migration = await read("sync-worker/migrations/0003_website_booking_board.sql");
+
+  assert.match(worker, /\/api\/public\/availability/);
+  assert.match(worker, /\/api\/public\/bookings/);
+  assert.match(worker, /const BOOKING_DAYS = new Set\(\[0, 1, 2, 3\]\)/);
+  assert.match(worker, /INSERT INTO website_bookings/);
+  assert.match(worker, /env\.DB\.batch/);
+  assert.match(worker, /reason: "day_taken"/);
+  assert.match(worker, /source: "gold-mobile-mechanic-site"/);
+  assert.match(migration, /day TEXT PRIMARY KEY/);
+  assert.match(migration, /job_id TEXT NOT NULL UNIQUE/);
+});

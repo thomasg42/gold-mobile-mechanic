@@ -19,8 +19,16 @@ type StoredReceiptRow = {
   mime_type: string;
 };
 
+type WebsiteBookingRow = {
+  day: string;
+};
+
 const GITHUB_ORIGIN = "https://thomasg42.github.io";
 const MAX_RECEIPT_BYTES = 900_000;
+const BOOKING_ZONE = "America/Denver";
+const BOOKING_DAYS = new Set([0, 1, 2, 3]); // Sunday through Wednesday.
+const DEFAULT_BOOKING_WEEKS = 3;
+const MAX_BOOKING_WEEKS = 6;
 
 // Voice proxy limits. The ElevenLabs key is billable, so every route that
 // spends it is capped on size and on calls-per-minute per caller.
@@ -184,6 +192,203 @@ function receiptPath(
     : null;
 }
 
+function cleanText(value: unknown, max: number): string {
+  return String(value == null ? "" : value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+function todayInBookingZone(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOOKING_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function addIsoDays(iso: string, count: number): string {
+  const date = new Date(`${iso}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + count);
+  return date.toISOString().slice(0, 10);
+}
+
+function isoDayOfWeek(iso: string): number {
+  return new Date(`${iso}T12:00:00Z`).getUTCDay();
+}
+
+function bookingWindow(weeksValue: string | null): { start: string; end: string; days: string[] } {
+  const requestedWeeks = Number.parseInt(String(weeksValue || DEFAULT_BOOKING_WEEKS), 10);
+  const weeks = Math.min(MAX_BOOKING_WEEKS, Math.max(1, requestedWeeks || DEFAULT_BOOKING_WEEKS));
+  const today = todayInBookingZone();
+  const start = addIsoDays(today, 1);
+  const end = addIsoDays(today, (weeks * 7) - isoDayOfWeek(today) - 1);
+  const days: string[] = [];
+
+  for (let cursor = start, guard = 0; cursor <= end && guard < 50; cursor = addIsoDays(cursor, 1), guard += 1) {
+    if (BOOKING_DAYS.has(isoDayOfWeek(cursor))) days.push(cursor);
+  }
+  return { start, end, days };
+}
+
+async function websiteAvailability(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const window = bookingWindow(url.searchParams.get("weeks"));
+  const result = await env.DB.prepare(
+    `SELECT day FROM website_bookings
+     WHERE day >= ?1 AND day <= ?2
+     ORDER BY day ASC`,
+  )
+    .bind(window.start, window.end)
+    .all<WebsiteBookingRow>();
+  const taken = new Set((result.results || []).map((row) => row.day));
+  return json(request, {
+    ok: true,
+    open: window.days.filter((day) => !taken.has(day)),
+    taken: [...taken],
+    today: todayInBookingZone(),
+  });
+}
+
+async function withinWebsiteBookingLimit(request: Request, env: Env): Promise<boolean> {
+  const caller = request.headers.get("CF-Connecting-IP") || "unknown";
+  const hour = Math.floor(Date.now() / 3_600_000);
+  const bucket = `${caller}|${hour}`;
+  const expiresAt = (hour + 2) * 3_600;
+  const row = await env.DB.prepare(
+    `INSERT INTO website_booking_rate (bucket, count, expires_at) VALUES (?1, 1, ?2)
+     ON CONFLICT(bucket) DO UPDATE SET count = count + 1
+     RETURNING count`,
+  )
+    .bind(bucket, expiresAt)
+    .first<{ count: number }>();
+  if ((row?.count ?? 0) === 1) {
+    await env.DB.prepare("DELETE FROM website_booking_rate WHERE expires_at < ?1")
+      .bind(Math.floor(Date.now() / 1000))
+      .run();
+  }
+  return (row?.count ?? 0) <= 5;
+}
+
+async function bookWebsiteDay(request: Request, env: Env): Promise<Response> {
+  if (!(await withinWebsiteBookingLimit(request, env))) {
+    return json(request, { ok: false, reason: "rate_limited" }, 429);
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return json(request, { ok: false, reason: "invalid_json" }, 400);
+  }
+
+  const name = cleanText(body.name, 80);
+  const phone = cleanText(body.phone, 30);
+  const email = cleanText(body.email, 120);
+  const location = cleanText(body.location, 160);
+  const issue = cleanText(body.issue, 800);
+  const year = cleanText(body.year, 4);
+  const make = cleanText(body.make, 40);
+  const model = cleanText(body.model, 40);
+  const jobType = cleanText(body.jobType, 40) || "Not sure yet";
+  const requestedDay = cleanText(body.requestedDay, 10);
+  const window = bookingWindow(String(DEFAULT_BOOKING_WEEKS));
+  const errors: string[] = [];
+  if (!name) errors.push("name");
+  if (phone.replace(/\D/g, "").length < 10) errors.push("phone");
+  if (!issue) errors.push("issue");
+  if (!/^\d{4}$/.test(year)) errors.push("year");
+  if (!make) errors.push("make");
+  if (!model) errors.push("model");
+  if (!window.days.includes(requestedDay)) errors.push("requestedDay");
+  if (errors.length) return json(request, { ok: false, errors }, 400);
+
+  const now = new Date().toISOString();
+  const jobId = `WEB-${requestedDay.replace(/-/g, "")}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
+  const booking = {
+    source: "gold-mobile-mechanic-site",
+    name,
+    phone,
+    email,
+    location,
+    issue,
+    year,
+    make,
+    model,
+    vehicle: [year, make, model].filter(Boolean).join(" "),
+    jobType,
+    requestedDay,
+    submittedAt: now,
+  };
+  const job = {
+    id: jobId,
+    customerName: name,
+    customerEmail: email,
+    customerPhone: phone,
+    vehicleYear: year,
+    vehicleMake: make,
+    vehicleModel: model,
+    vehiclePlate: "",
+    requestedDay,
+    laborRateCents: 0,
+    agreedWork: [
+      `Website request for ${requestedDay}.`,
+      `Phone: ${phone}`,
+      `Location: ${location || "Not provided"}`,
+      `Service location: ${jobType}`,
+      "",
+      issue,
+      "",
+      "Confirm the day, scope, and labor rate with the customer before starting.",
+    ].join("\n"),
+    materials: [],
+    suggestions: "",
+    status: "draft",
+    receiptReview: false,
+    laborAmountCents: null,
+    laborAdjustmentCents: 0,
+    difficultyLevel: "Standard",
+    createdAt: now,
+    startedAt: null,
+    endedAt: null,
+    timeEntries: [],
+    eventHistory: [],
+    receipts: [],
+    invoice: null,
+    updatedAt: now,
+  };
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO website_bookings (day, job_id, data, created_at) VALUES (?1, ?2, ?3, ?4)",
+      ).bind(requestedDay, jobId, JSON.stringify(booking), now),
+      env.DB.prepare(
+        "INSERT INTO jobs (id, data, updated_at) VALUES (?1, ?2, ?3)",
+      ).bind(jobId, JSON.stringify(job), now),
+    ]);
+  } catch {
+    const availability = await env.DB.prepare(
+      "SELECT day FROM website_bookings WHERE day >= ?1 AND day <= ?2 ORDER BY day ASC",
+    )
+      .bind(window.start, window.end)
+      .all<WebsiteBookingRow>();
+    const taken = new Set((availability.results || []).map((row) => row.day));
+    if (taken.has(requestedDay)) {
+      return json(request, {
+        ok: false,
+        reason: "day_taken",
+        requestedDay,
+        open: window.days.filter((day) => !taken.has(day)),
+      }, 409);
+    }
+    return json(request, { ok: false, reason: "save_failed" }, 503);
+  }
+
+  return json(request, { ok: true, dayHeld: true, requestedDay, jobId }, 201);
+}
+
 async function listJobs(request: Request, env: Env): Promise<Response> {
   const result = await env.DB.prepare(
     "SELECT data FROM jobs ORDER BY updated_at DESC",
@@ -249,6 +454,7 @@ async function deleteJob(
 ): Promise<Response> {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM receipts WHERE job_id = ?").bind(jobId),
+    env.DB.prepare("DELETE FROM website_bookings WHERE job_id = ?").bind(jobId),
     env.DB.prepare("DELETE FROM jobs WHERE id = ?").bind(jobId),
   ]);
   return json(request, { deleted: true, jobId });
@@ -451,6 +657,14 @@ export default {
         service: "gold-mobile-mechanic-sync",
         voice: Boolean(env.ELEVENLABS_API_KEY),
       });
+    }
+
+    if (url.pathname === "/api/public/availability" && request.method === "GET") {
+      return websiteAvailability(request, env);
+    }
+    if (url.pathname === "/api/public/bookings" && request.method === "POST") {
+      if (!allowedOrigin(request)) return json(request, { error: "Forbidden." }, 403);
+      return bookWebsiteDay(request, env);
     }
 
     // The voice routes spend real ElevenLabs credit, so unlike the sync routes

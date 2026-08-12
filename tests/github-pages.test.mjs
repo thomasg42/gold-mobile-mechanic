@@ -79,6 +79,7 @@ test("Worker owns the public one-car-per-day booking board", async () => {
   assert.match(worker, /env\.DB\.batch/);
   assert.match(worker, /reason: "day_taken"/);
   assert.match(worker, /source: "gold-mobile-mechanic-site"/);
+  assert.match(worker, /request\.headers\.get\("Origin"\) && !allowedOrigin\(request\)/);
   assert.match(migration, /day TEXT PRIMARY KEY/);
   assert.match(migration, /job_id TEXT NOT NULL UNIQUE/);
 });

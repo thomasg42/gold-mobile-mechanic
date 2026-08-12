@@ -663,7 +663,11 @@ export default {
       return websiteAvailability(request, env);
     }
     if (url.pathname === "/api/public/bookings" && request.method === "POST") {
-      if (!allowedOrigin(request)) return json(request, { error: "Forbidden." }, 403);
+      // Browsers must be the GitHub Pages site or localhost; server tools such
+      // as ElevenLabs do not send an Origin header and are rate-limited below.
+      if (request.headers.get("Origin") && !allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
       return bookWebsiteDay(request, env);
     }
 

@@ -2,6 +2,7 @@
   "use strict";
 
   const STORAGE_KEY = "gold-mobile-mechanic-phone-v1";
+  const NEW_JOB_DRAFT_STORAGE = "gold-mobile-mechanic-new-job-draft-v1";
   const RECEIPT_DB = "gold-mobile-mechanic-receipts";
   const RECEIPT_STORE = "receipts";
   const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
@@ -1998,14 +1999,87 @@
       } else {
         row.remove();
       }
+      scheduleJobDraftAutosave();
     });
     materialRows.appendChild(row);
   }
 
+  function loadJobDraft() {
+    try {
+      return JSON.parse(localStorage.getItem(NEW_JOB_DRAFT_STORAGE) || "null");
+    } catch {
+      return null;
+    }
+  }
+
+  function clearJobDraft() {
+    try {
+      localStorage.removeItem(NEW_JOB_DRAFT_STORAGE);
+    } catch {
+      // Ignore storage errors clearing the draft.
+    }
+  }
+
+  function saveJobDraft() {
+    const data = new FormData(jobForm);
+    const materials = [...materialRows.querySelectorAll(".material-row")]
+      .map((row) => String(row.querySelector('[name="materialDescription"]')?.value || "").trim())
+      .filter(Boolean);
+    const draft = {
+      customerName: String(data.get("customerName") || ""),
+      customerEmail: String(data.get("customerEmail") || ""),
+      vehicleYear: String(data.get("vehicleYear") || ""),
+      vehicleMake: String(data.get("vehicleMake") || ""),
+      vehicleModel: String(data.get("vehicleModel") || ""),
+      vehiclePlate: String(data.get("vehiclePlate") || ""),
+      agreedWork: String(data.get("agreedWork") || ""),
+      laborRate: String(data.get("laborRate") || ""),
+      materials
+    };
+    const isEmpty = Object.values(draft).every((value) =>
+      Array.isArray(value) ? value.length === 0 : !value);
+    if (isEmpty) {
+      clearJobDraft();
+      return;
+    }
+    try {
+      localStorage.setItem(NEW_JOB_DRAFT_STORAGE, JSON.stringify(draft));
+      notifyAutoSaved();
+    } catch {
+      // Job list storage may be full; the explicit Create job save still works.
+    }
+  }
+
+  let jobDraftAutosaveTimer = null;
+  function scheduleJobDraftAutosave() {
+    clearTimeout(jobDraftAutosaveTimer);
+    jobDraftAutosaveTimer = setTimeout(saveJobDraft, 500);
+  }
+
+  function applyJobDraft(draft) {
+    setField(jobForm, "customerName", draft.customerName || "");
+    setField(jobForm, "customerEmail", draft.customerEmail || "");
+    setField(jobForm, "vehicleYear", draft.vehicleYear || "");
+    setField(jobForm, "vehicleMake", draft.vehicleMake || "");
+    setField(jobForm, "vehicleModel", draft.vehicleModel || "");
+    setField(jobForm, "vehiclePlate", draft.vehiclePlate || "");
+    setField(jobForm, "agreedWork", draft.agreedWork || "");
+    setField(jobForm, "laborRate", draft.laborRate || "");
+    materialRows.innerHTML = "";
+    const materials = Array.isArray(draft.materials) && draft.materials.length ? draft.materials : [""];
+    materials.forEach((description) => addMaterialRow({ description }));
+  }
+
   function openJobDialog() {
     jobForm.reset();
-    materialRows.innerHTML = "";
-    addMaterialRow();
+    const draft = loadJobDraft();
+    if (draft) {
+      applyJobDraft(draft);
+      notify("Restored your unsaved job draft.");
+    } else {
+      materialRows.innerHTML = "";
+      addMaterialRow();
+    }
     $("jobFormError").classList.add("hidden");
     jobDialog.showModal();
   }
@@ -2015,8 +2089,13 @@
   }
 
   function closeJobDialog() {
+    clearTimeout(jobDraftAutosaveTimer);
+    saveJobDraft();
     jobDialog.close();
   }
+
+  jobForm.addEventListener("input", scheduleJobDraftAutosave);
+  jobForm.addEventListener("change", scheduleJobDraftAutosave);
 
   jobForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -2067,7 +2146,9 @@
 
     state.jobs.push(job);
     queueJobSync(job);
-    closeJobDialog();
+    clearTimeout(jobDraftAutosaveTimer);
+    clearJobDraft();
+    jobDialog.close();
     notify(`${job.id} created.`);
     openJob(job.id);
   });

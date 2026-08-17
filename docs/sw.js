@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v21-thomas-wording";
+const CACHE = "gold-mobile-mechanic-v22-newjob-autosave";
 const APP_SHELL = [
   "./",
   "./index.html",

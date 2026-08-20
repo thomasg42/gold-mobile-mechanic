@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101214">
+  <meta name="robots" content="noindex">
+  <meta name="description" content="Gold Mobile Mechanic customers: sign in with your first name and phone number to see your past invoices.">
+  <title>Your invoices · Gold Mobile Mechanic</title>
+  <link rel="apple-touch-icon" href="./icon-192.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="portal-body">
+  <header class="topbar">
+    <a class="brand" href="./portal.html" aria-label="Gold Mobile Mechanic">
+      <span class="brand-mark" aria-hidden="true"><span>G</span></span>
+      <span>
+        <strong>Gold Mobile</strong>
+        <small>Customer invoices</small>
+      </span>
+    </a>
+  </header>
+
+  <main class="page">
+    <section id="portalSignIn">
+      <div class="board-heading">
+        <div>
+          <p class="eyebrow">Customer portal</p>
+          <h1>Your invoices,<br><em>any time.</em></h1>
+          <p>Sign in with the first name and phone number you gave us on the job.</p>
+        </div>
+      </div>
+
+      <form class="content-card portal-form" id="portalForm" novalidate>
+        <label class="field field-wide">
+          <span>First name</span>
+          <input name="firstName" autocomplete="given-name" autocapitalize="words" required>
+        </label>
+        <label class="field field-wide">
+          <span>Phone number</span>
+          <input name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="406 555 0147" required>
+        </label>
+        <p class="portal-error hidden" id="portalError" role="alert"></p>
+        <button class="button button-gold" id="portalSubmit" type="submit">See my invoices</button>
+      </form>
+    </section>
+
+    <section id="portalResults" class="hidden">
+      <div class="board-heading">
+        <div>
+          <p class="eyebrow">Signed in</p>
+          <h1 id="portalGreeting">Your invoices</h1>
+          <p id="portalCount"></p>
+        </div>
+        <div class="board-cta">
+          <button class="button button-quiet" id="portalSignOut" type="button">Sign out</button>
+        </div>
+      </div>
+      <div id="portalInvoices"></div>
+    </section>
+  </main>
+
+  <script src="./portal.js"></script>
+</body>
+</html>

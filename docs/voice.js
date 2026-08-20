@@ -591,12 +591,36 @@
       .filter((part) => part.length > 1);
   }
 
+  /**
+   * A person's name is whatever they say it is. Only the lead-in phrase and
+   * trailing punctuation come off — no title casing, no dictionary, no
+   * "helpful" respelling. "DeShawn", "McCrae" and "jo-Anne" all survive
+   * exactly as dictated, and the flow reads the spelling back for a yes.
+   */
   function cleanSpokenName(text) {
-    const raw = String(text || "")
+    return String(text || "")
       .replace(/^(it'?s|this is|the customer is|customer is|his name is|her name is|their name is|name is|for)\s+/i, "")
       .replace(/[.,]+$/, "")
+      .replace(/\s+/g, " ")
       .trim();
-    return titleCase(raw);
+  }
+
+  /** "four zero six five five five..." -> "4065550147" */
+  function parsePhone(text) {
+    const words = {
+      zero: "0", oh: "0", o: "0", one: "1", two: "2", to: "2", too: "2",
+      three: "3", four: "4", for: "4", five: "5", six: "6", seven: "7",
+      eight: "8", ate: "8", nine: "9"
+    };
+    const digits = String(text || "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((token) => (words[token] !== undefined ? words[token] : token))
+      .join("")
+      .replace(/\D/g, "");
+    const local = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+    if (local.length !== 10) return "";
+    return `${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
   }
 
   function cleanSentence(text) {
@@ -787,8 +811,8 @@
    * Asks one question until it produces a usable answer. Returns null only when
    * the step is optional and the mechanic skipped it.
    */
-  async function ask(step) {
-    const prompt = typeof step.prompt === "function" ? step.prompt() : step.prompt;
+  async function ask(step, context = {}) {
+    const prompt = typeof step.prompt === "function" ? step.prompt(context) : step.prompt;
     let attempts = 0;
 
     while (attempts < 4) {
@@ -808,7 +832,17 @@
         value === undefined ||
         value === "" ||
         (Array.isArray(value) && !value.length);
-      if (!empty) return value;
+      if (!empty) {
+        // A step that carries its own read-back — a name, where the exact
+        // spelling matters — is confirmed the moment it is captured rather
+        // than waiting for the section summary at the end.
+        if (step.confirmEach) {
+          if (await confirm(step.confirmEach(value))) return value;
+          await speak(step.retryAfterNo || "Let's try that again.");
+          continue;
+        }
+        return value;
+      }
       if (step.optional && attempts >= 2) return null;
     }
 
@@ -816,12 +850,17 @@
     throw new Error(`Could not capture ${step.label || "that answer"}. Finish it by hand.`);
   }
 
-  /** Reads a section back and returns true only on an explicit yes. */
+  /**
+   * Reads something back and returns true only on an explicit yes. A summary
+   * already phrased as a question is asked verbatim, so a step can use its own
+   * wording ("Is Jon, spelled J-O-N, correct?") instead of the generic tail.
+   */
   async function confirm(summary) {
+    const question = /\?\s*$/.test(String(summary || "")) ? String(summary) : `${summary} Is that correct?`;
     let attempts = 0;
     while (attempts < 3) {
       attempts += 1;
-      await speak(attempts === 1 ? `${summary} Is that correct?` : "Is that correct? Yes or no.");
+      await speak(attempts === 1 ? question : "Is that correct? Yes or no.");
       const heard = await Promise.race([listen(), typedAnswer()]);
       assertLive();
       const answer = parseYesNo(heard);
@@ -835,14 +874,19 @@
    * field as it lands, then reads the whole section back. A "no" re-asks the
    * section rather than guessing which field was wrong.
    */
-  async function runSection(section) {
+  async function runSection(section, context = {}) {
     for (let pass = 0; pass < 3; pass += 1) {
+      // Prompts read from everything captured so far, this section and every
+      // section before it, so a follow-up can name the customer instead of
+      // asking the same generic question again.
       const captured = {};
       for (const step of section.steps) {
-        if (step.when && !step.when(captured)) continue;
-        const value = await ask(step);
+        const seen = { ...context, ...captured };
+        if (step.when && !step.when(seen)) continue;
+        const value = await ask(step, seen);
         captured[step.name] = value;
         if (step.apply) step.apply(value, captured);
+        Object.assign(context, captured);
       }
       if (!section.summary) return captured;
       if (await confirm(section.summary(captured))) {
@@ -936,6 +980,7 @@
       vehicle: parseVehicle,
       email: parseEmail,
       plate: parsePlate,
+      phone: parsePhone,
       list: parseList,
       name: cleanSpokenName,
       sentence: cleanSentence,

@@ -27,9 +27,15 @@ test("GitHub phone app syncs durable jobs, receipts, and clock history", async (
   assert.match(script, /localStorage/);
   assert.match(script, /indexedDB/);
   assert.match(script, /clock_in/);
-  assert.match(script, /break_start/);
-  assert.match(script, /break_end/);
   assert.match(script, /clock_out/);
+  // Two clock states only. Breaks were removed: no code path may start one.
+  assert.doesNotMatch(script, /data-timer-action="break_/);
+  assert.doesNotMatch(script, /status = "on_break"/);
+  assert.doesNotMatch(script, /kind: "break"/);
+  // Every clock event is written and pushed on its own the moment it happens.
+  assert.match(script, /function logClockEvent/);
+  assert.match(script, /\/events`/);
+  assert.match(script, /PENDING_EVENTS_STORAGE/);
   assert.match(script, /receiptReview/);
   assert.match(script, /invoice-at-capture|Invoice at capture|upsertInvoice/);
   assert.match(script, /partsTotal|receiptTotal/);

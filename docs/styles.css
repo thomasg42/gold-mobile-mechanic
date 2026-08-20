@@ -520,7 +520,7 @@ button {
   background: var(--green);
 }
 
-.job-card[data-status="on_break"]::after {
+.job-card[data-status="clocked_out"]::after {
   background: var(--blue);
 }
 
@@ -565,7 +565,7 @@ button {
   color: #145638;
 }
 
-.status-pill.on_break {
+.status-pill.clocked_out {
   background: #dce8f2;
   color: #174d77;
 }
@@ -1787,4 +1787,61 @@ button {
     animation: none !important;
     transition: none;
   }
+}
+
+/* ---------------------------------------------------------- customer portal */
+/* The portal reuses the field-desk shell (topbar, content-card, button, field)
+   so it needs only the few pieces the mechanic's app has no equivalent for. */
+
+.portal-form {
+  display: grid;
+  gap: 16px;
+  max-width: 460px;
+}
+
+.portal-error {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: #f7dede;
+  color: #8a1c1c;
+  font-size: 0.95rem;
+}
+
+.portal-invoice + .portal-invoice {
+  margin-top: 20px;
+}
+
+.portal-work {
+  margin: 0 0 8px;
+}
+
+.portal-hours {
+  margin: 0 0 14px;
+  color: var(--muted, #6b7075);
+  font-size: 0.92rem;
+}
+
+.portal-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.portal-total {
+  border-top-width: 2px;
+  font-size: 1.1rem;
+}
+
+.portal-notes {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.portal-notes p {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
 }

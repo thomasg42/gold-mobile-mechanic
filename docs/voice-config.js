@@ -11,12 +11,18 @@
  * and needs no fetch on a driveway with one bar of signal.
  *
  * ---------------------------------------------------------------------------
- * STEP        { name, label, prompt, parse, field | apply, optional }
- *   parse     name | email | sentence | list | plate | yesNo | vehicle
+ * STEP        { name, label, prompt, parse, field | apply, optional, confirmEach }
+ *   parse     name | email | phone | sentence | list | plate | yesNo | vehicle
  *             | money:rate | money:amount
  *   field     form input to write the answer into
  *   apply     named writer for answers spanning several fields (see app.js)
  *   optional  "skip" is accepted and leaves it blank
+ *   prompt    may use {token} for anything already captured in this interview,
+ *             so a follow-up names the customer instead of re-asking blind
+ *   confirmEach  read this answer back on its own, right after it lands, and
+ *             re-ask on a no. Tokens: {value} and {spelled}. Use it wherever
+ *             the exact characters matter — a name is never auto-corrected, so
+ *             the confirmation is what catches a misheard spelling.
  *
  * SUMMARY     array of parts, spoken back before asking "Is that correct?"
  *   "literal text"
@@ -41,6 +47,7 @@ window.VoiceConfig = {
       {
         summary: [
           "I have the customer as ", { field: "customerName" },
+          { field: "customerPhone", prefix: ", phone ", fallback: ", no phone" },
           { field: "customerEmail", prefix: ", email ", fallback: ", no email" },
           "."
         ],
@@ -48,15 +55,28 @@ window.VoiceConfig = {
           {
             name: "customerName",
             label: "the customer name",
-            prompt: "Who are we helping today?",
+            prompt: "Whose car are we working on?",
             parse: "name",
-            field: "customerName"
+            field: "customerName",
+            // Spelled out as well as spoken: this is the one field the customer
+            // portal signs in on, and a silently "corrected" name locks them out.
+            confirmEach: "Is {value}, spelled {spelled}, correct?",
+            retryAfterNo: "No problem — say the name again."
+          },
+          {
+            name: "customerPhone",
+            label: "the phone number",
+            prompt: "What's {customerName}'s phone number?",
+            parse: "phone",
+            field: "customerPhone",
+            confirmEach: "Is {value} correct?",
+            retryAfterNo: "Let's get that number again."
           },
           {
             name: "customerEmail",
             label: "the email",
             optional: true,
-            prompt: "What's their email? Say skip if you don't have it.",
+            prompt: "What's {customerName}'s email? Say skip if you don't have it.",
             parse: "email",
             field: "customerEmail"
           }
@@ -74,7 +94,7 @@ window.VoiceConfig = {
           {
             name: "vehicle",
             label: "the vehicle",
-            prompt: "Whose car are we working on today? Year, make, and model.",
+            prompt: "What's the year, make, and model for {customerName}'s car?",
             parse: "vehicle",
             apply: "vehicle"
           },
@@ -82,7 +102,7 @@ window.VoiceConfig = {
             name: "vehiclePlate",
             label: "the plate",
             optional: true,
-            prompt: "What's the plate? Say skip if you don't have it.",
+            prompt: "What's the plate on {customerName}'s car? Say skip if you don't have it.",
             parse: "plate",
             field: "vehiclePlate"
           }
@@ -98,7 +118,7 @@ window.VoiceConfig = {
           {
             name: "agreedWork",
             label: "the work",
-            prompt: "What things are we going to get done on it?",
+            prompt: "What things are we going to get done on {customerName}'s car?",
             parse: "sentence",
             field: "agreedWork"
           },

@@ -40,6 +40,13 @@ const MAX_STT_BYTES = 4_000_000;
 const VOICE_RATE_LIMIT = 60;
 const VOICE_RATE_WINDOW_SECONDS = 60;
 
+// Customer portal sign-in is a first name plus a phone number and nothing else,
+// so the only thing standing between a guesser and someone's invoices is this
+// throttle. Keep it tight.
+const PORTAL_RATE_LIMIT = 10;
+const PORTAL_RATE_WINDOW_SECONDS = 300;
+const CLOCK_ACTIONS = new Set(["clock_in", "clock_out"]);
+
 function allowedOrigin(request: Request): string | null {
   const origin = request.headers.get("Origin");
   if (!origin) return null;
@@ -95,6 +102,31 @@ function jobPath(pathname: string): { jobId: string } | null {
   return match ? { jobId: decodeURIComponent(match[1]) } : null;
 }
 
+function jobEventsPath(pathname: string): { jobId: string } | null {
+  const match = /^\/api\/jobs\/([^/]+)\/events$/.exec(pathname);
+  return match ? { jobId: decodeURIComponent(match[1]) } : null;
+}
+
+/** Phone numbers are compared as bare digits so formatting never blocks a match. */
+function phoneDigits(value: unknown): string {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  // A US number dialed with the country code is the same number.
+  return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+}
+
+/**
+ * Sign-in matches on the first name only, case- and spacing-insensitively.
+ * The spelling captured by voice is preserved in the record itself — this is
+ * only the comparison key.
+ */
+function firstNameKey(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .split(/\s+/)[0]
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+}
+
 function mergeRecordsById(
   current: Array<Record<string, unknown>>,
   incoming: Array<Record<string, unknown>>,
@@ -121,39 +153,34 @@ function mergeJobs(
   incoming: Record<string, unknown>,
 ): Record<string, unknown> {
   if (!current) return incoming;
-  const latestEventTime = (job: Record<string, unknown>): number => {
-    if (!Array.isArray(job.eventHistory)) return Number.NaN;
-    return job.eventHistory.reduce((latest: number, event: Record<string, unknown>) => {
-      const occurredAt = Date.parse(String(event.occurredAt || 0));
-      return Number.isFinite(occurredAt) ? Math.max(latest, occurredAt) : latest;
-    }, Number.NEGATIVE_INFINITY);
-  };
-  const currentEventTime = latestEventTime(current);
-  const incomingEventTime = latestEventTime(incoming);
+  // Clock events are unioned below and are separately durable in job_events, so
+  // they play no part in picking a winner — a phone whose local history is thin
+  // (reinstalled app, cleared browser) must still be able to save a newer job.
   const currentTime = Date.parse(String(current.updatedAt || current.createdAt || 0));
   const incomingTime = Date.parse(String(incoming.updatedAt || incoming.createdAt || 0));
   const incomingIsNewer =
-    (Number.isFinite(incomingEventTime) &&
-      (!Number.isFinite(currentEventTime) || incomingEventTime > currentEventTime)) ||
-    (incomingEventTime === currentEventTime &&
-      (!Number.isFinite(currentTime) ||
-        (Number.isFinite(incomingTime) && incomingTime >= currentTime)));
+    !Number.isFinite(currentTime) ||
+    (Number.isFinite(incomingTime) && incomingTime >= currentTime);
   const base = incomingIsNewer ? incoming : current;
   const eventHistory = mergeRecordsById(
     Array.isArray(current.eventHistory) ? current.eventHistory as Array<Record<string, unknown>> : [],
     Array.isArray(incoming.eventHistory) ? incoming.eventHistory as Array<Record<string, unknown>> : [],
   ).sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)));
   const latestEvent = eventHistory.at(-1);
+  // Two clock states, and neither of them ends the job. Finishing is a
+  // deliberate act on the phone, so only the phone's own status can say a job
+  // is completed or invoiced — clocking out just stops billable time.
   const statusByAction: Record<string, string> = {
     clock_in: "in_progress",
-    break_start: "on_break",
+    clock_out: "clocked_out",
+    // A job last saved during the break era resumes simply off the clock.
+    break_start: "clocked_out",
     break_end: "in_progress",
-    clock_out: "completed",
   };
-  const resolvedStatus =
-    base.status === "invoiced"
-      ? "invoiced"
-      : statusByAction[String(latestEvent?.action || "")] || base.status;
+  const finished = base.status === "invoiced" || base.status === "completed";
+  const resolvedStatus = finished
+    ? String(base.status)
+    : statusByAction[String(latestEvent?.action || "")] || base.status;
 
   return {
     ...base,
@@ -162,6 +189,8 @@ function mergeJobs(
     endedAt:
       resolvedStatus === "completed" || resolvedStatus === "invoiced"
         ? base.endedAt || latestEvent?.occurredAt || null
+        // Clocking out stops billable time but does not end the job, so an
+        // unfinished job never carries an end date.
         : null,
     createdAt: current.createdAt || incoming.createdAt,
     materials: mergeRecordsById(
@@ -431,9 +460,23 @@ async function putJob(
     }
   }
 
+  // Clock events written one-at-a-time by /events are the authority on the
+  // ledger, and they are folded in BEFORE the merge: the merge reads the last
+  // event to decide whether the job is on the clock, so handing it a history
+  // that is missing an event already recorded would resolve a stale status.
+  job.eventHistory = mergeRecordsById(
+    await storedEvents(env, jobId),
+    Array.isArray(job.eventHistory) ? (job.eventHistory as Array<Record<string, unknown>>) : [],
+  ).sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)));
+
   job = mergeJobs(existing, job);
+
+  // The row's updated_at is server time (it only ever orders the job list), but
+  // the body keeps the phone's own timestamp. mergeJobs compares one phone's
+  // clock against another's, and overwriting it here would make every device
+  // whose clock trails the server look permanently stale.
   const updatedAt = new Date().toISOString();
-  job.updatedAt = updatedAt;
+  job.updatedAt = String(job.updatedAt || updatedAt);
   await env.DB.prepare(
     `INSERT INTO jobs (id, data, updated_at)
      VALUES (?, ?, ?)
@@ -445,6 +488,144 @@ async function putJob(
     .run();
 
   return json(request, { job, updatedAt });
+}
+
+async function storedEvents(
+  env: Env,
+  jobId: string,
+): Promise<Array<Record<string, unknown>>> {
+  const result = await env.DB.prepare(
+    "SELECT id, action, occurred_at FROM job_events WHERE job_id = ? ORDER BY occurred_at",
+  )
+    .bind(jobId)
+    .all<{ id: string; action: string; occurred_at: string }>();
+  return (result.results || []).map((row) => ({
+    id: row.id,
+    action: row.action,
+    occurredAt: row.occurred_at,
+  }));
+}
+
+/**
+ * Records ONE clock in or clock out, on its own, the moment it happens. The
+ * whole-job PUT still follows, but this row is what makes the event durable
+ * even if that PUT never lands.
+ */
+async function putJobEvent(
+  request: Request,
+  env: Env,
+  jobId: string,
+): Promise<Response> {
+  let event: Record<string, unknown>;
+  try {
+    event = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return json(request, { error: "Event body must be valid JSON." }, 400);
+  }
+
+  const id = typeof event?.id === "string" ? event.id : "";
+  const action = String(event?.action || "");
+  const occurredAt = String(event?.occurredAt || "");
+  if (!id || !CLOCK_ACTIONS.has(action) || !Number.isFinite(Date.parse(occurredAt))) {
+    return json(request, { error: "Event id, action, and occurredAt are required." }, 400);
+  }
+
+  // The id is generated on the phone and replayed by the offline queue, so the
+  // insert has to be idempotent rather than an error on the second attempt.
+  await env.DB.prepare(
+    `INSERT INTO job_events (id, job_id, action, occurred_at, recorded_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO NOTHING`,
+  )
+    .bind(id, jobId, action, occurredAt, new Date().toISOString())
+    .run();
+
+  return json(request, { recorded: true, id, jobId, action, occurredAt });
+}
+
+async function withinPortalRateLimit(request: Request, env: Env): Promise<boolean> {
+  const caller = request.headers.get("CF-Connecting-IP") || "unknown";
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const window = Math.floor(nowSeconds / PORTAL_RATE_WINDOW_SECONDS);
+  const expiresAt = (window + 1) * PORTAL_RATE_WINDOW_SECONDS;
+  try {
+    const row = await env.DB.prepare(
+      `INSERT INTO portal_rate (bucket, count, expires_at) VALUES (?1, 1, ?2)
+       ON CONFLICT(bucket) DO UPDATE SET count = count + 1
+       RETURNING count`,
+    )
+      .bind(`${caller}|${window}`, expiresAt)
+      .first<{ count: number }>();
+    if ((row?.count ?? 0) === 1) {
+      await env.DB.prepare(`DELETE FROM portal_rate WHERE expires_at < ?1`)
+        .bind(nowSeconds)
+        .run();
+    }
+    return (row?.count ?? 0) <= PORTAL_RATE_LIMIT;
+  } catch {
+    // Unlike the voice limiter, a limiter outage here must NOT open the door.
+    return false;
+  }
+}
+
+/**
+ * Customer portal sign-in: first name + phone number in, that customer's own
+ * filed invoices out. Deliberately returns invoice-facing fields only — never
+ * the internal ledger, receipts, cost basis, or another customer's job.
+ */
+async function portalLookup(request: Request, env: Env): Promise<Response> {
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return json(request, { error: "Sign-in body must be valid JSON." }, 400);
+  }
+
+  const first = firstNameKey(body?.firstName);
+  const phone = phoneDigits(body?.phone);
+  if (!first || phone.length < 10) {
+    return json(request, { error: "Enter your first name and full phone number." }, 400);
+  }
+  if (!(await withinPortalRateLimit(request, env))) {
+    return json(request, { error: "Too many sign-in attempts. Try again in a few minutes." }, 429);
+  }
+
+  // Matched in JS rather than by a WHERE clause: the name and phone live inside
+  // the job's JSON body, so a column-based match would only ever find jobs
+  // written since those columns existed and would quietly hide every older
+  // customer. One mechanic's job list is small enough to read.
+  const result = await env.DB.prepare(
+    "SELECT data FROM jobs ORDER BY updated_at DESC",
+  ).all<StoredJobRow>();
+
+  const invoices = (result.results || []).flatMap((row) => {
+    let job: Record<string, unknown>;
+    try {
+      job = JSON.parse(row.data) as Record<string, unknown>;
+    } catch {
+      return [];
+    }
+    if (phoneDigits(job.customerPhone) !== phone) return [];
+    if (firstNameKey(job.customerName) !== first) return [];
+    const invoice = job.invoice as Record<string, unknown> | undefined;
+    // An open job is not a bill. Only filed invoices are the customer's to see.
+    if (!invoice || job.status !== "invoiced") return [];
+    return [{
+      jobId: job.id,
+      invoiceNumber: invoice.invoiceNumber,
+      createdAt: invoice.createdAt,
+      customerName: job.customerName,
+      vehicle: [job.vehicleYear, job.vehicleMake, job.vehicleModel].filter(Boolean).join(" "),
+      agreedWork: job.agreedWork || "",
+      suggestions: job.suggestions || "",
+      laborCents: invoice.laborCents ?? 0,
+      partsCents: invoice.materialsCents ?? 0,
+      totalCents: invoice.totalCents ?? 0,
+      workSeconds: invoice.workSeconds ?? 0,
+    }];
+  });
+
+  return json(request, { customerName: invoices[0]?.customerName || "", invoices });
 }
 
 async function deleteJob(
@@ -696,6 +877,18 @@ export default {
     }
     if (receipt && request.method === "GET") {
       return getReceipt(request, env, receipt.jobId, receipt.receiptId);
+    }
+
+    if (url.pathname === "/api/portal/lookup" && request.method === "POST") {
+      if (request.headers.get("Origin") && !allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      return portalLookup(request, env);
+    }
+
+    const jobEvent = jobEventsPath(url.pathname);
+    if (jobEvent && request.method === "POST") {
+      return putJobEvent(request, env, jobEvent.jobId);
     }
 
     const job = jobPath(url.pathname);

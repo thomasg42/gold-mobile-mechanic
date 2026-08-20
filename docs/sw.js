@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v22-newjob-autosave";
+const CACHE = "gold-mobile-mechanic-v23-clock-portal";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -6,6 +6,8 @@ const APP_SHELL = [
   "./app.js",
   "./voice-config.js",
   "./voice.js",
+  "./portal.html",
+  "./portal.js",
   "./icon-192.png",
   "./icon-512.png",
   "./manifest.webmanifest"

@@ -6,14 +6,17 @@
   const RECEIPT_DB = "gold-mobile-mechanic-receipts";
   const RECEIPT_STORE = "receipts";
   const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
+  // Where customers look their own invoices up. Same GitHub Pages site.
+  const PORTAL_URL = `${window.location.origin}${window.location.pathname.replace(/[^/]*$/, "")}portal.html`;
   const OCR_BASE = "./vendor/tesseract";
   const PENDING_JOBS_STORAGE = "gold-mobile-mechanic-pending-jobs-v1";
   const PENDING_RECEIPTS_STORAGE = "gold-mobile-mechanic-pending-receipts-v1";
   const PENDING_DELETES_STORAGE = "gold-mobile-mechanic-pending-deletes-v1";
+  const PENDING_EVENTS_STORAGE = "gold-mobile-mechanic-pending-events-v1";
   const STATUS_COPY = {
     draft: "Ready",
     in_progress: "On the clock",
-    on_break: "On break",
+    clocked_out: "Off the clock",
     completed: "Finished job",
     invoiced: "Invoice ready",
     archived: "Archived"
@@ -53,29 +56,31 @@
     localStorage.setItem(key, JSON.stringify(values));
   }
 
+  /**
+   * Rebuilds a clock ledger for a job saved before events were recorded. Breaks
+   * no longer exist, so a job only ever has billable work spans: each one opens
+   * with a clock in and closes with a clock out. A legacy break entry is simply
+   * the gap between two of those spans and needs no event of its own.
+   */
   function derivedEventHistory(job) {
-    const entries = [...(job.timeEntries || [])]
-      .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
     const events = [];
-    entries.forEach((entry, index) => {
-      const action = entry.kind === "break"
-        ? "break_start"
-        : index === 0
-          ? "clock_in"
-          : "break_end";
-      events.push({
-        id: `legacy-${job.id}-${action}-${entry.startedAt}`,
-        action,
-        occurredAt: entry.startedAt
+    [...(job.timeEntries || [])]
+      .filter((entry) => entry.kind === "work")
+      .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))
+      .forEach((entry) => {
+        events.push({
+          id: `legacy-${job.id}-clock_in-${entry.startedAt}`,
+          action: "clock_in",
+          occurredAt: entry.startedAt
+        });
+        if (entry.endedAt) {
+          events.push({
+            id: `legacy-${job.id}-clock_out-${entry.endedAt}`,
+            action: "clock_out",
+            occurredAt: entry.endedAt
+          });
+        }
       });
-    });
-    if (job.endedAt) {
-      events.push({
-        id: `legacy-${job.id}-clock_out-${job.endedAt}`,
-        action: "clock_out",
-        occurredAt: job.endedAt
-      });
-    }
     return events;
   }
 
@@ -123,6 +128,10 @@
         : 0,
       laborAdjustSign: Number(job.laborAdjustSign) < 0 ? -1 : 1,
       difficultyLevel: String(job.difficultyLevel || "Standard"),
+      customerPhone: String(job.customerPhone || ""),
+      // "on_break" cannot occur any more; a job saved mid-break reopens simply
+      // off the clock, which is exactly what a break was.
+      status: job.status === "on_break" ? "clocked_out" : job.status,
       eventHistory: Array.isArray(job.eventHistory) && job.eventHistory.length
         ? job.eventHistory
         : derivedEventHistory(job)
@@ -190,20 +199,101 @@
         ? "Job list storage is full on this phone browser. Receipt photos may still be saved — free Safari/Chrome site data and retry File All."
         : `Could not save job list: ${message || "unknown error"}`);
     }
-    if (pendingJobIds().length || pendingReceipts().length || pendingDeletes().length) {
+    if (
+      pendingJobIds().length ||
+      pendingReceipts().length ||
+      pendingDeletes().length ||
+      pendingClockEvents().length
+    ) {
       setSyncStatus(navigator.onLine ? "syncing" : "pending");
     }
   }
 
+  /**
+   * Folds a job from the cloud into local state IN PLACE. Swapping in a fresh
+   * object instead would silently orphan every reference already handed out —
+   * the rendered job page holds the record its buttons mutate, so after one
+   * background sync a clock in or clock out would update a detached copy,
+   * toast "Clocked out", and persist nothing.
+   */
   function replaceJob(job) {
     const normalized = normalizeJob(job);
-    const index = state.jobs.findIndex((item) => item.id === normalized.id);
-    if (index === -1) state.jobs.push(normalized);
-    else state.jobs[index] = normalized;
+    const existing = state.jobs.find((item) => item.id === normalized.id);
+    if (!existing) {
+      state.jobs.push(normalized);
+      return;
+    }
+    for (const key of Object.keys(existing)) {
+      if (!(key in normalized)) delete existing[key];
+    }
+    Object.assign(existing, normalized);
   }
 
   function pendingDeletes() {
     return arrayFromStorage(PENDING_DELETES_STORAGE).filter((id) => typeof id === "string");
+  }
+
+  function pendingClockEvents() {
+    return arrayFromStorage(PENDING_EVENTS_STORAGE).filter(
+      (item) => item && typeof item.jobId === "string" && typeof item.id === "string"
+    );
+  }
+
+  function dropPendingClockEvent(eventId) {
+    writeStorageArray(
+      PENDING_EVENTS_STORAGE,
+      pendingClockEvents().filter((item) => item.id !== eventId)
+    );
+  }
+
+  // Ids currently being posted. The tap fires its own request straight away and
+  // the queue flush runs moments later off the same job sync, so without this
+  // every clock event would go up twice.
+  const clockEventsInFlight = new Set();
+
+  async function pushClockEvent(item) {
+    if (clockEventsInFlight.has(item.id)) return;
+    clockEventsInFlight.add(item.id);
+    try {
+      await cloudFetch(`/api/jobs/${encodeURIComponent(item.jobId)}/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: item.id, action: item.action, occurredAt: item.occurredAt })
+      });
+      dropPendingClockEvent(item.id);
+    } finally {
+      clockEventsInFlight.delete(item.id);
+    }
+  }
+
+  /**
+   * Records one clock in or clock out and makes it durable on its own, right
+   * now. The event is written to this phone's storage and posted to its own
+   * cloud endpoint the instant it is tapped — it is never left waiting on a
+   * profile save, a batch, or the whole-job sync that follows it. If the post
+   * fails the event stays queued and is replayed on the next flush, so the
+   * timestamp is the moment of the tap either way.
+   */
+  function logClockEvent(job, action, occurredAt) {
+    const event = { id: uid(), action, occurredAt };
+    job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
+    job.eventHistory.push(event);
+
+    const queued = pendingClockEvents();
+    queued.push({ ...event, jobId: job.id });
+    writeStorageArray(PENDING_EVENTS_STORAGE, queued);
+    // Straight to disk before anything else can throw or navigate away.
+    saveState();
+
+    // Deliberately not routed through flushSyncQueue: that call holds a single
+    // in-flight lock behind receipt uploads and job bodies, and a clock event
+    // must not wait in line behind a 900 KB photo.
+    if (navigator.onLine) {
+      void pushClockEvent({ ...event, jobId: job.id }).catch(() => {
+        // Still queued; flushSyncQueue will replay it.
+      });
+    }
+    return event;
   }
 
   function queueJobDelete(jobIdValue) {
@@ -301,6 +391,12 @@
           writeStorageArray(PENDING_DELETES_STORAGE, deleteIds);
         }
 
+        // Clock events go before job bodies and receipts: they are the
+        // smallest, most time-sensitive writes in the queue.
+        for (const item of pendingClockEvents()) {
+          await pushClockEvent(item);
+        }
+
         let jobIds = pendingJobIds();
         for (const id of jobIds) {
           const job = findJob(id);
@@ -311,7 +407,16 @@
             body: JSON.stringify(job)
           });
           const payload = await response.json();
-          replaceJob(payload.job);
+          // A job the mechanic touched while this request was in the air is
+          // newer than the answer coming back. Clock in and clock out are one
+          // tap each and can easily land inside that window, so a stale echo
+          // must never be allowed to undo them.
+          const local = findJob(id);
+          const localTime = Date.parse(String(local?.updatedAt || 0));
+          const remoteTime = Date.parse(String(payload.job?.updatedAt || 0));
+          if (!Number.isFinite(localTime) || !Number.isFinite(remoteTime) || remoteTime >= localTime) {
+            replaceJob(payload.job);
+          }
           jobIds = jobIds.filter((value) => value !== id);
           writeStorageArray(PENDING_JOBS_STORAGE, jobIds);
           saveState();
@@ -1055,15 +1160,15 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  // Two states, nothing else: on the clock or off it. Clocking out stops
+  // billable time and leaves the job open — finishing the job is the separate
+  // Finish Project button further down the page.
   function timerControls(job) {
-    if (job.status === "draft") {
+    if (job.status === "draft" || job.status === "clocked_out") {
       return `<button class="button button-green" data-timer-action="clock_in" type="button">Clock in</button>`;
     }
     if (job.status === "in_progress") {
-      return `<button class="button button-dark" data-timer-action="break_start" type="button">Start break</button>`;
-    }
-    if (job.status === "on_break") {
-      return `<button class="button button-green" data-timer-action="break_end" type="button">End break</button>`;
+      return `<button class="button button-dark" data-timer-action="clock_out" type="button">Clock out</button>`;
     }
     return `<button class="button button-quiet" type="button" disabled>${job.status === "invoiced" ? "Invoice filed" : "Finished job"}</button>`;
   }
@@ -1184,9 +1289,12 @@
   function clockHistoryMarkup(job) {
     const labels = {
       clock_in: "Clocked in",
-      break_start: "Paused for break",
-      break_end: "Resumed work",
-      clock_out: "Finished project"
+      clock_out: "Clocked out",
+      // Kept only so a job saved before breaks were removed still reads
+      // correctly in its own history.
+      break_start: "Clocked out",
+      break_end: "Clocked in",
+      finished: "Finished project"
     };
     const events = [...(job.eventHistory || [])]
       .sort((a, b) => String(b.occurredAt).localeCompare(String(a.occurredAt)));
@@ -1211,7 +1319,6 @@
       return;
     }
     const workSeconds = billableSeconds(job);
-    const breakSeconds = elapsedSeconds(job, "break");
     const timedSeconds = elapsedSeconds(job, "work");
     const adjustment = hoursMinutes(manualWorkSeconds(job));
     const receipts = await receiptMarkup(job);
@@ -1223,7 +1330,7 @@
         <button class="back-button" id="backButton" type="button">← All jobs</button>
         <p class="eyebrow">${escapeHtml(job.id)}</p>
         <h1>${escapeHtml(vehicleName(job) || "Vehicle")} <em>work order.</em></h1>
-        <p>${escapeHtml(job.customerName)} · ${escapeHtml(job.vehiclePlate || "No plate recorded")}</p>
+        <p>${escapeHtml(job.customerName)} · ${escapeHtml(job.customerPhone || "No phone recorded")} · ${escapeHtml(job.vehiclePlate || "No plate recorded")}</p>
         <div class="job-hero-meta">
           <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status])}</span>
           <span>Opened ${calendarDate(job.createdAt)}</span>
@@ -1237,7 +1344,7 @@
             <div class="card-heading">
               <div>
                 <p class="eyebrow">Job timer</p>
-                <h2>${job.status === "on_break" ? "Break in progress" : job.status === "draft" ? "Ready to begin" : "Work ledger"}</h2>
+                <h2>${job.status === "draft" ? "Ready to begin" : job.status === "clocked_out" ? "Off the clock" : "Work ledger"}</h2>
               </div>
               <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status])}</span>
             </div>
@@ -1246,8 +1353,8 @@
               <strong id="liveWorkTimer">${duration(workSeconds)}</strong>
             </div>
             <div class="timer-summary">
-              <div><span class="detail-label">Clocked in</span><strong>${clockTime(job.startedAt)}</strong></div>
-              <div><span class="detail-label">Break time</span><strong id="liveBreakTimer">${duration(breakSeconds)}</strong></div>
+              <div><span class="detail-label">First clocked in</span><strong>${clockTime(job.startedAt)}</strong></div>
+              <div><span class="detail-label">Clock events</span><strong>${(job.eventHistory || []).filter((event) => event.action === "clock_in" || event.action === "clock_out").length}</strong></div>
             </div>
             <div class="timer-buttons">${timerControls(job)}</div>
             <div class="time-edit">
@@ -1408,11 +1515,11 @@
         <div>
           <p class="eyebrow">Bottom of work order</p>
           <h3>${job.status === "completed" || job.status === "invoiced" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
-          <p>${job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Finish Project closes the timer and files the invoice so you can get paid. Clocking out or taking a break for the day doesn't affect it — come back whenever and hit Finish Project when the job is actually done."}</p>
+          <p>${job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Finish Project closes the timer and files the invoice so you can get paid. Clocking out for the day doesn't affect it — come back, clock in again, and hit Finish Project when the job is actually done."}</p>
         </div>
         <div class="card-cta">
-          <button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "on_break" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
-          <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "on_break" ? "" : "disabled"}>Finish Project</button>
+          <button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
+          <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}>Finish Project</button>
         </div>
       </section>`;
 
@@ -1588,7 +1695,7 @@
           notify(blocked, true);
           return;
         }
-        timerAction(job, "clock_out");
+        timerAction(job, "finish");
       });
     }
 
@@ -1929,31 +2036,39 @@
 
   function timerAction(job, action, { skipConfirm = false } = {}) {
     const now = new Date().toISOString();
-    const openEntry = job.timeEntries.find((entry) => !entry.endedAt);
+    // Work spans only: a job carried over from the break era can still hold a
+    // dangling break entry, and closing that one instead would leave the real
+    // billable span running forever.
+    const openEntry = job.timeEntries.find((entry) => entry.kind === "work" && !entry.endedAt);
+    const onTheClock = job.status === "in_progress";
 
-    if (action === "clock_in" && job.status === "draft") {
+    if (action === "clock_in" && (job.status === "draft" || job.status === "clocked_out")) {
       job.status = "in_progress";
-      job.startedAt = now;
+      // startedAt is the first time this job was ever worked, not the latest
+      // clock in — the invoice and its editable "clocked in" field read it.
+      if (!job.startedAt) job.startedAt = now;
       job.timeEntries.push({ id: uid(), kind: "work", startedAt: now, endedAt: null });
+      // Persist this single event immediately, before anything else.
+      logClockEvent(job, "clock_in", now);
       notify("Clocked in. Billable time is running.");
-    } else if (action === "break_start" && job.status === "in_progress") {
+    } else if (action === "clock_out" && onTheClock) {
       if (openEntry) openEntry.endedAt = now;
-      job.timeEntries.push({ id: uid(), kind: "break", startedAt: now, endedAt: null });
-      job.status = "on_break";
-      notify("Break started. Billable time is paused.");
-    } else if (action === "break_end" && job.status === "on_break") {
-      if (openEntry) openEntry.endedAt = now;
-      job.timeEntries.push({ id: uid(), kind: "work", startedAt: now, endedAt: null });
-      job.status = "in_progress";
-      notify("Break ended. Billable time resumed.");
-    } else if (action === "clock_out" && (job.status === "in_progress" || job.status === "on_break")) {
+      job.status = "clocked_out";
+      logClockEvent(job, "clock_out", now);
+      notify("Clocked out. Billable time is stopped — clock back in whenever.");
+    } else if (action === "finish" && (onTheClock || job.status === "clocked_out")) {
       // Voice already read the job back and heard an explicit yes.
       if (!skipConfirm && !window.confirm("Finish this project, close the timer, and file the invoice for payment?")) return;
-      if (openEntry) openEntry.endedAt = now;
+      // Finishing while still on the clock is also a clock out, and it is
+      // recorded as its own durable event before the invoice is filed.
+      if (onTheClock) {
+        if (openEntry) openEntry.endedAt = now;
+        logClockEvent(job, "clock_out", now);
+      }
       job.status = "completed";
       job.endedAt = now;
       job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
-      job.eventHistory.push({ id: uid(), action, occurredAt: now });
+      job.eventHistory.push({ id: uid(), action: "finished", occurredAt: now });
       const invoice = upsertInvoice(job);
       renderJob();
       notify(`${invoice.invoiceNumber} filed — share it to get paid.`);
@@ -1963,8 +2078,6 @@
       return;
     }
 
-    job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
-    job.eventHistory.push({ id: uid(), action, occurredAt: now });
     queueJobSync(job);
     renderJob();
   }
@@ -1973,10 +2086,8 @@
     const job = selectedJobId ? findJob(selectedJobId) : null;
     if (!job) return;
     const work = $("liveWorkTimer");
-    const rest = $("liveBreakTimer");
     const summary = $("billableSummary");
     if (work) work.textContent = duration(billableSeconds(job));
-    if (rest) rest.textContent = duration(elapsedSeconds(job, "break"));
     if (summary) summary.textContent = duration(billableSeconds(job));
   }
 
@@ -2027,6 +2138,7 @@
       .filter(Boolean);
     const draft = {
       customerName: String(data.get("customerName") || ""),
+      customerPhone: String(data.get("customerPhone") || ""),
       customerEmail: String(data.get("customerEmail") || ""),
       vehicleYear: String(data.get("vehicleYear") || ""),
       vehicleMake: String(data.get("vehicleMake") || ""),
@@ -2058,6 +2170,7 @@
 
   function applyJobDraft(draft) {
     setField(jobForm, "customerName", draft.customerName || "");
+    setField(jobForm, "customerPhone", draft.customerPhone || "");
     setField(jobForm, "customerEmail", draft.customerEmail || "");
     setField(jobForm, "vehicleYear", draft.vehicleYear || "");
     setField(jobForm, "vehicleMake", draft.vehicleMake || "");
@@ -2120,6 +2233,9 @@
     const job = {
       id: jobId(),
       customerName: String(data.get("customerName") || "").trim(),
+      // The phone is half of the customer's portal sign-in, so it is stored as
+      // dictated and normalized to digits only at lookup time.
+      customerPhone: String(data.get("customerPhone") || "").trim(),
       customerEmail: String(data.get("customerEmail") || "").trim(),
       vehicleYear: String(data.get("vehicleYear") || "").trim(),
       vehicleMake: String(data.get("vehicleMake") || "").trim(),
@@ -2880,7 +2996,7 @@
       <div class="meta"><strong>${escapeHtml(job.invoice.invoiceNumber)}</strong><br>${calendarDate(job.invoice.createdAt)}<br>Job ${escapeHtml(job.id)}</div>
     </header>
     <div class="grid">
-      <div class="box"><span class="eyebrow">Bill to</span><br><strong>${escapeHtml(job.customerName)}</strong><br>${escapeHtml(job.customerEmail || "Email not provided")}</div>
+      <div class="box"><span class="eyebrow">Bill to</span><br><strong>${escapeHtml(job.customerName)}</strong><br>${escapeHtml(job.customerPhone || "Phone not provided")}<br>${escapeHtml(job.customerEmail || "Email not provided")}</div>
       <div class="box"><span class="eyebrow">Vehicle</span><br><strong>${escapeHtml(vehicleName(job))}</strong><br>${escapeHtml(job.vehiclePlate || "No plate recorded")}</div>
     </div>
     <div class="box"><span class="eyebrow">Agreed work</span><p>${escapeHtml(job.agreedWork)}</p></div>
@@ -2956,6 +3072,8 @@
       `Invoice total: ${money(job.invoice.totalCents)}`,
       "",
       "Attach the downloaded invoice file to this message before sending.",
+      "",
+      `Every invoice we've filed for you is also at ${PORTAL_URL} — sign in with your first name and this phone number.`,
       "",
       "Thank you,"
     ].join("\n");
@@ -3065,6 +3183,20 @@
     return String(value || "").split("").join(" ");
   }
 
+  /**
+   * "Jon Mc-Crae" -> "J-O-N, M-C-C-R-A-E". Hyphen-joined capitals are what a
+   * speech engine reliably reads out one letter at a time; bare spaced letters
+   * get run back together into a word.
+   */
+  function spellLetters(value) {
+    return String(value || "")
+      .trim()
+      .split(/\s+/)
+      .map((word) => word.replace(/[^A-Za-z0-9]/g, "").toUpperCase().split("").join("-"))
+      .filter(Boolean)
+      .join(", ");
+  }
+
   /** Renders one configured summary part against what the section captured. */
   function summaryPart(part, captured) {
     if (typeof part === "string") return part;
@@ -3110,7 +3242,17 @@
       name: step.name,
       label: step.label,
       optional: Boolean(step.optional),
-      prompt: step.prompt,
+      // Prompts are resolved against everything captured so far, so
+      // "{customerName}'s car" reads back the name that was just confirmed
+      // instead of asking the same generic question a second time.
+      prompt: (context) => fillPrompt(step.prompt, context || {}),
+      retryAfterNo: step.retryAfterNo,
+      confirmEach: step.confirmEach
+        ? (value) => fillPrompt(step.confirmEach, {
+          value: Array.isArray(value) ? value.join(", ") : String(value ?? ""),
+          spelled: spellLetters(value)
+        })
+        : undefined,
       parse: voiceParser(step.parse),
       apply: (value, captured) => {
         if (step.apply) voiceAppliers[step.apply]?.(value, captured);
@@ -3181,8 +3323,11 @@
     const outcome = await window.GMMVoice.run(async ({ speak, ask, runSection }) => {
       if (flow.intro) await speak(flow.intro);
 
+      // One shared context for the whole interview: the vehicle question needs
+      // the customer name captured back in the first section.
+      const interview = {};
       for (const section of flow.sections || []) {
-        await runSection(configuredSection(section));
+        await runSection(configuredSection(section), interview);
       }
 
       if (flow.creating) await speak(flow.creating);
@@ -3372,7 +3517,7 @@
         return false;
       }
 
-      timerAction(job, "clock_out", { skipConfirm: true });
+      timerAction(job, "finish", { skipConfirm: true });
       await speak(copy.filed);
       return true;
     });

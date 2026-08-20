@@ -25,6 +25,7 @@
     <div class="topbar-meta">
       <span class="signal-dot" id="syncDot" data-sync="disconnected" aria-hidden="true"></span>
       <span id="storageLabel">Connecting cloud ledger</span>
+      <a href="./portal.html" id="portalLink">Customer portal</a>
     </div>
   </header>
 
@@ -89,6 +90,10 @@
           <label class="field field-wide">
             <span>Customer name</span>
             <input name="customerName" autocomplete="name" required>
+          </label>
+          <label class="field field-wide">
+            <span>Customer phone</span>
+            <input name="customerPhone" type="tel" autocomplete="tel" inputmode="tel" placeholder="406 555 0147" required>
           </label>
           <label class="field field-wide">
             <span>Customer email</span>

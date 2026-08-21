@@ -40,10 +40,9 @@ const MAX_STT_BYTES = 4_000_000;
 const VOICE_RATE_LIMIT = 60;
 const VOICE_RATE_WINDOW_SECONDS = 60;
 
-// Customer portal sign-in is a first name plus a phone number and nothing else,
-// so the only thing standing between a guesser and someone's invoices is this
-// throttle. Keep it tight.
-const PORTAL_RATE_LIMIT = 10;
+// The customer portal is open by design, so this limit is not protecting the
+// data — it only stops one caller hammering the worker or bulk-scraping it.
+const PORTAL_RATE_LIMIT = 120;
 const PORTAL_RATE_WINDOW_SECONDS = 300;
 const CLOCK_ACTIONS = new Set(["clock_in", "clock_out"]);
 
@@ -112,19 +111,6 @@ function phoneDigits(value: unknown): string {
   const digits = String(value ?? "").replace(/\D/g, "");
   // A US number dialed with the country code is the same number.
   return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
-}
-
-/**
- * Sign-in matches on the first name only, case- and spacing-insensitively.
- * The spelling captured by voice is preserved in the record itself — this is
- * only the comparison key.
- */
-function firstNameKey(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    .split(/\s+/)[0]
-    .toLowerCase()
-    .replace(/[^a-z]/g, "");
 }
 
 function mergeRecordsById(
@@ -563,8 +549,9 @@ async function withinPortalRateLimit(request: Request, env: Env): Promise<boolea
     }
     return (row?.count ?? 0) <= PORTAL_RATE_LIMIT;
   } catch {
-    // Unlike the voice limiter, a limiter outage here must NOT open the door.
-    return false;
+    // The pages behind this are public, so a limiter outage must not take the
+    // portal down with it.
+    return true;
   }
 }
 
@@ -573,59 +560,132 @@ async function withinPortalRateLimit(request: Request, env: Env): Promise<boolea
  * filed invoices out. Deliberately returns invoice-facing fields only — never
  * the internal ledger, receipts, cost basis, or another customer's job.
  */
-async function portalLookup(request: Request, env: Env): Promise<Response> {
-  let body: Record<string, unknown>;
-  try {
-    body = (await request.json()) as Record<string, unknown>;
-  } catch {
-    return json(request, { error: "Sign-in body must be valid JSON." }, 400);
+/**
+ * One customer's filed invoices, keyed by the opaque id the directory hands
+ * out. Grouping is by name + phone so two different people who share a name
+ * stay separate, but the phone never appears in the key or the response — the
+ * portal publishes who was worked on and what it cost, not how to reach them.
+ */
+function customerKey(name: unknown, phone: unknown): string {
+  const normalizedName = String(name ?? "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  // FNV-1a: short, stable, and dependency-free. This is an identifier, not a
+  // security boundary — the portal is public by design.
+  let hash = 0x811c9dc5;
+  for (const character of `${normalizedName}|${phoneDigits(phone)}`) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
   }
+  return hash.toString(36).padStart(7, "0");
+}
 
-  const first = firstNameKey(body?.firstName);
-  const phone = phoneDigits(body?.phone);
-  if (!first || phone.length < 10) {
-    return json(request, { error: "Enter your first name and full phone number." }, 400);
-  }
-  if (!(await withinPortalRateLimit(request, env))) {
-    return json(request, { error: "Too many sign-in attempts. Try again in a few minutes." }, 429);
-  }
+type PortalInvoice = {
+  jobId: unknown;
+  invoiceNumber: unknown;
+  createdAt: unknown;
+  vehicle: string;
+  agreedWork: unknown;
+  suggestions: unknown;
+  laborCents: unknown;
+  partsCents: unknown;
+  totalCents: unknown;
+  workSeconds: unknown;
+};
 
-  // Matched in JS rather than by a WHERE clause: the name and phone live inside
-  // the job's JSON body, so a column-based match would only ever find jobs
-  // written since those columns existed and would quietly hide every older
-  // customer. One mechanic's job list is small enough to read.
+type PortalCustomer = {
+  id: string;
+  name: string;
+  vehicles: string[];
+  invoices: PortalInvoice[];
+};
+
+/**
+ * Every customer with at least one filed invoice, grouped and ready to browse.
+ *
+ * Read in JS rather than by a WHERE clause: names live inside the job's JSON
+ * body, and one mechanic's job list is small enough to read in full.
+ *
+ * Deliberately excluded from every response: phone numbers, email addresses,
+ * receipts, cost basis, the clock ledger, and any job that has not been
+ * invoiced. The portal is open by design — that is Thomas's call — but it
+ * publishes finished bills, not contact details or an open job in progress.
+ */
+async function portalCustomers(env: Env): Promise<PortalCustomer[]> {
   const result = await env.DB.prepare(
     "SELECT data FROM jobs ORDER BY updated_at DESC",
   ).all<StoredJobRow>();
 
-  const invoices = (result.results || []).flatMap((row) => {
+  const customers = new Map<string, PortalCustomer>();
+  for (const row of result.results || []) {
     let job: Record<string, unknown>;
     try {
       job = JSON.parse(row.data) as Record<string, unknown>;
     } catch {
-      return [];
+      continue;
     }
-    if (phoneDigits(job.customerPhone) !== phone) return [];
-    if (firstNameKey(job.customerName) !== first) return [];
     const invoice = job.invoice as Record<string, unknown> | undefined;
-    // An open job is not a bill. Only filed invoices are the customer's to see.
-    if (!invoice || job.status !== "invoiced") return [];
-    return [{
+    if (!invoice || job.status !== "invoiced") continue;
+
+    const name = String(job.customerName || "").trim();
+    if (!name) continue;
+    const id = customerKey(name, job.customerPhone);
+    const vehicle = [job.vehicleYear, job.vehicleMake, job.vehicleModel]
+      .filter(Boolean)
+      .join(" ");
+
+    const customer = customers.get(id) || { id, name, vehicles: [], invoices: [] };
+    if (vehicle && !customer.vehicles.includes(vehicle)) customer.vehicles.push(vehicle);
+    customer.invoices.push({
       jobId: job.id,
       invoiceNumber: invoice.invoiceNumber,
       createdAt: invoice.createdAt,
-      customerName: job.customerName,
-      vehicle: [job.vehicleYear, job.vehicleMake, job.vehicleModel].filter(Boolean).join(" "),
+      vehicle,
       agreedWork: job.agreedWork || "",
       suggestions: job.suggestions || "",
       laborCents: invoice.laborCents ?? 0,
       partsCents: invoice.materialsCents ?? 0,
       totalCents: invoice.totalCents ?? 0,
       workSeconds: invoice.workSeconds ?? 0,
-    }];
-  });
+    });
+    customers.set(id, customer);
+  }
 
-  return json(request, { customerName: invoices[0]?.customerName || "", invoices });
+  for (const customer of customers.values()) {
+    customer.invoices.sort((a, b) =>
+      String(b.createdAt).localeCompare(String(a.createdAt)));
+  }
+  return [...customers.values()].sort((a, b) =>
+    a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+}
+
+/** The browsable directory: every customer, newest invoice first inside each. */
+async function portalDirectory(request: Request, env: Env): Promise<Response> {
+  if (!(await withinPortalRateLimit(request, env))) {
+    return json(request, { error: "The portal is busy. Try again in a moment." }, 429);
+  }
+  const customers = await portalCustomers(env);
+  return json(request, {
+    customers: customers.map((customer) => ({
+      id: customer.id,
+      name: customer.name,
+      vehicles: customer.vehicles,
+      invoiceCount: customer.invoices.length,
+      latestAt: customer.invoices[0]?.createdAt ?? null,
+    })),
+  });
+}
+
+/** One customer's profile, opened from the directory. */
+async function portalCustomer(
+  request: Request,
+  env: Env,
+  id: string,
+): Promise<Response> {
+  if (!(await withinPortalRateLimit(request, env))) {
+    return json(request, { error: "The portal is busy. Try again in a moment." }, 429);
+  }
+  const customer = (await portalCustomers(env)).find((entry) => entry.id === id);
+  if (!customer) return json(request, { error: "No such customer." }, 404);
+  return json(request, { customer });
 }
 
 async function deleteJob(
@@ -879,11 +939,19 @@ export default {
       return getReceipt(request, env, receipt.jobId, receipt.receiptId);
     }
 
-    if (url.pathname === "/api/portal/lookup" && request.method === "POST") {
+    if (url.pathname === "/api/portal/customers" && request.method === "GET") {
       if (request.headers.get("Origin") && !allowedOrigin(request)) {
         return json(request, { error: "Forbidden." }, 403);
       }
-      return portalLookup(request, env);
+      return portalDirectory(request, env);
+    }
+
+    const portalProfile = /^\/api\/portal\/customers\/([^/]+)$/.exec(url.pathname);
+    if (portalProfile && request.method === "GET") {
+      if (request.headers.get("Origin") && !allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      return portalCustomer(request, env, decodeURIComponent(portalProfile[1]));
     }
 
     const jobEvent = jobEventsPath(url.pathname);

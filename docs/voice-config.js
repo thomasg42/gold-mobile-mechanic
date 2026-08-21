@@ -66,7 +66,8 @@ window.VoiceConfig = {
           {
             name: "customerPhone",
             label: "the phone number",
-            prompt: "What's {customerName}'s phone number?",
+            optional: true,
+            prompt: "What's {customerName}'s phone number? Say skip if you don't have it.",
             parse: "phone",
             field: "customerPhone",
             confirmEach: "Is {value} correct?",

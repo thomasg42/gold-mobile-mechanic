@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#101214">
   <meta name="robots" content="noindex">
-  <meta name="description" content="Gold Mobile Mechanic customers: sign in with your first name and phone number to see your past invoices.">
-  <title>Your invoices · Gold Mobile Mechanic</title>
+  <meta name="description" content="Gold Mobile Mechanic customers and the work we've completed for them.">
+  <title>Customers · Gold Mobile Mechanic</title>
   <link rel="apple-touch-icon" href="./icon-192.png">
   <link rel="stylesheet" href="./styles.css">
 </head>
@@ -16,44 +16,39 @@
       <span class="brand-mark" aria-hidden="true"><span>G</span></span>
       <span>
         <strong>Gold Mobile</strong>
-        <small>Customer invoices</small>
+        <small>Customers</small>
       </span>
     </a>
   </header>
 
   <main class="page">
-    <section id="portalSignIn">
+    <section id="portalDirectory">
       <div class="board-heading">
         <div>
-          <p class="eyebrow">Customer portal</p>
-          <h1>Your invoices,<br><em>any time.</em></h1>
-          <p>Sign in with the first name and phone number you gave us on the job.</p>
+          <p class="eyebrow">Open door</p>
+          <h1>Every customer,<br><em>every job.</em></h1>
+          <p>Find your name, tap it, and see the work we've done and what it came to.</p>
         </div>
       </div>
 
-      <form class="content-card portal-form" id="portalForm" novalidate>
-        <label class="field field-wide">
-          <span>First name</span>
-          <input name="firstName" autocomplete="given-name" autocapitalize="words" required>
-        </label>
-        <label class="field field-wide">
-          <span>Phone number</span>
-          <input name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="406 555 0147" required>
-        </label>
-        <p class="portal-error hidden" id="portalError" role="alert"></p>
-        <button class="button button-gold" id="portalSubmit" type="submit">See my invoices</button>
-      </form>
+      <label class="field field-wide portal-search">
+        <span>Search by name</span>
+        <input id="portalSearch" type="search" autocomplete="off" placeholder="Start typing a name">
+      </label>
+
+      <p class="portal-error hidden" id="portalError" role="alert"></p>
+      <div id="portalList"><p class="history-empty">Loading customers…</p></div>
     </section>
 
-    <section id="portalResults" class="hidden">
+    <section id="portalProfile" class="hidden">
       <div class="board-heading">
         <div>
-          <p class="eyebrow">Signed in</p>
-          <h1 id="portalGreeting">Your invoices</h1>
-          <p id="portalCount"></p>
+          <p class="eyebrow">Customer</p>
+          <h1 id="portalName">Customer</h1>
+          <p id="portalSummary"></p>
         </div>
         <div class="board-cta">
-          <button class="button button-quiet" id="portalSignOut" type="button">Sign out</button>
+          <button class="button button-quiet" id="portalBack" type="button">← All customers</button>
         </div>
       </div>
       <div id="portalInvoices"></div>

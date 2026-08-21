@@ -1793,10 +1793,34 @@ button {
 /* The portal reuses the field-desk shell (topbar, content-card, button, field)
    so it needs only the few pieces the mechanic's app has no equivalent for. */
 
-.portal-form {
-  display: grid;
-  gap: 16px;
+.portal-search {
   max-width: 460px;
+  margin-bottom: 20px;
+}
+
+.portal-customer {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+
+.portal-customer + .portal-customer {
+  margin-top: 12px;
+}
+
+.portal-customer-name {
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.portal-customer-vehicles,
+.portal-customer-meta {
+  color: var(--muted, #6b7075);
+  font-size: 0.92rem;
 }
 
 .portal-error {

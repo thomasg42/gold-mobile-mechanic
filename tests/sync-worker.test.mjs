@@ -81,7 +81,8 @@ test("sync worker records clock events durably and serves the customer portal", 
     vehicleModel: "Cruze", eventHistory: [], updatedAt: new Date().toISOString(), ...over
   });
 
-  let r = await call("/api/jobs/GMM-0001", { method: "PUT", body: jobBody() });
+  let r = await call("/api/jobs/GMM-0001", { method: "PUT",
+    body: jobBody({ updatedAt: "2026-08-20T14:59:00.000Z" }) });
   assert.equal(r.status, 200); ok("job saved");
 
   // One clock-in, posted on its own, before any job body follows it.
@@ -110,7 +111,8 @@ test("sync worker records clock events durably and serves the customer portal", 
   assert.equal(r.status, 400); ok("break event rejected");
 
   // A phone that posted events and then syncs a STALE job body must not erase them.
-  r = await call("/api/jobs/GMM-0001", { method: "PUT", body: jobBody({ eventHistory: [] }) });
+  r = await call("/api/jobs/GMM-0001", { method: "PUT",
+    body: jobBody({ eventHistory: [], updatedAt: "2026-08-20T17:31:00.000Z" }) });
   const merged = (await r.json()).job;
   assert.deepEqual(merged.eventHistory.map((e) => e.action), ["clock_in", "clock_out"]);
   ok("stale job body cannot wipe recorded clock events");
@@ -145,46 +147,79 @@ test("sync worker records clock events durably and serves the customer portal", 
   assert.equal((await sr.json()).job.status, "invoiced"); ok("a finished job is not reopened by its clock out");
 
   // ---------------------------------------------------------------------- portal
-  // Nothing is visible until the invoice is actually filed.
-  r = await call("/api/portal/lookup", { method: "POST", body: { firstName: "deShaun", phone: "4065550147" } });
-  assert.deepEqual((await r.json()).invoices, []); ok("open job exposes no invoice");
+  // The portal is an open directory by design: anyone may browse every
+  // customer and open any profile. What it must never publish is contact
+  // details, the internal ledger, or a job that has not been invoiced.
+  let dir = await call("/api/portal/customers");
+  assert.deepEqual((await dir.json()).customers, []);
+  ok("an open job puts nobody in the directory");
 
   await call("/api/jobs/GMM-0001", { method: "PUT", body: jobBody({
-    status: "invoiced", updatedAt: "2026-08-20T18:00:01.000Z", agreedWork: "Oil filter housing", suggestions: "Rear pads soon",
+    status: "invoiced", updatedAt: "2026-08-20T18:00:01.000Z",
+    agreedWork: "Oil filter housing", suggestions: "Rear pads soon",
     invoice: { invoiceNumber: "GMM-INV-0001", createdAt: "2026-08-20T18:00:00.000Z",
       laborCents: 30000, materialsCents: 8000, totalCents: 38000, workSeconds: 9000 }
   }) });
 
-  // Sign in the way a customer would type it: messy formatting, any casing.
-  r = await call("/api/portal/lookup", { method: "POST", body: { firstName: "  DESHAUN ", phone: "1 (406) 555-0147" } });
-  let payload = await r.json();
-  assert.equal(payload.invoices.length, 1);
-  assert.equal(payload.invoices[0].totalCents, 38000);
-  assert.equal(payload.invoices[0].partsCents, 8000);
-  assert.equal(payload.invoices[0].vehicle, "2012 Chevrolet Cruze");
-  ok("customer sees their own filed invoice");
+  // A second customer, and a second invoice for the first one.
+  await call("/api/jobs/GMM-0003", { method: "PUT", body: jobBody({
+    id: "GMM-0003", customerName: "Ada Lin", customerPhone: "406 555 0199",
+    vehicleYear: "2019", vehicleMake: "Toyota", vehicleModel: "Camry",
+    status: "invoiced", updatedAt: "2026-08-19T18:00:01.000Z", agreedWork: "Timing belt",
+    invoice: { invoiceNumber: "GMM-INV-0003", createdAt: "2026-08-19T18:00:00.000Z",
+      laborCents: 40000, materialsCents: 12000, totalCents: 52000, workSeconds: 12600 }
+  }) });
+  await call("/api/jobs/GMM-0004", { method: "PUT", body: jobBody({
+    id: "GMM-0004", status: "invoiced", updatedAt: "2026-08-21T18:00:01.000Z",
+    vehicleYear: "2012", vehicleMake: "Chevrolet", vehicleModel: "Cruze", agreedWork: "Brakes",
+    invoice: { invoiceNumber: "GMM-INV-0004", createdAt: "2026-08-21T18:00:00.000Z",
+      laborCents: 20000, materialsCents: 5000, totalCents: 25000, workSeconds: 7200 }
+  }) });
 
-  // The portal must never hand back the internal ledger.
-  const leaked = Object.keys(payload.invoices[0]).filter((k) =>
-    ["receipts", "eventHistory", "timeEntries", "laborRateCents", "materials"].includes(k));
-  assert.deepEqual(leaked, []); ok("no internal ledger fields leak");
+  dir = await call("/api/portal/customers");
+  const listed = (await dir.json()).customers;
+  assert.deepEqual(listed.map((c) => c.name), ["Ada Lin", "deShaun O'Brien-Katz"]);
+  ok("the directory lists every customer, sorted by name");
 
-  // Right phone, wrong person: no match.
-  r = await call("/api/portal/lookup", { method: "POST", body: { firstName: "Marcus", phone: "4065550147" } });
-  assert.deepEqual((await r.json()).invoices, []); ok("wrong first name returns nothing");
+  const deShaun = listed.find((c) => c.name === "deShaun O'Brien-Katz");
+  assert.equal(deShaun.invoiceCount, 2);
+  assert.equal(deShaun.latestAt, "2026-08-21T18:00:00.000Z");
+  ok("a customer's jobs are grouped under one profile");
 
-  // Right name, wrong number: no match.
-  r = await call("/api/portal/lookup", { method: "POST", body: { firstName: "deShaun", phone: "4065559999" } });
-  assert.deepEqual((await r.json()).invoices, []); ok("wrong phone returns nothing");
+  // The directory is a list of names, not a contact list.
+  const rowText = JSON.stringify(listed);
+  assert.doesNotMatch(rowText, /555/);
+  assert.doesNotMatch(rowText, /@/);
+  ok("the directory publishes no phone numbers or emails");
 
-  r = await call("/api/portal/lookup", { method: "POST", body: { firstName: "deShaun", phone: "406555" } });
-  assert.equal(r.status, 400); ok("partial phone refused");
+  // Anyone may open anyone's profile — that is the open-door design.
+  let profile = await call(`/api/portal/customers/${deShaun.id}`);
+  const opened = (await profile.json()).customer;
+  assert.equal(opened.name, "deShaun O'Brien-Katz");
+  assert.deepEqual(opened.invoices.map((i) => i.invoiceNumber), ["GMM-INV-0004", "GMM-INV-0001"]);
+  assert.equal(opened.invoices[0].partsCents, 5000);
+  ok("any profile opens, newest invoice first");
 
-  // Guessing is throttled.
-  let throttled = false;
-  for (let i = 0; i < 14; i += 1) {
-    const attempt = await call("/api/portal/lookup", { method: "POST", body: { firstName: "guess", phone: "4065550147" } });
-    if (attempt.status === 429) { throttled = true; break; }
-  }
-  assert.equal(throttled, true); ok("repeat sign-in guessing is rate limited");
+  const profileText = JSON.stringify(opened);
+  assert.doesNotMatch(profileText, /555/);
+  assert.doesNotMatch(profileText, /customerPhone|customerEmail|receipts|eventHistory|timeEntries|laborRateCents/);
+  ok("a profile carries invoices only — no contact details or internal ledger");
+
+  // Two different people who happen to share a name stay apart.
+  await call("/api/jobs/GMM-0005", { method: "PUT", body: jobBody({
+    id: "GMM-0005", customerName: "Ada Lin", customerPhone: "406 555 0222",
+    status: "invoiced", updatedAt: "2026-08-21T19:00:01.000Z",
+    invoice: { invoiceNumber: "GMM-INV-0005", createdAt: "2026-08-21T19:00:00.000Z",
+      laborCents: 10000, materialsCents: 0, totalCents: 10000, workSeconds: 3600 }
+  }) });
+  dir = await call("/api/portal/customers");
+  const adas = (await dir.json()).customers.filter((c) => c.name === "Ada Lin");
+  assert.equal(adas.length, 2);
+  assert.notEqual(adas[0].id, adas[1].id);
+  ok("two customers sharing a name are separate profiles");
+
+  profile = await call("/api/portal/customers/nosuchid");
+  assert.equal(profile.status, 404);
+  ok("an unknown profile id is a clean 404");
+
 });

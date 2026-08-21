@@ -2233,8 +2233,9 @@
     const job = {
       id: jobId(),
       customerName: String(data.get("customerName") || "").trim(),
-      // The phone is half of the customer's portal sign-in, so it is stored as
-      // dictated and normalized to digits only at lookup time.
+      // Kept on the record for calling and texting the customer. It is not
+      // published anywhere: the portal groups by name + phone so two people
+      // who share a name stay apart, but never sends the number to the page.
       customerPhone: String(data.get("customerPhone") || "").trim(),
       customerEmail: String(data.get("customerEmail") || "").trim(),
       vehicleYear: String(data.get("vehicleYear") || "").trim(),
@@ -3073,7 +3074,7 @@
       "",
       "Attach the downloaded invoice file to this message before sending.",
       "",
-      `Every invoice we've filed for you is also at ${PORTAL_URL} — sign in with your first name and this phone number.`,
+      `Every invoice we've filed is also at ${PORTAL_URL} — find your name in the list.`,
       "",
       "Thank you,"
     ].join("\n");

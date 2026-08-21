@@ -1,27 +1,29 @@
 /**
- * Gold Mobile Mechanic customer portal.
+ * Gold Mobile Mechanic customer portal — open door.
  *
- * Customers sign in with the two things they actually remember — their first
- * name and their phone number — and see the invoices already filed against
- * their own jobs. Nothing here can create, edit, or close a job: the only call
- * it makes is the read-only lookup, and the worker decides what comes back.
+ * Every customer with a filed invoice is listed by name. Anyone can open
+ * anyone's profile and read the work and the totals: that is the deliberate
+ * design, chosen by Thomas, not an oversight.
  *
- * The credentials are deliberately low-friction, so they are held in
- * sessionStorage only (gone when the tab closes) and never written to the
- * address bar or to localStorage.
+ * What the worker never sends and this page therefore cannot show: phone
+ * numbers, email addresses, receipt images, cost basis, the clock ledger, and
+ * any job that has not been invoiced yet.
+ *
+ * Read-only throughout — the only calls it makes are two GETs.
  */
 (() => {
   "use strict";
 
   const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
-  const SESSION_KEY = "gold-mobile-mechanic-portal-session";
 
   const $ = (id) => document.getElementById(id);
-  const signInView = $("portalSignIn");
-  const resultsView = $("portalResults");
-  const form = $("portalForm");
+  const directoryView = $("portalDirectory");
+  const profileView = $("portalProfile");
+  const listBox = $("portalList");
   const errorBox = $("portalError");
-  const submitButton = $("portalSubmit");
+  const searchInput = $("portalSearch");
+
+  let customers = [];
 
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -30,8 +32,7 @@
   }
 
   function money(cents) {
-    const value = Number(cents || 0) / 100;
-    return value.toLocaleString("en-US", { style: "currency", currency: "USD" });
+    return (Number(cents || 0) / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
   }
 
   function calendarDate(value) {
@@ -55,11 +56,49 @@
     errorBox.classList.add("hidden");
   }
 
+  async function getJson(path) {
+    const response = await fetch(`${SYNC_API}${path}`, { cache: "no-store" });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) {
+      throw new Error(payload?.error || "We couldn't reach the invoice system. Try again in a moment.");
+    }
+    return payload || {};
+  }
+
+  // ----------------------------------------------------------------- directory
+
+  function customerRow(customer) {
+    const vehicles = (customer.vehicles || []).join(" · ");
+    const count = Number(customer.invoiceCount || 0);
+    return `
+      <button class="content-card portal-customer" type="button" data-customer="${escapeHtml(customer.id)}">
+        <span class="portal-customer-name">${escapeHtml(customer.name)}</span>
+        ${vehicles ? `<span class="portal-customer-vehicles">${escapeHtml(vehicles)}</span>` : ""}
+        <span class="portal-customer-meta">${count} invoice${count === 1 ? "" : "s"}${customer.latestAt ? ` · latest ${escapeHtml(calendarDate(customer.latestAt))}` : ""}</span>
+      </button>`;
+  }
+
+  function renderList() {
+    const term = searchInput.value.trim().toLowerCase();
+    const matches = term
+      ? customers.filter((customer) => String(customer.name).toLowerCase().includes(term))
+      : customers;
+    listBox.innerHTML = matches.length
+      ? matches.map(customerRow).join("")
+      : `<p class="history-empty">${customers.length
+        ? "No customer matches that name."
+        : "No invoices have been filed yet."}</p>`;
+  }
+
+  // ------------------------------------------------------------------- profile
+
   function invoiceMarkup(invoice) {
-    const lines = [
-      ["Labor", invoice.laborCents],
-      ["Parts and materials", invoice.partsCents]
-    ]
+    const lines = [["Labor", invoice.laborCents], ["Parts and materials", invoice.partsCents]]
       .map(([label, cents]) => `
         <div class="portal-line">
           <span>${escapeHtml(label)}</span>
@@ -72,7 +111,7 @@
         <div class="card-heading">
           <div>
             <p class="eyebrow">${escapeHtml(invoice.invoiceNumber || "Invoice")}</p>
-            <h2>${escapeHtml(invoice.vehicle || "Your vehicle")}</h2>
+            <h2>${escapeHtml(invoice.vehicle || "Vehicle")}</h2>
           </div>
           <span class="status-pill invoiced">${escapeHtml(calendarDate(invoice.createdAt))}</span>
         </div>
@@ -85,88 +124,70 @@
         </div>
         ${invoice.suggestions ? `
           <div class="portal-notes">
-            <span class="detail-label">What we recommend next</span>
+            <span class="detail-label">What we recommended next</span>
             <p>${escapeHtml(invoice.suggestions)}</p>
           </div>` : ""}
       </article>`;
   }
 
-  function renderInvoices(payload, firstName) {
-    const invoices = Array.isArray(payload.invoices) ? payload.invoices : [];
-    $("portalGreeting").textContent = `${payload.customerName || firstName}'s invoices`;
-    $("portalCount").textContent = invoices.length
-      ? `${invoices.length} invoice${invoices.length === 1 ? "" : "s"} on file.`
-      : "";
+  function renderProfile(customer) {
+    const invoices = Array.isArray(customer.invoices) ? customer.invoices : [];
+    const total = invoices.reduce((sum, invoice) => sum + Number(invoice.totalCents || 0), 0);
+    $("portalName").textContent = customer.name;
+    $("portalSummary").textContent = invoices.length
+      ? `${invoices.length} invoice${invoices.length === 1 ? "" : "s"} · ${money(total)} of work`
+      : "No invoices filed yet.";
     $("portalInvoices").innerHTML = invoices.length
       ? invoices.map(invoiceMarkup).join("")
-      : `<article class="content-card"><p>No invoices are filed under this name and number yet.
-           A job that is still open does not have an invoice until it's finished.</p></article>`;
-    signInView.classList.add("hidden");
-    resultsView.classList.remove("hidden");
+      : `<article class="content-card"><p>No invoices are filed for this customer yet.</p></article>`;
+    directoryView.classList.add("hidden");
+    profileView.classList.remove("hidden");
+    window.scrollTo({ top: 0 });
   }
 
-  async function lookup(firstName, phone) {
-    const response = await fetch(`${SYNC_API}/api/portal/lookup`, {
-      method: "POST",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ firstName, phone })
-    });
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch {
-      payload = null;
-    }
-    if (!response.ok) {
-      throw new Error(payload?.error || "We couldn't reach the invoice system. Try again in a moment.");
-    }
-    return payload || { invoices: [] };
-  }
-
-  async function signIn(firstName, phone, { remember = true } = {}) {
+  async function openCustomer(id) {
     clearError();
-    submitButton.disabled = true;
-    submitButton.textContent = "Checking…";
     try {
-      const payload = await lookup(firstName, phone);
-      if (remember) {
-        sessionStorage.setItem(SESSION_KEY, JSON.stringify({ firstName, phone }));
-      }
-      renderInvoices(payload, firstName);
+      const payload = await getJson(`/api/portal/customers/${encodeURIComponent(id)}`);
+      if (!payload.customer) throw new Error("That customer could not be found.");
+      renderProfile(payload.customer);
+      window.location.hash = `customer/${encodeURIComponent(id)}`;
     } catch (error) {
-      showError(error instanceof Error ? error.message : "Sign-in failed.");
-    } finally {
-      submitButton.disabled = false;
-      submitButton.textContent = "See my invoices";
+      showError(error instanceof Error ? error.message : "Could not open that customer.");
     }
   }
 
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const data = new FormData(form);
-    const firstName = String(data.get("firstName") || "").trim();
-    const phone = String(data.get("phone") || "").trim();
-    if (!firstName || phone.replace(/\D/g, "").length < 10) {
-      showError("Enter your first name and your full 10-digit phone number.");
+  function showDirectory() {
+    profileView.classList.add("hidden");
+    directoryView.classList.remove("hidden");
+    if (window.location.hash) window.location.hash = "";
+  }
+
+  // The list is re-rendered on every search keystroke, so the click handler is
+  // bound once on the container rather than per row — binding per render would
+  // stack a fresh listener on every keystroke and fire a tap several times.
+  listBox.addEventListener("click", (event) => {
+    const button = event.target.closest?.("[data-customer]");
+    if (button) void openCustomer(button.dataset.customer);
+  });
+
+  searchInput.addEventListener("input", renderList);
+  $("portalBack").addEventListener("click", showDirectory);
+
+  async function initialize() {
+    try {
+      const payload = await getJson("/api/portal/customers");
+      customers = Array.isArray(payload.customers) ? payload.customers : [];
+      renderList();
+    } catch (error) {
+      listBox.innerHTML = "";
+      showError(error instanceof Error ? error.message : "Could not load the customer list.");
       return;
     }
-    void signIn(firstName, phone);
-  });
-
-  $("portalSignOut").addEventListener("click", () => {
-    sessionStorage.removeItem(SESSION_KEY);
-    $("portalInvoices").innerHTML = "";
-    form.reset();
-    resultsView.classList.add("hidden");
-    signInView.classList.remove("hidden");
-  });
-
-  // Coming back to the tab within the same session skips re-typing the number.
-  try {
-    const saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
-    if (saved?.firstName && saved?.phone) void signIn(saved.firstName, saved.phone, { remember: false });
-  } catch {
-    sessionStorage.removeItem(SESSION_KEY);
+    // A shared link opens straight to that customer.
+    const deepLink = /^#customer\/(.+)$/.exec(window.location.hash || "");
+    if (deepLink) await openCustomer(decodeURIComponent(deepLink[1]));
   }
+
+  void initialize();
 })();

@@ -11,12 +11,19 @@
  * and needs no fetch on a driveway with one bar of signal.
  *
  * ---------------------------------------------------------------------------
- * STEP        { name, label, prompt, parse, field | apply, optional, confirmEach }
+ * STEP        { name, label, prompt, parse, field | apply, optional, confirmEach,
+ *               patience, aliases }
  *   parse     name | email | phone | sentence | list | plate | yesNo | vehicle
  *             | money:rate | money:amount
  *   field     form input to write the answer into
  *   apply     named writer for answers spanning several fields (see app.js)
  *   optional  "skip" is accepted and leaves it blank
+ *   patience  "normal" (default) cuts about two seconds after you stop; "long"
+ *             waits roughly seven seconds of real silence and lets the answer
+ *             run for minutes. Use it on anything open-ended — a mechanic
+ *             listing work pauses to think, and a short cut-off reads as the
+ *             app hanging up mid-sentence.
+ *   aliases   extra words that point a "fix the ___" repair at this step
  *   prompt    may use {token} for anything already captured in this interview,
  *             so a follow-up names the customer instead of re-asking blind
  *   confirmEach  read this answer back on its own, right after it lands, and
@@ -55,6 +62,7 @@ window.VoiceConfig = {
           {
             name: "customerName",
             label: "the customer name",
+            aliases: ["caller", "spelling", "spelled"],
             prompt: "Whose car are we working on?",
             parse: "name",
             field: "customerName",
@@ -66,6 +74,7 @@ window.VoiceConfig = {
           {
             name: "customerPhone",
             label: "the phone number",
+            aliases: ["cell", "number", "phone"],
             optional: true,
             prompt: "What's {customerName}'s phone number? Say skip if you don't have it.",
             parse: "phone",
@@ -76,6 +85,7 @@ window.VoiceConfig = {
           {
             name: "customerEmail",
             label: "the email",
+            aliases: ["address", "e-mail"],
             optional: true,
             prompt: "What's {customerName}'s email? Say skip if you don't have it.",
             parse: "email",
@@ -88,24 +98,16 @@ window.VoiceConfig = {
         summary: [
           "That's a ",
           { fields: ["vehicleYear", "vehicleMake", "vehicleModel"], join: " " },
-          { field: "vehiclePlate", format: "spell", prefix: ", plate ", fallback: ", no plate" },
           "."
         ],
         steps: [
           {
             name: "vehicle",
             label: "the vehicle",
+            aliases: ["car", "truck", "year", "make", "model"],
             prompt: "What's the year, make, and model for {customerName}'s car?",
             parse: "vehicle",
             apply: "vehicle"
-          },
-          {
-            name: "vehiclePlate",
-            label: "the plate",
-            optional: true,
-            prompt: "What's the plate on {customerName}'s car? Say skip if you don't have it.",
-            parse: "plate",
-            field: "vehiclePlate"
           }
         ]
       },
@@ -119,13 +121,19 @@ window.VoiceConfig = {
           {
             name: "agreedWork",
             label: "the work",
-            prompt: "What things are we going to get done on {customerName}'s car?",
+            aliases: ["job", "doing", "scope", "list"],
+            // Open-ended: this is the one answer that runs long, and being cut
+            // off mid-sentence is what made it look like the app stopped
+            // listening. Long patience waits out a real thinking pause.
+            patience: "long",
+            prompt: "What things are we going to get done on {customerName}'s car? Take your time — I'll wait through the pauses and won't cut you off.",
             parse: "sentence",
             field: "agreedWork"
           },
           {
             name: "laborRateCents",
             label: "the labor rate",
+            aliases: ["hourly", "rate", "charging", "price", "hour"],
             prompt: "What's the rate that we're charging?",
             parse: "money:rate",
             apply: "laborRate"
@@ -147,14 +155,29 @@ window.VoiceConfig = {
           {
             name: "materials",
             label: "the parts",
+            aliases: ["material", "materials", "part"],
             optional: true,
-            prompt: "Do we need any materials?",
+            patience: "long",
+            prompt: "Do we need any materials? Name them all — I'll wait between them.",
             parse: "list",
             apply: "materials"
           }
         ]
       }
     ],
+
+    /**
+     * Said when a read-back comes back wrong. Only the named part is re-asked —
+     * a "no" used to throw away the whole section and re-ask every question in
+     * it, which is why saying "not correct" felt like starting over.
+     * Tokens: {choices} {label}
+     */
+    repair: {
+      which: "Which part should I fix — {choices}? Say the one that's wrong, or say all of it.",
+      fixing: "Okay, let's fix {label}.",
+      whole: "No problem, let's go through that part again.",
+      unclear: "I didn't catch which part. Let's go through it again."
+    },
 
     creating: "Creating the job now.",
     clockIn: {

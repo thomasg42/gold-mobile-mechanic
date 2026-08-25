@@ -1958,3 +1958,64 @@ button {
   margin: 6px 0 0;
   white-space: pre-wrap;
 }
+
+/* ---------------------------------------------------------------- edit cards
+   Every work-order card carries a read view and an edit view. The Edit button
+   swaps them, so a glanceable record stays glanceable and a correction is one
+   tap away instead of a re-typed job. */
+
+.edit-form {
+  display: none;
+}
+
+.content-card.is-editing .edit-form {
+  display: block;
+}
+
+.content-card.is-editing .edit-read {
+  display: none;
+}
+
+.detail-readout {
+  display: grid;
+  gap: 10px;
+}
+
+.readout-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.07);
+}
+
+.readout-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.readout-row strong {
+  font-size: 1rem;
+  font-weight: 650;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.edit-form .form-grid {
+  margin-bottom: 12px;
+}
+
+#editDetailsShortcut {
+  padding: 0;
+}
+
+/* The voice panel says out loud that a pause is on purpose — silence with a
+   blank panel is indistinguishable from a frozen app. */
+.voice-waiting {
+  margin: 6px 0 0;
+  min-height: 1.2em;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+}

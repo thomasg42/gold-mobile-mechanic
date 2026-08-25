@@ -1366,6 +1366,7 @@
           <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status])}</span>
           <span>Opened ${calendarDate(job.createdAt)}</span>
           <span>${money(job.laborRateCents)}/hour</span>
+          ${locked ? "" : `<button class="text-button" id="editDetailsShortcut" type="button">Edit details</button>`}
         </div>
       </div>
 
@@ -1461,14 +1462,89 @@
             </div>
           </article>
 
-          <article class="content-card">
+          <article class="content-card" id="jobDetailsCard">
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Work order details</p>
+                <h2>Customer &amp; vehicle</h2>
+                <p>Every line here can be corrected — name, caller's number, email, vehicle, or plate.</p>
+              </div>
+              ${locked ? "" : `<div class="card-cta"><button class="button button-quiet" type="button" data-edit-toggle="jobDetailsCard">Edit</button></div>`}
+            </div>
+            <div class="edit-read">
+              <div class="detail-readout">
+                <div class="readout-row"><span class="detail-label">Customer</span><strong>${escapeHtml(job.customerName || "Not entered")}</strong></div>
+                <div class="readout-row"><span class="detail-label">Phone</span><strong>${escapeHtml(job.customerPhone || "Not entered")}</strong></div>
+                <div class="readout-row"><span class="detail-label">Email</span><strong>${escapeHtml(job.customerEmail || "Not entered")}</strong></div>
+                <div class="readout-row"><span class="detail-label">Vehicle</span><strong>${escapeHtml(vehicleName(job) || "Not entered")}</strong></div>
+                <div class="readout-row"><span class="detail-label">Plate</span><strong>${escapeHtml(job.vehiclePlate || "Not entered")}</strong></div>
+                <div class="readout-row"><span class="detail-label">Hourly rate</span><strong>${money(job.laborRateCents)}</strong></div>
+              </div>
+            </div>
+            ${locked ? "" : `
+              <div class="edit-form" id="jobDetailsFields">
+                <div class="form-grid">
+                  <label class="field field-wide">
+                    <span>${requiredStar("Customer name")}</span>
+                    <input data-job-field="customerName" autocomplete="name" value="${escapeHtml(job.customerName || "")}">
+                  </label>
+                  <label class="field field-wide">
+                    <span>Caller / phone</span>
+                    <input data-job-field="customerPhone" type="tel" inputmode="tel" value="${escapeHtml(job.customerPhone || "")}" placeholder="406 555 0147">
+                  </label>
+                  <label class="field field-wide">
+                    <span>Email</span>
+                    <input data-job-field="customerEmail" type="email" inputmode="email" value="${escapeHtml(job.customerEmail || "")}">
+                  </label>
+                </div>
+                <div class="form-grid vehicle-grid">
+                  <label class="field">
+                    <span>Year</span>
+                    <input data-job-field="vehicleYear" inputmode="numeric" maxlength="4" value="${escapeHtml(job.vehicleYear || "")}" placeholder="2018">
+                  </label>
+                  <label class="field">
+                    <span>${requiredStar("Make")}</span>
+                    <input data-job-field="vehicleMake" value="${escapeHtml(job.vehicleMake || "")}" placeholder="Ford">
+                  </label>
+                  <label class="field">
+                    <span>${requiredStar("Model")}</span>
+                    <input data-job-field="vehicleModel" value="${escapeHtml(job.vehicleModel || "")}" placeholder="F-150">
+                  </label>
+                  <label class="field">
+                    <span>Plate</span>
+                    <input data-job-field="vehiclePlate" autocapitalize="characters" value="${escapeHtml(job.vehiclePlate || "")}" placeholder="Add it later">
+                  </label>
+                </div>
+                <p class="time-edit-note">The hourly rate lives with the labor total in the Job timer card above, so there is only ever one of it.</p>
+                <div class="save-row">
+                  <button class="button button-quiet" id="saveDetailsButton" type="button">Save details</button>
+                </div>
+                <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>
+              </div>`}
+          </article>
+
+          <article class="content-card" id="agreedWorkCard">
             <div class="card-heading">
               <div>
                 <p class="eyebrow">Approved scope</p>
                 <h2>Agreed work</h2>
               </div>
+              ${locked ? "" : `<div class="card-cta"><button class="button button-quiet" type="button" data-edit-toggle="agreedWorkCard">Edit</button></div>`}
             </div>
-            <p class="work-copy">${escapeHtml(job.agreedWork)}</p>
+            <div class="edit-read">
+              <p class="work-copy">${escapeHtml(job.agreedWork || "No agreed work recorded yet.")}</p>
+            </div>
+            ${locked ? "" : `
+              <div class="edit-form">
+                <label class="field field-wide">
+                  <span>${requiredStar("Work description")}</span>
+                  <textarea class="suggestions" id="agreedWorkInput" rows="4" placeholder="Diagnose no-start condition and replace the agreed failed component.">${escapeHtml(job.agreedWork || "")}</textarea>
+                </label>
+                <div class="save-row">
+                  <button class="button button-quiet" id="saveAgreedWorkButton" type="button">Save agreed work</button>
+                </div>
+                <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>
+              </div>`}
           </article>
 
           <article class="content-card">
@@ -1577,6 +1653,46 @@
   });
 
   function bindJobEvents(job) {
+    /**
+     * Writes the customer and vehicle back onto the job. Every field on a work
+     * order is correctable after the fact — a name heard wrong over a phone, a
+     * plate that was never read, a number typed a digit short.
+     */
+    function persistDetails() {
+      const panel = $("jobDetailsFields");
+      if (!panel) return false;
+      const read = (name) =>
+        String(panel.querySelector(`[data-job-field="${name}"]`)?.value ?? "").trim();
+      const next = {
+        // The name is the one field the customer portal signs in on, so a blank
+        // is treated as "not edited" rather than wiping the record's identity.
+        customerName: read("customerName") || job.customerName || "",
+        customerPhone: read("customerPhone"),
+        customerEmail: read("customerEmail"),
+        vehicleYear: read("vehicleYear"),
+        vehicleMake: read("vehicleMake") || job.vehicleMake || "",
+        vehicleModel: read("vehicleModel") || job.vehicleModel || "",
+        vehiclePlate: read("vehiclePlate").toUpperCase()
+      };
+      const changed = Object.entries(next).some(([key, value]) => String(job[key] || "") !== value);
+      if (!changed) return false;
+      Object.assign(job, next);
+      queueJobSync(job);
+      return true;
+    }
+
+    function persistAgreedWork() {
+      const input = $("agreedWorkInput");
+      if (!input || input.disabled) return false;
+      const next = input.value.trim();
+      // Agreed work is what the invoice bills against; an empty box is a
+      // mis-tap, not an instruction to erase the scope.
+      if (!next || next === (job.agreedWork || "")) return false;
+      job.agreedWork = next;
+      queueJobSync(job);
+      return true;
+    }
+
     function persistSuggestions() {
       const input = $("suggestionsInput");
       if (!input || input.disabled) return false;
@@ -1692,11 +1808,19 @@
 
     function flushJobAutosave() {
       if (job.status === "invoiced") return false;
-      const changed =
-        persistSuggestions() ||
-        persistMaterials() ||
-        persistLabor() ||
-        persistFolder();
+      // Every panel is asked, deliberately without `||`: short-circuiting meant
+      // that editing the suggestions and the labor rate in one visit saved only
+      // the suggestions, and the rate was silently thrown away on the next
+      // render. Each persist* is its own cheap dirty-check.
+      const results = [
+        persistDetails(),
+        persistAgreedWork(),
+        persistSuggestions(),
+        persistMaterials(),
+        persistLabor(),
+        persistFolder()
+      ];
+      const changed = results.some(Boolean);
       if (changed) notifyAutoSaved();
       return changed;
     }
@@ -1719,6 +1843,8 @@
       clockOutButton.addEventListener("click", () => {
         if ($("laborRateInput")) applyLaborFromForm(job);
         if (job.receipts.length) readFolderReceiptInputs(job);
+        persistDetails();
+        persistAgreedWork();
         persistSuggestions();
         persistMaterials();
         const blocked = jobReadyForInvoice(job);
@@ -1754,6 +1880,8 @@
         window.GMMVoice?.prime();
         if ($("laborRateInput")) applyLaborFromForm(job);
         if (job.receipts.length) readFolderReceiptInputs(job);
+        persistDetails();
+        persistAgreedWork();
         persistSuggestions();
         persistMaterials();
         void voiceFinishJob(job);
@@ -1763,6 +1891,58 @@
     document.querySelectorAll("[data-receipt-id]").forEach((button) => {
       button.addEventListener("click", () => viewReceipt(button.dataset.receiptId));
     });
+
+    /**
+     * One Edit button per card. Each editable card ships both views and the
+     * toggle swaps which is showing, so the read-back a mechanic glances at
+     * stays clean and the correction is one tap away rather than buried.
+     */
+    document.querySelectorAll("[data-edit-toggle]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const card = document.getElementById(button.dataset.editToggle);
+        if (!card) return;
+        const editing = card.classList.toggle("is-editing");
+        button.textContent = editing ? "Done" : "Edit";
+        if (editing) {
+          card.querySelector(".edit-form input, .edit-form textarea")?.focus();
+          return;
+        }
+        // Closing the editor is a save, not a discard.
+        flushJobAutosave();
+        void renderJob();
+      });
+    });
+
+    const editDetailsShortcut = $("editDetailsShortcut");
+    if (editDetailsShortcut) {
+      editDetailsShortcut.addEventListener("click", () => {
+        const card = $("jobDetailsCard");
+        const toggle = document.querySelector('[data-edit-toggle="jobDetailsCard"]');
+        if (!card || !toggle) return;
+        if (!card.classList.contains("is-editing")) toggle.click();
+        card.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      });
+    }
+
+    const saveDetailsButton = $("saveDetailsButton");
+    if (saveDetailsButton) {
+      saveDetailsButton.addEventListener("click", () => {
+        persistDetails();
+        notifyAutoSaved();
+        // Always re-render: a blur-triggered autosave may have already taken
+        // the change, and the read view still has to catch up either way.
+        void renderJob();
+      });
+    }
+
+    const saveAgreedWorkButton = $("saveAgreedWorkButton");
+    if (saveAgreedWorkButton) {
+      saveAgreedWorkButton.addEventListener("click", () => {
+        persistAgreedWork();
+        notifyAutoSaved();
+        void renderJob();
+      });
+    }
 
     const saveSuggestionsButton = $("saveSuggestionsButton");
     if (saveSuggestionsButton) {
@@ -3358,6 +3538,10 @@
       name: step.name,
       label: step.label,
       optional: Boolean(step.optional),
+      // How long to wait through a pause before deciding the answer is over,
+      // and the extra words that let "fix the rate" find this step.
+      patience: step.patience,
+      aliases: step.aliases,
       // Prompts are resolved against everything captured so far, so
       // "{customerName}'s car" reads back the name that was just confirmed
       // instead of asking the same generic question a second time.
@@ -3380,7 +3564,10 @@
   function configuredSection(section) {
     return {
       steps: section.steps.map(configuredStep),
-      summary: (captured) => buildSummary(section.summary, captured)
+      summary: (captured) => buildSummary(section.summary, captured),
+      // What Ken says when a read-back comes back wrong, so only the named
+      // part is re-asked instead of the whole section.
+      repair: (voiceConfig.newJob || {}).repair
     };
   }
 
@@ -3537,6 +3724,8 @@
           parts = await ask({
             name: "receiptParts",
             label: "the parts",
+            // A receipt is usually a list read off the paper, with pauses.
+            patience: "long",
             prompt: fillPrompt(copy.parts, { vendor }),
             parse: window.GMMVoice.parse.sentence
           });
@@ -3601,6 +3790,9 @@
         name: "suggestions",
         label: "the recommendations",
         optional: true,
+        // Open-ended, and the answer prints on the invoice — worth waiting out
+        // a thinking pause rather than filing half a sentence.
+        patience: "long",
         prompt: copy.recommendations,
         parse: window.GMMVoice.parse.sentence
       });

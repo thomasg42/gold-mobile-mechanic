@@ -13,10 +13,31 @@
   "use strict";
 
   const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
-  const SILENCE_HOLD_MS = 1200;
-  const MAX_UTTERANCE_MS = 15000;
   const MIN_UTTERANCE_MS = 400;
   const SPEECH_RMS = 0.012;
+
+  /**
+   * How long the app waits before deciding the mechanic is finished talking.
+   *
+   * `silenceHoldMs` is the whole point: a person listing the work on a truck
+   * stops to think, and cutting at the first gap made the app look like it hung
+   * up mid-sentence. Long patience waits out a real pause instead, and only
+   * ends the turn when the silence keeps going.
+   *
+   *   silenceHoldMs  quiet time after speech that ends the turn
+   *   leadInMs       how long to wait for the FIRST word before giving up
+   *   maxMs          hard ceiling so a stuck mic cannot record forever
+   *   fallbackMs     fixed window used on a phone with no audio analyser,
+   *                  where there is no silence to detect
+   */
+  const PATIENCE = {
+    normal: { silenceHoldMs: 2000, leadInMs: 8000, maxMs: 30000, fallbackMs: 8000 },
+    long: { silenceHoldMs: 7000, leadInMs: 15000, maxMs: 180000, fallbackMs: 25000 }
+  };
+
+  function pacingFor(name) {
+    return PATIENCE[name] || PATIENCE.normal;
+  }
 
   let engine = "browser";
   let engineChecked = null;
@@ -40,6 +61,13 @@
       '"': "&quot;",
       "'": "&#39;"
     })[character]);
+  }
+
+  /** Fills {token} placeholders in the short runtime lines this file speaks. */
+  function fill(template, values) {
+    if (!template) return "";
+    return String(template).replace(/\{(\w+)\}/g, (_, key) =>
+      values[key] === null || values[key] === undefined ? "" : String(values[key]));
   }
 
   class VoiceCancelled extends Error {}
@@ -188,7 +216,7 @@
    * clip rather than a live stream keeps the whole thing inside a single
    * getUserMedia grant per interview.
    */
-  async function recordUtterance() {
+  async function recordUtterance(pacing = PATIENCE.normal) {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
@@ -227,11 +255,11 @@
       await sleep(90);
       if (cancelled) break;
       const elapsed = Date.now() - startedAt;
-      if (elapsed > MAX_UTTERANCE_MS) break;
+      if (elapsed > pacing.maxMs) break;
 
       if (!analyser) {
         // No analyser means no silence detection; fall back to a fixed window.
-        if (elapsed > 6000) break;
+        if (elapsed > pacing.fallbackMs) break;
         continue;
       }
 
@@ -242,15 +270,18 @@
         sum += value * value;
       }
       const rms = Math.sqrt(sum / samples.length);
-      setOverlay({ level: Math.min(1, rms / 0.08) });
+      const waiting = heardSpeech && quietSince
+        ? Math.max(0, Math.round((pacing.silenceHoldMs - (Date.now() - quietSince)) / 1000))
+        : null;
+      setOverlay({ level: Math.min(1, rms / 0.08), waiting });
 
       if (rms > SPEECH_RMS) {
         heardSpeech = true;
         quietSince = 0;
       } else if (heardSpeech) {
         if (!quietSince) quietSince = Date.now();
-        else if (Date.now() - quietSince > SILENCE_HOLD_MS && elapsed > MIN_UTTERANCE_MS) break;
-      } else if (elapsed > 7000) {
+        else if (Date.now() - quietSince > pacing.silenceHoldMs && elapsed > MIN_UTTERANCE_MS) break;
+      } else if (elapsed > pacing.leadInMs) {
         // Nothing was ever said — stop rather than record the driveway.
         break;
       }
@@ -269,8 +300,8 @@
     return { blob, heardSpeech };
   }
 
-  async function listenWithElevenLabs() {
-    const { blob, heardSpeech } = await recordUtterance();
+  async function listenWithElevenLabs(pacing) {
+    const { blob, heardSpeech } = await recordUtterance(pacing);
     assertLive();
     if (!heardSpeech || blob.size < 1200) return "";
     setOverlay({ state: "thinking" });
@@ -287,65 +318,145 @@
     return String(payload?.text || "").trim();
   }
 
-  function listenWithBrowser() {
+  /**
+   * The phone's own recogniser, taught to sit through a pause.
+   *
+   * Left alone it ends the turn at the first gap — iOS ignores `continuous`
+   * entirely and fires `onend` a beat after you stop — which is exactly the
+   * "it cut me off mid-sentence" complaint. So the turn is owned here, not by
+   * the recogniser: every `onend` inside the patience window simply restarts
+   * it and keeps appending, and the turn ends only on real silence, on the
+   * hard ceiling, or when nothing is ever said.
+   */
+  function listenWithBrowser(pacing = PATIENCE.normal) {
     return new Promise((resolve, reject) => {
       const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (!Recognition) {
         reject(new Error("This phone has no speech recognition."));
         return;
       }
-      const recognition = new Recognition();
-      activeRecognition = recognition;
-      recognition.lang = "en-US";
-      recognition.interimResults = true;
-      recognition.maxAlternatives = 1;
-      let best = "";
+
+      const startedAt = Date.now();
+      let finalText = "";
+      let liveText = "";
+      let lastVoiceAt = Date.now();
       let settled = false;
+      let current = null;
+      let watchdog = null;
+
+      // Finalised text survives each restart; only the interim tail is replaced.
+      const transcript = () => `${finalText}${liveText}`.replace(/\s+/g, " ").trim();
+
       const finish = (value) => {
         if (settled) return;
         settled = true;
+        clearInterval(watchdog);
         activeRecognition = null;
         try {
-          recognition.stop();
+          current?.stop();
         } catch {
           /* Already stopped. */
         }
-        resolve(value.trim());
+        resolve(String(value || "").trim());
       };
-      recognition.onresult = (event) => {
-        let text = "";
-        for (let index = 0; index < event.results.length; index += 1) {
-          text += event.results[index][0].transcript;
+
+      const listenLonger = () => {
+        const recognition = new Recognition();
+        current = recognition;
+        activeRecognition = recognition;
+        recognition.lang = "en-US";
+        recognition.interimResults = true;
+        recognition.maxAlternatives = 1;
+        // Honoured on desktop, ignored on iOS — the restart below covers both.
+        recognition.continuous = true;
+
+        recognition.onresult = (event) => {
+          let interim = "";
+          for (let index = event.resultIndex ?? 0; index < event.results.length; index += 1) {
+            const result = event.results[index];
+            if (result.isFinal) finalText += `${result[0].transcript} `;
+            else interim += result[0].transcript;
+          }
+          liveText = interim;
+          lastVoiceAt = Date.now();
+          setOverlay({ heard: transcript() });
+        };
+
+        recognition.onerror = (event) => {
+          // "no-speech" and "aborted" are what a pause looks like; only a
+          // refused microphone is actually fatal.
+          const code = event?.error;
+          if (code === "not-allowed" || code === "service-not-allowed") finish(transcript());
+        };
+
+        recognition.onend = () => {
+          if (settled || cancelled) {
+            finish(transcript());
+            return;
+          }
+          // A restart drops whatever interim tail was never finalised, so keep
+          // it rather than losing the last few words of a long answer.
+          if (liveText.trim()) {
+            finalText += `${liveText.trim()} `;
+            liveText = "";
+          }
+          const spoken = transcript();
+          const elapsed = Date.now() - startedAt;
+          const quietFor = Date.now() - lastVoiceAt;
+          if (elapsed >= pacing.maxMs) return finish(spoken);
+          if (spoken && quietFor >= pacing.silenceHoldMs) return finish(spoken);
+          if (!spoken && elapsed >= pacing.leadInMs) return finish("");
+          try {
+            listenLonger();
+          } catch {
+            finish(spoken);
+          }
+        };
+
+        try {
+          recognition.start();
+        } catch {
+          finish(transcript());
         }
-        best = text;
-        setOverlay({ heard: text });
       };
-      recognition.onerror = () => finish(best);
-      recognition.onend = () => finish(best);
-      try {
-        recognition.start();
-      } catch {
-        finish("");
-      }
-      setTimeout(() => finish(best), MAX_UTTERANCE_MS);
+
+      // `continuous` recognisers never fire `onend` during a pause, so the
+      // silence cut is enforced here as well as in `onend`.
+      watchdog = setInterval(() => {
+        if (settled) return;
+        if (cancelled) return finish(transcript());
+        const elapsed = Date.now() - startedAt;
+        const quietFor = Date.now() - lastVoiceAt;
+        const spoken = transcript();
+        if (spoken) {
+          const remaining = Math.max(0, Math.round((pacing.silenceHoldMs - quietFor) / 1000));
+          setOverlay({ waiting: quietFor > 900 ? remaining : null });
+        }
+        if (elapsed >= pacing.maxMs) return finish(spoken);
+        if (spoken && quietFor >= pacing.silenceHoldMs) return finish(spoken);
+        if (!spoken && elapsed >= pacing.leadInMs) return finish("");
+      }, 250);
+
+      listenLonger();
     });
   }
 
-  async function listen() {
+  async function listen(patience) {
     assertLive();
-    setOverlay({ state: "listening", heard: "" });
+    const pacing = pacingFor(patience);
+    setOverlay({ state: "listening", heard: "", waiting: null });
     let heard = "";
     if ((await detectEngine()) === "elevenlabs") {
       try {
-        heard = await listenWithElevenLabs();
+        heard = await listenWithElevenLabs(pacing);
       } catch (error) {
         if (error instanceof VoiceCancelled) throw error;
         heard = "";
       }
     }
-    if (!heard && engine !== "elevenlabs") heard = await listenWithBrowser();
+    if (!heard && engine !== "elevenlabs") heard = await listenWithBrowser(pacing);
     assertLive();
-    setOverlay({ heard });
+    setOverlay({ heard, waiting: null });
     return heard;
   }
 
@@ -463,7 +574,12 @@
   }
 
   const AFFIRMATIVE = /\b(yes|yeah|yep|yup|correct|right|affirmative|sure|good|perfect|that's it|thats it|looks good|sounds good|ok|okay)\b/i;
-  const NEGATIVE = /\b(no|nope|nah|negative|wrong|incorrect|not right|change|fix|redo)\b/i;
+  // "not correct" is the phrase Thomas actually says, and it used to be read as
+  // a YES — NEGATIVE never matched it, and AFFIRMATIVE matched the word
+  // "correct" sitting inside it. Every negation that wraps an affirmative word
+  // ("not right", "isn't correct", "that's not it") is spelled out here, and
+  // NEGATIVE is still tested first.
+  const NEGATIVE = /\b(no|nope|nah|negative|wrong|incorrect|nay|change|fix|redo|scratch that)\b|\b(?:not|isn'?t|ain'?t|aren'?t|is not|that'?s not)\s+(?:quite\s+|really\s+|totally\s+|all\s+)?(?:correct|right|it|good|true|the one)\b/i;
   const SKIP = /\b(skip|none|nothing|no thanks|don't have|dont have|not sure|pass|leave it|blank)\b/i;
 
   function parseYesNo(text) {
@@ -651,6 +767,7 @@
         </div>
         <p class="voice-question" id="voiceQuestion"></p>
         <p class="voice-heard" id="voiceHeard"></p>
+        <p class="voice-waiting" id="voiceWaiting"></p>
         <div class="voice-typed hidden" id="voiceTypedRow">
           <input id="voiceTypedInput" placeholder="Type the answer" autocomplete="off">
           <button class="button button-gold" id="voiceTypedSubmit" type="button">Use this</button>
@@ -705,12 +822,20 @@
     if (patch.level !== undefined) {
       overlay.querySelector("#voiceOrb").style.setProperty("--voice-level", String(patch.level));
     }
+    // A long pause is deliberate, so say so — silence with a blank panel is
+    // indistinguishable from a frozen app.
+    if (patch.waiting !== undefined) {
+      const line = overlay.querySelector("#voiceWaiting");
+      line.textContent = patch.waiting === null || patch.waiting === undefined
+        ? ""
+        : `Still listening — take your time (${patch.waiting}s)`;
+    }
   }
 
   function showOverlay() {
     buildOverlay();
     if (!overlay.open) overlay.showModal();
-    setOverlay({ state: "idle", question: "", heard: "" });
+    setOverlay({ state: "idle", question: "", heard: "", waiting: null });
   }
 
   /**
@@ -820,7 +945,7 @@
       await speak(attempts === 1 ? prompt : step.retry || `Sorry — ${prompt}`);
       assertLive();
 
-      const heard = await Promise.race([listen(), typedAnswer()]);
+      const heard = await Promise.race([listen(step.patience), typedAnswer()]);
       assertLive();
 
       if (!heard) continue;
@@ -855,46 +980,137 @@
    * already phrased as a question is asked verbatim, so a step can use its own
    * wording ("Is Jon, spelled J-O-N, correct?") instead of the generic tail.
    */
-  async function confirm(summary) {
+  async function confirmHeard(summary) {
     const question = /\?\s*$/.test(String(summary || "")) ? String(summary) : `${summary} Is that correct?`;
     let attempts = 0;
+    let heard = "";
     while (attempts < 3) {
       attempts += 1;
       await speak(attempts === 1 ? question : "Is that correct? Yes or no.");
-      const heard = await Promise.race([listen(), typedAnswer()]);
+      heard = await Promise.race([listen(), typedAnswer()]);
       assertLive();
       const answer = parseYesNo(heard);
-      if (answer !== null) return answer;
+      // The rejection usually names the problem in the same breath — "no, the
+      // phone number is wrong" — so the raw words go back to the caller and
+      // only the named part gets re-asked.
+      if (answer !== null) return { answer, heard };
     }
-    return false;
+    return { answer: false, heard };
+  }
+
+  async function confirm(summary) {
+    return (await confirmHeard(summary)).answer;
+  }
+
+  /** "the customer name" -> "customer name" */
+  function stepLabel(step) {
+    return String(step?.label || step?.name || "that part").replace(/^the\s+/i, "");
+  }
+
+  /** Joins labels the way a person reads a list: "a, b, or c". */
+  function orList(values) {
+    if (values.length <= 1) return values[0] || "";
+    return `${values.slice(0, -1).join(", ")}, or ${values.at(-1)}`;
   }
 
   /**
+   * Works out which single step a rejection is pointing at. Scored rather than
+   * first-match, because "the customer's phone number" mentions both the
+   * customer name and the phone number and only one of them is the answer.
+   * A tie is deliberately no match — guessing the wrong field to re-ask is
+   * worse than asking which one.
+   */
+  function matchStep(steps, heard) {
+    const raw = ` ${String(heard || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ")} `;
+    if (!raw.trim()) return null;
+    let best = null;
+    let bestScore = 0;
+    let tied = false;
+    for (const step of steps) {
+      const terms = [
+        ...stepLabel(step).toLowerCase().split(/\s+/),
+        ...(step.aliases || []).map((alias) => String(alias).toLowerCase())
+      ].filter((term) => term.length > 2);
+      const score = new Set(terms.filter((term) => raw.includes(` ${term} `))).size;
+      if (!score) continue;
+      if (score > bestScore) {
+        best = step;
+        bestScore = score;
+        tied = false;
+      } else if (score === bestScore) {
+        tied = true;
+      }
+    }
+    return tied ? null : best;
+  }
+
+  const WHOLE_SECTION = /\b(all of it|all of them|everything|the whole thing|start over|over again|both)\b/i;
+
+  /**
    * Runs one section: asks every step, writes each answer into its real form
-   * field as it lands, then reads the whole section back. A "no" re-asks the
-   * section rather than guessing which field was wrong.
+   * field as it lands, then reads the whole section back.
+   *
+   * A "no" used to throw the entire section away and re-ask every question in
+   * it, so correcting one digit of a phone number meant re-dictating the name
+   * and the email too. Now the rejection is read for which part is wrong —
+   * either from the same breath ("no, the phone number") or from one follow-up
+   * question — and only that step is asked again. Everything already confirmed
+   * stays exactly as captured.
    */
   async function runSection(section, context = {}) {
-    for (let pass = 0; pass < 3; pass += 1) {
-      // Prompts read from everything captured so far, this section and every
-      // section before it, so a follow-up can name the customer instead of
-      // asking the same generic question again.
-      const captured = {};
-      for (const step of section.steps) {
-        const seen = { ...context, ...captured };
-        if (step.when && !step.when(seen)) continue;
-        const value = await ask(step, seen);
-        captured[step.name] = value;
-        if (step.apply) step.apply(value, captured);
-        Object.assign(context, captured);
-      }
-      if (!section.summary) return captured;
-      if (await confirm(section.summary(captured))) {
+    const repair = section.repair || {};
+    const captured = {};
+
+    const askStep = async (step) => {
+      const seen = { ...context, ...captured };
+      if (step.when && !step.when(seen)) return;
+      const value = await ask(step, seen);
+      captured[step.name] = value;
+      if (step.apply) step.apply(value, captured);
+      Object.assign(context, captured);
+    };
+
+    const askAll = async () => {
+      for (const step of section.steps) await askStep(step);
+    };
+
+    await askAll();
+    if (!section.summary) return captured;
+
+    for (let pass = 0; pass < 4; pass += 1) {
+      const { answer, heard } = await confirmHeard(section.summary(captured));
+      if (answer) {
         await speak(section.done || "Got it.");
         return captured;
       }
-      await speak(pass < 2 ? "No problem, let's go through that again." : "Let's try once more.");
+
+      // One-step sections have nothing to disambiguate.
+      let target = section.steps.length === 1 ? section.steps[0] : matchStep(section.steps, heard);
+      let wholeSection = WHOLE_SECTION.test(heard || "");
+
+      if (!target && !wholeSection && pass < 3) {
+        const choices = orList(section.steps.map(stepLabel));
+        await speak(fill(repair.which, { choices })
+          || `Which part should I fix — ${choices}? Say the one that's wrong, or say all of it.`);
+        const named = await Promise.race([listen(), typedAnswer()]);
+        assertLive();
+        target = matchStep(section.steps, named);
+        wholeSection = !target && WHOLE_SECTION.test(named || "");
+      }
+
+      if (target && !wholeSection) {
+        await speak(fill(repair.fixing, { label: target.label || stepLabel(target) })
+          || `Okay, let's fix ${stepLabel(target)}.`);
+        await askStep(target);
+        continue;
+      }
+
+      await speak((wholeSection ? repair.whole : repair.unclear)
+        || repair.whole
+        || "No problem, let's go through that part again.");
+      await askAll();
     }
+
     await speak("Let's finish this part by hand.");
     throw new Error("Section was not confirmed.");
   }

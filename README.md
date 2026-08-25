@@ -26,6 +26,10 @@ last-known recovery copy and queues changes while offline.
    `jobs/{jobId}/receipts/` and their vendor, amount, filename, MIME type, and
    timestamp are stored with the job.
 4. Save the mechanic's suggestions. They print directly on the invoice.
+4a. Correct anything, any time. Every card on a work order carries an Edit
+   button — customer name, caller's phone, email, vehicle, plate, agreed work,
+   materials, hourly rate, and suggestions are all editable after creation and
+   sync back to the cloud ledger on save.
 5. Clock out at the bottom of the job. This freezes billable work time.
 6. Review the receipt folder. Invoice creation stays locked until clock-out and
    this explicit review are both complete.

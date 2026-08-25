@@ -82,6 +82,9 @@ button {
 
 .brand {
   display: inline-flex;
+  /* The topbar now carries a Save button. The wordmark yields to it rather
+     than pushing the row past the screen edge on a 320px phone. */
+  min-width: 0;
   align-items: center;
   gap: 12px;
   padding: 0;
@@ -972,6 +975,46 @@ button {
   border-bottom: 1px solid var(--line);
 }
 
+/* Save, the save-state pill, and the close × ride together at the top right
+   of the sheet so the answer to "did that save?" is beside the control that
+   answers it, not buried at the bottom of a scrolling form. */
+.sheet-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.button-compact {
+  min-height: 40px;
+  padding: 0 16px;
+  font-size: 11px;
+}
+
+.save-pill {
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: #6c7276;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.save-pill[data-state="typing"] {
+  border-color: rgba(208, 168, 67, 0.5);
+  color: #8a6d1f;
+}
+
+.save-pill[data-state="draft"],
+.save-pill[data-state="saved"] {
+  border-color: rgba(88, 182, 138, 0.5);
+  background: rgba(88, 182, 138, 0.11);
+  color: #2f7a55;
+}
+
 .icon-button {
   display: grid;
   width: 40px;
@@ -1513,9 +1556,55 @@ button {
   }
 
   .topbar-meta {
-    max-width: 90px;
+    max-width: 60%;
+    flex: 0 0 auto;
+    gap: 6px;
     font-size: 8px;
     line-height: 1.25;
+  }
+
+  .topbar-meta #storageLabel {
+    overflow: hidden;
+    max-width: 62px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbar-meta #portalLink {
+    overflow: hidden;
+    max-width: 56px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Nothing in the wordmark is dropped — it just gives ground before the row
+     can push past the edge of a 320px screen. */
+  .brand > span:not(.brand-mark) {
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .brand strong,
+  .brand small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbar-meta .button-compact {
+    min-height: 36px;
+    padding: 0 12px;
+  }
+
+  .sheet-header-actions {
+    gap: 7px;
+  }
+
+  .save-pill {
+    padding: 4px 8px;
+    font-size: 9px;
+    letter-spacing: 0.06em;
   }
 
   .page {

@@ -25,6 +25,7 @@
     <div class="topbar-meta">
       <span class="signal-dot" id="syncDot" data-sync="disconnected" aria-hidden="true"></span>
       <span id="storageLabel">Connecting cloud ledger</span>
+      <button class="button button-gold button-compact" id="saveAllButton" type="button">Save</button>
       <a href="./portal.html" id="portalLink">Customer portal</a>
     </div>
   </header>
@@ -75,13 +76,17 @@
   </main>
 
   <dialog class="sheet" id="jobDialog">
-    <form id="jobForm">
+    <form id="jobForm" novalidate>
       <div class="sheet-header">
         <div>
           <p class="eyebrow">Open a work order</p>
           <h2>New job</h2>
         </div>
-        <button class="icon-button" id="closeJobDialog" type="button" aria-label="Close">×</button>
+        <div class="sheet-header-actions">
+          <span class="save-pill" id="jobDraftState" data-state="idle">Auto-saving</span>
+          <button class="button button-gold button-compact" id="saveJobButton" type="submit">Save</button>
+          <button class="icon-button" id="closeJobDialog" type="button" aria-label="Close">×</button>
+        </div>
       </div>
 
       <div class="form-section">
@@ -150,7 +155,7 @@
       </div>
 
       <p class="form-error hidden" id="jobFormError"></p>
-      <p class="time-edit-note">This draft auto-saves as you type. Hit Create job to save it as a real job.</p>
+      <p class="time-edit-note">This draft auto-saves as you type. Save (top right) or Create job writes it to the ledger for good.</p>
       <div class="sheet-actions">
         <button class="button button-quiet" id="cancelJobButton" type="button">Cancel</button>
         <button class="button button-gold" type="submit">Create job</button>

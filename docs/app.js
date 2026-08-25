@@ -40,6 +40,7 @@
   let activeObjectUrls = [];
   let toastTimer = null;
   let syncInFlight = null;
+  let syncQueueDirty = false;
   let ocrWorkerPromise = null;
   let pendingScan = { vendor: "", amount: 0, orderId: "", receiptParts: "" };
 
@@ -374,74 +375,103 @@
     return response;
   }
 
+  /**
+   * Drains everything waiting to reach the cloud: deletes, clock events, job
+   * bodies, then receipt files.
+   *
+   * Two things here look fussy and are not. First, the in-flight lock is
+   * claimed BEFORE the body is allowed to finish. An empty queue drains
+   * without ever hitting an await, so the body used to run start to finish —
+   * clearing `syncInFlight` in its own `finally` — before the assignment that
+   * installs it had even executed. The assignment then re-installed an
+   * already-settled promise and every later flush returned it instantly
+   * without doing any work. On a phone that is one line: the first sync at
+   * boot has nothing to send, so nothing the mechanic entered afterwards ever
+   * uploaded. The job lived only in this phone's storage until Safari evicted
+   * it, which is exactly what "I made the customer, clocked in, and it deleted
+   * itself" looks like from the driveway.
+   *
+   * Second, work queued while a pass is already running is retried by that
+   * pass rather than dropped. `pendingJobIds()` is read once per pass, so a
+   * job saved a moment after the pass started would otherwise sit in the queue
+   * with nothing left to trigger it.
+   */
   async function flushSyncQueue() {
-    if (syncInFlight) return syncInFlight;
+    if (syncInFlight) {
+      syncQueueDirty = true;
+      return syncInFlight;
+    }
     if (!navigator.onLine) {
       setSyncStatus("pending");
       return;
     }
 
-    syncInFlight = (async () => {
+    const run = (async () => {
+      // Yields so the assignment below lands before this body can clear it.
+      await Promise.resolve();
       setSyncStatus("syncing");
       try {
-        let deleteIds = pendingDeletes();
-        for (const id of deleteIds) {
-          await cloudFetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
-          deleteIds = deleteIds.filter((value) => value !== id);
-          writeStorageArray(PENDING_DELETES_STORAGE, deleteIds);
-        }
-
-        // Clock events go before job bodies and receipts: they are the
-        // smallest, most time-sensitive writes in the queue.
-        for (const item of pendingClockEvents()) {
-          await pushClockEvent(item);
-        }
-
-        let jobIds = pendingJobIds();
-        for (const id of jobIds) {
-          const job = findJob(id);
-          if (!job) continue;
-          const response = await cloudFetch(`/api/jobs/${encodeURIComponent(id)}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(job)
-          });
-          const payload = await response.json();
-          // A job the mechanic touched while this request was in the air is
-          // newer than the answer coming back. Clock in and clock out are one
-          // tap each and can easily land inside that window, so a stale echo
-          // must never be allowed to undo them.
-          const local = findJob(id);
-          const localTime = Date.parse(String(local?.updatedAt || 0));
-          const remoteTime = Date.parse(String(payload.job?.updatedAt || 0));
-          if (!Number.isFinite(localTime) || !Number.isFinite(remoteTime) || remoteTime >= localTime) {
-            replaceJob(payload.job);
+        do {
+          syncQueueDirty = false;
+          let deleteIds = pendingDeletes();
+          for (const id of deleteIds) {
+            await cloudFetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+            deleteIds = deleteIds.filter((value) => value !== id);
+            writeStorageArray(PENDING_DELETES_STORAGE, deleteIds);
           }
-          jobIds = jobIds.filter((value) => value !== id);
-          writeStorageArray(PENDING_JOBS_STORAGE, jobIds);
-          saveState();
-        }
 
-        let receipts = pendingReceipts();
-        for (const item of receipts) {
-          const stored = await getReceipt(item.receiptId).catch(() => null);
-          if (stored?.blob) {
-            await cloudFetch(
-              `/api/jobs/${encodeURIComponent(item.jobId)}/receipts/${encodeURIComponent(item.receiptId)}`,
-              {
-                method: "PUT",
-                headers: { "Content-Type": stored.blob.type || "image/jpeg" },
-                body: stored.blob
-              }
+          // Clock events go before job bodies and receipts: they are the
+          // smallest, most time-sensitive writes in the queue.
+          for (const item of pendingClockEvents()) {
+            await pushClockEvent(item);
+          }
+
+          let jobIds = pendingJobIds();
+          for (const id of jobIds) {
+            const job = findJob(id);
+            if (!job) continue;
+            const response = await cloudFetch(`/api/jobs/${encodeURIComponent(id)}`, {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(job)
+            });
+            const payload = await response.json();
+            // A job the mechanic touched while this request was in the air is
+            // newer than the answer coming back. Clock in and clock out are one
+            // tap each and can easily land inside that window, so a stale echo
+            // must never be allowed to undo them.
+            const local = findJob(id);
+            const localTime = Date.parse(String(local?.updatedAt || 0));
+            const remoteTime = Date.parse(String(payload.job?.updatedAt || 0));
+            if (!Number.isFinite(localTime) || !Number.isFinite(remoteTime) || remoteTime >= localTime) {
+              replaceJob(payload.job);
+            }
+            jobIds = jobIds.filter((value) => value !== id);
+            writeStorageArray(PENDING_JOBS_STORAGE, jobIds);
+            saveState();
+          }
+
+          let receipts = pendingReceipts();
+          for (const item of receipts) {
+            const stored = await getReceipt(item.receiptId).catch(() => null);
+            if (stored?.blob) {
+              await cloudFetch(
+                `/api/jobs/${encodeURIComponent(item.jobId)}/receipts/${encodeURIComponent(item.receiptId)}`,
+                {
+                  method: "PUT",
+                  headers: { "Content-Type": stored.blob.type || "image/jpeg" },
+                  body: stored.blob
+                }
+              );
+            }
+            receipts = receipts.filter(
+              (value) => value.jobId !== item.jobId || value.receiptId !== item.receiptId
             );
+            writeStorageArray(PENDING_RECEIPTS_STORAGE, receipts);
           }
-          receipts = receipts.filter(
-            (value) => value.jobId !== item.jobId || value.receiptId !== item.receiptId
-          );
-          writeStorageArray(PENDING_RECEIPTS_STORAGE, receipts);
-        }
-        localStorage.setItem("gold-mobile-mechanic-last-sync", new Date().toISOString());
-        saveState();
+          localStorage.setItem("gold-mobile-mechanic-last-sync", new Date().toISOString());
+          saveState();
+        } while (syncQueueDirty);
         setSyncStatus("synced");
       } catch (error) {
         setSyncStatus(navigator.onLine ? "error" : "pending");
@@ -451,7 +481,8 @@
       }
     })();
 
-    return syncInFlight;
+    syncInFlight = run;
+    return run;
   }
 
   async function syncFromCloud() {
@@ -2156,6 +2187,7 @@
     }
     try {
       localStorage.setItem(NEW_JOB_DRAFT_STORAGE, JSON.stringify(draft));
+      setJobDraftState("draft");
       notifyAutoSaved();
     } catch {
       // Job list storage may be full; the explicit Create job save still works.
@@ -2164,8 +2196,52 @@
 
   let jobDraftAutosaveTimer = null;
   function scheduleJobDraftAutosave() {
+    setJobDraftState("typing");
     clearTimeout(jobDraftAutosaveTimer);
     jobDraftAutosaveTimer = setTimeout(saveJobDraft, 500);
+  }
+
+  /**
+   * The one place the New Job sheet says out loud whether the work is safe.
+   * A toast disappears; this stays put next to the Save button so the answer
+   * is on screen at the moment the question gets asked.
+   */
+  function setJobDraftState(mode) {
+    const pill = $("jobDraftState");
+    if (!pill) return;
+    const copy = {
+      idle: "Auto-saving",
+      typing: "Saving…",
+      draft: "Draft saved",
+      saved: "Saved"
+    };
+    pill.textContent = copy[mode] || copy.idle;
+    pill.dataset.state = mode;
+  }
+
+  // Every field the ledger cannot do without. `required` stays on the markup
+  // for assistive tech, but the form is `novalidate` so this list — not a
+  // native bubble pinned to a field scrolled out of the sheet — is what the
+  // mechanic actually reads when a tap on Save appears to do nothing.
+  const REQUIRED_JOB_FIELDS = [
+    ["customerName", "customer name"],
+    ["vehicleMake", "vehicle make"],
+    ["vehicleModel", "vehicle model"],
+    ["agreedWork", "work description"],
+    ["laborRate", "labor rate"]
+  ];
+
+  function showJobFormError(message) {
+    const box = $("jobFormError");
+    box.textContent = message;
+    box.classList.remove("hidden");
+  }
+
+  function focusJobField(name) {
+    const field = jobForm.querySelector(`[name="${name}"]`);
+    if (!field) return;
+    field.focus?.();
+    field.scrollIntoView?.({ block: "center" });
   }
 
   function applyJobDraft(draft) {
@@ -2194,6 +2270,7 @@
       addMaterialRow();
     }
     $("jobFormError").classList.add("hidden");
+    setJobDraftState(draft ? "draft" : "idle");
     jobDialog.showModal();
   }
 
@@ -2213,10 +2290,26 @@
   jobForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const data = new FormData(jobForm);
+
+    const missing = REQUIRED_JOB_FIELDS.filter(([name]) => !String(data.get(name) || "").trim());
+    if (missing.length) {
+      const names = missing.map(([, label]) => label);
+      showJobFormError(
+        names.length === 1
+          ? `Add the ${names[0]} and the job will save.`
+          : `Add the ${names.slice(0, -1).join(", ")} and ${names.at(-1)} and the job will save.`
+      );
+      focusJobField(missing[0][0]);
+      // Nothing is lost while the missing field is filled in.
+      saveJobDraft();
+      return;
+    }
+
     const laborRateCents = parseCents(data.get("laborRate"));
     if (!laborRateCents) {
-      $("jobFormError").textContent = "Enter a labor rate greater than zero.";
-      $("jobFormError").classList.remove("hidden");
+      showJobFormError("Enter a labor rate greater than zero.");
+      focusJobField("laborRate");
+      saveJobDraft();
       return;
     }
 
@@ -2262,13 +2355,35 @@
     };
 
     state.jobs.push(job);
+    // Written to this phone before anything else can throw or navigate away.
     queueJobSync(job);
     clearTimeout(jobDraftAutosaveTimer);
     clearJobDraft();
+    setJobDraftState("saved");
     jobDialog.close();
-    notify(`${job.id} created.`);
+    notify(`${job.customerName} saved · ${job.id}`);
     openJob(job.id);
+    void confirmJobSaved(job);
   });
+
+  /**
+   * Says where the new customer actually ended up. "Created" on its own is the
+   * claim that caused the distrust: it was true of this phone's storage and
+   * said nothing about the cloud, so a job that never uploaded still looked
+   * filed right up until the phone forgot it.
+   */
+  async function confirmJobSaved(job) {
+    try {
+      await flushSyncQueue();
+    } catch {
+      // The queue state below is the honest answer either way.
+    }
+    if (pendingJobIds().includes(job.id)) {
+      notify(`${job.customerName} is saved on this phone. It uploads by itself when service returns.`);
+      return;
+    }
+    notify(`${job.customerName} saved to the cloud ledger · ${job.id}`);
+  }
 
   function draftTotalCents() {
     return draftReceipts.reduce((total, receipt) => total + Number(receipt.amountCents || 0), 0);
@@ -3532,6 +3647,42 @@
     window.GMMVoice?.prime();
     void voiceNewJob();
   });
+  /**
+   * The button Thomas asked for: one tap, anywhere in the app, that writes
+   * everything down and says plainly whether it made it off the phone. It is
+   * deliberately not the same as "Sync now" — that pulls the cloud's copy down
+   * first, which is the wrong move when the thing you are worried about is the
+   * work sitting on this phone.
+   */
+  $("saveAllButton").addEventListener("click", async () => {
+    const button = $("saveAllButton");
+    button.disabled = true;
+    try {
+      // Anything half-typed in the open New Job sheet goes down first.
+      if (jobDialog.open) {
+        clearTimeout(jobDraftAutosaveTimer);
+        saveJobDraft();
+      }
+      saveState();
+      await flushSyncQueue();
+      const waiting =
+        pendingJobIds().length + pendingReceipts().length +
+        pendingDeletes().length + pendingClockEvents().length;
+      notify(waiting
+        ? `Saved on this phone. ${waiting} change${waiting === 1 ? "" : "s"} still uploading.`
+        : `Everything saved · ${state.jobs.length} job${state.jobs.length === 1 ? "" : "s"} in the cloud ledger.`);
+    } catch (error) {
+      notify(
+        error instanceof Error
+          ? `Saved on this phone, but the cloud did not answer: ${error.message}`
+          : "Saved on this phone; the cloud did not answer.",
+        true
+      );
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   $("syncButton").addEventListener("click", async () => {
     if (await ensureCloudSync()) {
       renderBoard();

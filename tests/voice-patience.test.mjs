@@ -1,26 +1,32 @@
 /**
- * Drives the shipped docs/voice.js + docs/voice-config.js + docs/app.js through
- * a whole "New job by voice" interview in a real DOM, with a scripted speech
- * recogniser standing in for the phone's.
+ * Drives the shipped docs/voice.js + docs/assistant.js + docs/app.js through a
+ * whole Talk it in conversation in a real DOM, with a scripted speech
+ * recogniser standing in for the phone's and the Worker's agent route stubbed.
  *
- * Three defects are pinned here, all reported from the driveway:
+ * Two defects are pinned here, both reported from the driveway, and both still
+ * live after the scripted new-job interview was replaced by the shop agent —
+ * because the agent listens through the same `GMMVoice` turn:
  *
  *  1. THE CUT-OFF. The browser recogniser ends the turn at the first gap, so
  *     listing the work on a truck — which has thinking pauses in it — filed
- *     half a sentence and moved on. The recorded turn is now owned by the app:
- *     an `onend` inside the patience window restarts the recogniser and keeps
- *     appending, and only real silence ends the answer.
+ *     half a sentence and moved on. The recorded turn is owned by the app: an
+ *     `onend` inside the patience window restarts the recogniser and keeps
+ *     appending, and only real silence ends the answer. The agent asks its
+ *     open questions with `listen("long")`, so half an answer reaching the
+ *     model is the same defect wearing a new hat — and worse, because the
+ *     model would confidently write the half it got onto the invoice.
  *
  *  2. "NOT CORRECT" MEANT YES. The negative pattern never matched the phrase,
  *     and the affirmative one matched the word "correct" sitting inside it, so
- *     rejecting a read-back confirmed it instead.
+ *     rejecting a read-back confirmed it instead. The agent runs the same
+ *     `parse.yesNo` on its final read-back, where a false yes does not just
+ *     mis-file a field — it saves the whole job.
  *
- *  3. A "no" THREW AWAY THE WHOLE SECTION. Correcting one digit of a phone
- *     number re-asked the name and the email too. Only the named step is
- *     re-asked now.
- *
- * The plate question is also gone from the interview — Thomas does not want to
- * be asked for it — while the plate itself stays an editable field on the job.
+ * The third defect this file used to pin — a "no" re-asking a whole section
+ * instead of the named step — was a property of the scripted step runner. That
+ * runner still exists and still serves the receipt and closeout interviews, but
+ * opening a job no longer goes through it, so it is no longer exercised
+ * end-to-end here. Corrections during Talk it in are handled by the model.
  *
  * Needs `linkedom`; the test is skipped with a clear message when it is absent.
  */
@@ -115,7 +121,7 @@ function scriptedRecognition({ turns, clock, transcripts }) {
   return { FakeRecognition, turnsUsed: () => turnIndex };
 }
 
-function boot({ turns, clock, spoken, transcripts, cloud, calls }) {
+function boot({ turns, clock, spoken, transcripts, cloud, calls, agentReplies }) {
   const { window: dom } = parseHTML(readFileSync(`${DOCS}/index.html`, "utf8"));
   const doc = dom.document;
 
@@ -204,8 +210,20 @@ function boot({ turns, clock, spoken, transcripts, cloud, calls }) {
       const method = options.method || "GET";
       calls.push({ url: address, method });
       if (address.endsWith("/api/health")) {
-        // No ElevenLabs key: the phone's own recogniser is what runs.
-        return new Response(JSON.stringify({ voice: false }), { status: 200 });
+        // No ElevenLabs key: the phone's own recogniser is what runs. The agent
+        // is configured, so Talk it in is visible.
+        return new Response(JSON.stringify({ voice: false, assistant: true }), { status: 200 });
+      }
+      if (address.endsWith("/api/assistant/invoice")) {
+        const sent = JSON.parse(options.body);
+        const reply = agentReplies.shift();
+        // The stub echoes the mechanic's last words straight back as the work
+        // description. That is the point: whatever the recogniser handed the
+        // agent is what ends up on the invoice, so a truncated turn shows up
+        // in the saved job rather than being smoothed over by a fake answer.
+        const lastHeard = [...sent.messages].reverse().find((m) => m.role === "user")?.content || "";
+        if (reply.echoWorkFromSpeech) reply.fields.agreedWork = lastHeard;
+        return new Response(JSON.stringify(reply), { status: 200 });
       }
       if (address.endsWith("/api/jobs") && method === "GET") {
         return new Response(JSON.stringify({ jobs: [...cloud.values()] }), { status: 200 });
@@ -226,7 +244,7 @@ function boot({ turns, clock, spoken, transcripts, cloud, calls }) {
   context.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   vm.createContext(context);
-  for (const file of ["voice-config.js", "voice.js", "app.js"]) {
+  for (const file of ["voice-config.js", "voice.js", "assistant.js", "app.js"]) {
     vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
   }
   return { dom, context, store };
@@ -240,7 +258,7 @@ const settle = async (until, label = "the interview") => {
   throw new Error(`timed out waiting for ${label}`);
 };
 
-test("the voice interview waits out a long pause, takes 'not correct' as a no, and fixes only the part that was wrong", {
+test("Talk it in waits out a long pause and takes 'not correct' as a no", {
   skip: parseHTML ? false : "linkedom is not installed"
 }, async () => {
   const clock = { now: Date.parse("2026-08-25T15:00:00.000Z") };
@@ -258,75 +276,71 @@ test("the voice interview waits out a long pause, takes 'not correct' as a no, a
   });
 
   const turns = [
-    say("Jane Rivera"),                       // 0  whose car
-    say("yes"),                               // 1  spelling read-back
-    say("406 555 0101"),                      // 2  phone
-    say("yes"),                               // 3  phone read-back
-    say("skip"),                              // 4  email
-    say("that is not correct"),               // 5  section read-back  <-- bug 2
-    say("the phone number is wrong"),         // 6  which part         <-- bug 3
-    say("406 555 0199"),                      // 7  phone again
-    say("yes"),                               // 8  phone read-back
-    say("yes"),                               // 9  section read-back
-    say("a 2014 Chevrolet Cruze"),            // 10 vehicle (no plate question)
-    say("yes"),                               // 11 vehicle read-back
     // The long answer, with a five-second thinking pause in the middle of it.
     { chunks: [
       { at: 400, text: "replace the oil filter housing" },
       { at: 900, text: "and the thermostat" },
       { at: 6400, text: "and flush the coolant" }
-    ] },                                      // 12 the work           <-- bug 1
-    say("one twenty five"),                   // 13 labor rate
-    say("yes"),                               // 14 section read-back
-    say("skip"),                              // 15 materials
-    say("yes"),                               // 16 section read-back
-    say("no")                                 // 17 clock in?
+    ] },                                      // 0  the work          <-- bug 1
+    say("that is not correct"),               // 1  read-back         <-- bug 2
+    say("yes")                                // 2  read-back, agreed
   ];
 
-  const { dom, store } = boot({ turns, clock, spoken, transcripts, cloud, calls });
+  const readBack = "Jane Rivera, 2014 Chevrolet Cruze, one twenty five an hour. Right?";
+  const agentReplies = [
+    { say: "What are we doing to it?",
+      fields: { customerName: "Jane Rivera", vehicleYear: "2014", vehicleMake: "Chevrolet", vehicleModel: "Cruze" },
+      materials: [], ready: false, missing: ["agreedWork"] },
+    { say: readBack, fields: { laborRate: "125" }, materials: [], ready: true, missing: [],
+      echoWorkFromSpeech: true },
+    { say: readBack, fields: {}, materials: [], ready: true, missing: [] }
+  ];
+
+  const { dom, context, store } = boot({ turns, clock, spoken, transcripts, cloud, calls, agentReplies });
   const doc = dom.document;
 
   try {
     await settle(() => calls.some((call) => call.url.endsWith("/api/jobs")), "the cloud ledger");
-    doc.getElementById("voiceNewJobButton").dispatchEvent(new dom.Event("click"));
+
+    // ---------------------------------------------------------------- bug 2
+    // Asserted on the parser directly as well as through the save below: this
+    // is the phrase that used to confirm a read-back it was rejecting.
+    assert.equal(context.GMMVoice.parse.yesNo("that is not correct"), false);
+    assert.equal(context.GMMVoice.parse.yesNo("yes"), true);
+
+    await settle(() => !doc.getElementById("talkRow").classList.contains("hidden"), "the Talk it in button");
+    doc.getElementById("newJobButton").dispatchEvent(new dom.Event("click"));
+    await settle(() => doc.getElementById("jobDialog").open, "the invoice sheet");
+    doc.getElementById("talkItInButton").dispatchEvent(new dom.Event("click"));
 
     const state = () => JSON.parse(store.get("gold-mobile-mechanic-phone-v1") || '{"jobs":[]}');
-    await settle(() => state().jobs.length === 1, "the job to be created by voice");
+    await settle(() => state().jobs.length === 1, "the job to be created by the agent");
     const job = state().jobs[0];
 
     // ---------------------------------------------------------------- bug 1
     assert.equal(
       job.agreedWork,
-      // Sentence-cased by the parser, as any dictated answer is.
-      "Replace the oil filter housing and the thermostat and flush the coolant",
+      "replace the oil filter housing and the thermostat and flush the coolant",
       "a five-second pause mid-answer must not end the answer"
     );
 
     // ---------------------------------------------------------------- bug 2
-    const asked = spoken.join(" | ");
-    assert.match(asked, /Which part should I fix/, "'not correct' was heard as a rejection");
-
-    // ---------------------------------------------------------------- bug 3
-    assert.equal(job.customerPhone, "406 555 0199", "the corrected number is what was saved");
-    const nameAsks = spoken.filter((line) => /Whose car are we working on/.test(line)).length;
-    assert.equal(nameAsks, 1, "fixing the phone number must not re-ask the customer name");
-    const emailAsks = spoken.filter((line) => /email/i.test(line) && /skip/i.test(line)).length;
-    assert.equal(emailAsks, 1, "fixing the phone number must not re-ask the email");
-    assert.equal(job.customerName, "Jane Rivera");
-
-    // ------------------------------------------- the plate is no longer asked
+    // The read-back was spoken twice: the first "that is not correct" must have
+    // been heard as a rejection, so nothing was saved on that pass.
     assert.equal(
-      spoken.filter((line) => /plate/i.test(line)).length,
-      0,
-      "the interview no longer asks for a plate"
+      spoken.filter((line) => line === readBack).length,
+      2,
+      "'not correct' was heard as a rejection, so the agent asked again"
     );
+    assert.equal(agentReplies.length, 0, "every scripted agent turn was used");
 
     // The rest of the work order still came through.
+    assert.equal(job.customerName, "Jane Rivera");
     assert.equal(job.vehicleYear, "2014");
     assert.equal(job.vehicleMake, "Chevrolet");
     assert.equal(job.vehicleModel, "Cruze");
     assert.equal(job.laborRateCents, 12500);
-    assert.equal(job.status, "draft", "answering 'no' to clock in leaves the timer stopped");
+    assert.equal(job.status, "draft");
   } finally {
     clearInterval(ticker);
   }

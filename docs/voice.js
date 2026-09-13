@@ -1158,8 +1158,14 @@
     unlockAudio();
     showOverlay();
     try {
-      const result = await flow({ speak, ask, confirm, runSection, listen, capturePhoto });
-      await speak(flow.farewell || "All set.");
+      const result = await flow({
+        speak, ask, confirm, runSection, listen, capturePhoto,
+        // The shop agent drives its own turn order, so it needs the same typed
+        // fallback and status label `ask` uses rather than re-implementing them.
+        typedAnswer,
+        setState: (state, question) => setOverlay({ state, question }),
+      });
+      if (flow.farewell !== null) await speak(flow.farewell || "All set.");
       return { ok: true, result };
     } catch (error) {
       if (error instanceof VoiceCancelled) return { ok: false, reason: "cancelled" };

@@ -39,11 +39,11 @@
           <p>Clock the job. Capture the proof. Close it with a clean invoice.</p>
         </div>
         <div class="board-cta">
-          <button class="button button-voice" id="voiceNewJobButton" type="button">
-            <span aria-hidden="true">🎙</span> New job by voice
+          <button class="button button-voice hidden" id="shopAgentButton" type="button">
+            <span aria-hidden="true">💬</span> Ask Anya
           </button>
           <button class="button button-gold" id="newJobButton" type="button">
-            New job
+            Add invoice
           </button>
         </div>
       </div>
@@ -80,13 +80,30 @@
       <div class="sheet-header">
         <div>
           <p class="eyebrow">Open a work order</p>
-          <h2>New job</h2>
+          <h2>Add invoice</h2>
         </div>
         <div class="sheet-header-actions">
           <span class="save-pill" id="jobDraftState" data-state="idle">Auto-saving</span>
           <button class="button button-gold button-compact" id="saveJobButton" type="submit">Save</button>
           <button class="icon-button" id="closeJobDialog" type="button" aria-label="Close">×</button>
         </div>
+      </div>
+
+      <div class="talk-row hidden" id="talkRow">
+        <button class="button button-talk" id="talkItInButton" type="button">
+          <span aria-hidden="true">🎙</span> Talk to Anya
+        </button>
+        <p>Say the customer, the car and the work — all in one go if you want. She fills the sheet in as you talk, and starts the clock if you tell her to.</p>
+      </div>
+
+      <div class="form-section car-picker hidden" id="carPicker">
+        <div class="section-heading">
+          <div>
+            <h3>Cars you've had in</h3>
+            <p>Tap one to fill the customer and vehicle straight from the ledger.</p>
+          </div>
+        </div>
+        <div class="car-chips" id="carChips"></div>
       </div>
 
       <div class="form-section">
@@ -223,6 +240,7 @@
 
   <script src="./voice-config.js"></script>
   <script src="./voice.js"></script>
+  <script src="./assistant.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

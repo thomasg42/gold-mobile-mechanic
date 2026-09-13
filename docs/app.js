@@ -748,6 +748,55 @@
     return job.invoice;
   }
 
+  // The customer portal groups a customer's filed invoices under an opaque id
+  // that is a hash of their name and phone. The worker computes it in
+  // sync-worker/index.ts (customerKey); this is the identical function so the
+  // phone can build a customer's own portal link offline, without asking the
+  // server for it.
+  function portalPhoneDigits(value) {
+    const digits = String(value ?? "").replace(/\D/g, "");
+    return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  }
+
+  function customerPortalId(job) {
+    const normalizedName = String(job.customerName ?? "")
+      .trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+    let hash = 0x811c9dc5;
+    for (const character of `${normalizedName}|${portalPhoneDigits(job.customerPhone)}`) {
+      hash ^= character.charCodeAt(0);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(36).padStart(7, "0");
+  }
+
+  // The permanent link to hand one customer: it opens the portal straight to
+  // that customer's own filed invoices. Stable as long as their name and phone
+  // stay the same — correcting either one after the fact mints a new link.
+  function customerPortalLink(job) {
+    if (!String(job.customerName || "").trim()) return "";
+    return `${PORTAL_URL}#customer/${customerPortalId(job)}`;
+  }
+
+  // The exact reverse of the "finish" action. The timer reopens clocked out, the
+  // filed invoice is withdrawn (so it leaves the customer portal), and every
+  // field unlocks for editing again. Billable time, intervals, receipts, and the
+  // clock-history ledger are all left untouched — this only undoes the filing.
+  function reopenInvoice(job) {
+    if (job.status !== "invoiced") return;
+    const now = new Date().toISOString();
+    job.status = "clocked_out";
+    job.endedAt = null;
+    job.invoice = null;
+    job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
+    job.eventHistory.push({ id: uid(), action: "invoice_reopened", occurredAt: now });
+    // A real clock-out event with the current timestamp so the cloud merge
+    // resolves this job to "clocked out" no matter whose history it lands beside.
+    logClockEvent(job, "clock_out", now);
+    queueJobSync(job);
+    renderJob();
+    notify("Invoice reopened. Fix anything, then Finish Project to file it again.");
+  }
+
   function findJob(id) {
     return state.jobs.find((job) => job.id === id);
   }
@@ -1253,6 +1302,13 @@
           <button class="button button-quiet" id="downloadInvoiceButton" type="button">Download</button>
           <button class="button button-gold" id="emailInvoiceButton" type="button">Prepare email</button>
         </div>
+        ${customerPortalLink(job) ? `
+          <div class="customer-link-row">
+            <span class="detail-label">Customer's invoice link — send this</span>
+            <code class="customer-link-url">${escapeHtml(customerPortalLink(job))}</code>
+            <button class="button button-quiet button-compact" id="copyCustomerLinkButton" type="button" data-link="${escapeHtml(customerPortalLink(job))}">Copy link</button>
+          </div>` : ""}
+        <button class="button button-quiet unsubmit-button" data-unsubmit-invoice type="button">Unsubmit invoice</button>
       </article>`;
   }
 
@@ -1582,6 +1638,7 @@
               </div>
               <div class="card-cta">
                 <button class="button button-voice" id="voiceReceiptButton" type="button" ${locked ? "disabled" : ""}><span aria-hidden="true">🎙</span> Receipts by voice</button>
+                <button class="button button-talk hidden" id="jobShopAgentButton" type="button"><span aria-hidden="true">💬</span> Ask Anya</button>
                 <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
               </div>
             </div>
@@ -1621,12 +1678,18 @@
       <section class="clock-out-zone">
         <div>
           <p class="eyebrow">Bottom of work order</p>
-          <h3>${job.status === "completed" || job.status === "invoiced" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
-          <p>${job.status === "draft" ? "Clock in first so the invoice receives an accurate labor total." : "Finish Project closes the timer and files the invoice so you can get paid. Clocking out for the day doesn't affect it — come back, clock in again, and hit Finish Project when the job is actually done."}</p>
+          <h3>${job.status === "invoiced" ? "Invoice filed." : job.status === "completed" ? "Job clock is closed." : "Finished with the vehicle?"}</h3>
+          <p>${job.status === "invoiced"
+            ? "The invoice is filed and the customer can open it on their link. Need to change something? Unsubmit it — the job reopens clocked out and every field unlocks, then Finish Project files it again."
+            : job.status === "draft"
+              ? "Clock in first so the invoice receives an accurate labor total."
+              : "Finish Project closes the timer and files the invoice so you can get paid. Clocking out for the day doesn't affect it — come back, clock in again, and hit Finish Project when the job is actually done."}</p>
         </div>
         <div class="card-cta">
-          <button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
-          <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}>Finish Project</button>
+          ${job.status === "invoiced"
+            ? `<button class="button button-quiet unsubmit-button" data-unsubmit-invoice type="button">Unsubmit invoice</button>`
+            : `<button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
+          <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}>Finish Project</button>`}
         </div>
       </section>`;
 
@@ -1861,6 +1924,16 @@
       addReceiptButton.addEventListener("click", () => {
         flushJobAutosave();
         openReceiptDialog(job.id);
+      });
+    }
+
+    const jobShopAgentButton = $("jobShopAgentButton");
+    if (jobShopAgentButton) {
+      jobShopAgentButton.addEventListener("click", () => window.GMMAgent?.openChat());
+      // Re-checked per render rather than cached on the element: the job view
+      // is rebuilt by innerHTML, so this is a fresh button every time.
+      void Promise.resolve(window.GMMAgent?.available() ?? false).then((ready) => {
+        jobShopAgentButton.classList.toggle("hidden", !ready);
       });
     }
 
@@ -2243,6 +2316,30 @@
 
     const emailInvoiceButton = $("emailInvoiceButton");
     if (emailInvoiceButton) emailInvoiceButton.addEventListener("click", () => prepareEmail(job));
+
+    const copyCustomerLinkButton = $("copyCustomerLinkButton");
+    if (copyCustomerLinkButton) {
+      copyCustomerLinkButton.addEventListener("click", async () => {
+        const link = copyCustomerLinkButton.dataset.link || customerPortalLink(job);
+        if (!link) return;
+        try {
+          await navigator.clipboard.writeText(link);
+          notify("Customer's invoice link copied.");
+        } catch {
+          // Clipboard blocked (older browser, or not on HTTPS): a prompt still
+          // lets the link be copied by hand.
+          window.prompt("Copy this link for the customer:", link);
+        }
+      });
+    }
+
+    // Both the filed-invoice card and the bottom of the work order carry one.
+    document.querySelectorAll("[data-unsubmit-invoice]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (!window.confirm("Unsubmit this invoice? The job reopens clocked out, it leaves the customer's view, and every field unlocks. You file it again with Finish Project.")) return;
+        reopenInvoice(job);
+      });
+    });
   }
 
   function timerAction(job, action, { skipConfirm = false } = {}) {
@@ -2326,6 +2423,9 @@
     materialRows.appendChild(row);
   }
 
+  /** Asides captured while talking the current sheet in, newest last. */
+  let agentNotes = [];
+
   function loadJobDraft() {
     try {
       return JSON.parse(localStorage.getItem(NEW_JOB_DRAFT_STORAGE) || "null");
@@ -2357,7 +2457,11 @@
       vehiclePlate: String(data.get("vehiclePlate") || ""),
       agreedWork: String(data.get("agreedWork") || ""),
       laborRate: String(data.get("laborRate") || ""),
-      materials
+      materials,
+      // Things he mentioned in passing that are not form fields. They ride on
+      // the draft rather than in a variable so a stopped conversation, or a
+      // phone that locked in his pocket, does not lose them.
+      agentNotes
     };
     const isEmpty = Object.values(draft).every((value) =>
       Array.isArray(value) ? value.length === 0 : !value);
@@ -2434,6 +2538,7 @@
     setField(jobForm, "vehiclePlate", draft.vehiclePlate || "");
     setField(jobForm, "agreedWork", draft.agreedWork || "");
     setField(jobForm, "laborRate", draft.laborRate || "");
+    agentNotes = Array.isArray(draft.agentNotes) ? [...draft.agentNotes] : [];
     materialRows.innerHTML = "";
     const materials = Array.isArray(draft.materials) && draft.materials.length ? draft.materials : [""];
     materials.forEach((description) => addMaterialRow({ description }));
@@ -2441,6 +2546,7 @@
 
   function openJobDialog() {
     jobForm.reset();
+    agentNotes = [];
     const draft = loadJobDraft();
     if (draft) {
       applyJobDraft(draft);
@@ -2451,6 +2557,7 @@
     }
     $("jobFormError").classList.add("hidden");
     setJobDraftState(draft ? "draft" : "idle");
+    renderCarPicker();
     jobDialog.showModal();
   }
 
@@ -3369,7 +3476,7 @@
       "",
       "Attach the downloaded invoice file to this message before sending.",
       "",
-      `Every invoice we've filed is also at ${PORTAL_URL} — find your name in the list.`,
+      `You can also open this invoice any time here: ${customerPortalLink(job) || PORTAL_URL}`,
       "",
       "Thank you,"
     ].join("\n");
@@ -3431,42 +3538,16 @@
     }
   }
 
-  // ---------------------------------------------------------- voice interviews
-  // Each interview writes into the same inputs a thumb would, so an interrupted
-  // run leaves a normal half-filled form instead of a dead end.
+  // ------------------------------------------------- scripted voice interviews
+  // Receipts and the closeout are still fixed question lists: the order is the
+  // audit trail, and a model free to improvise one would skip a photo and then
+  // cheerfully confirm a receipt it never captured. Opening a job is the part
+  // that became a conversation — see the shop agent further down.
+  //
+  // Either way every answer lands in the same input a thumb would use, so an
+  // interrupted run leaves a normal half-filled form instead of a dead end.
 
   const voiceConfig = window.VoiceConfig || {};
-
-  /** Named parsers the config refers to by string. */
-  function voiceParser(spec) {
-    const parse = window.GMMVoice.parse;
-    const [key, style] = String(spec || "").split(":");
-    if (key === "money") return (heard) => parse.money(heard, style || "amount");
-    if (typeof parse[key] === "function") return parse[key];
-    return (heard) => String(heard || "").trim();
-  }
-
-  /**
-   * Named writers for answers that do not map to a single input. Anything a
-   * config can do to the form, it does through one of these.
-   */
-  const voiceAppliers = {
-    vehicle: (value, captured) => {
-      setField(jobForm, "vehicleYear", value?.year || "");
-      setField(jobForm, "vehicleMake", value?.make || "");
-      setField(jobForm, "vehicleModel", value?.model || "");
-      // Expose the pieces so a summary can read them back individually.
-      captured.vehicleYear = value?.year || "";
-      captured.vehicleMake = value?.make || "";
-      captured.vehicleModel = value?.model || "";
-    },
-    laborRate: (value) => setField(jobForm, "laborRate", ((value || 0) / 100).toFixed(2)),
-    materials: (value) => {
-      materialRows.innerHTML = "";
-      (value || []).forEach((description) => addMaterialRow({ description }));
-      if (!value?.length) addMaterialRow();
-    }
-  };
 
   function setField(form, name, value) {
     const input = form.querySelector(`[name="${name}"]`);
@@ -3475,100 +3556,10 @@
     input.dispatchEvent(new Event("input", { bubbles: true }));
   }
 
-  function spellOut(value) {
-    return String(value || "").split("").join(" ");
-  }
-
-  /**
-   * "Jon Mc-Crae" -> "J-O-N, M-C-C-R-A-E". Hyphen-joined capitals are what a
-   * speech engine reliably reads out one letter at a time; bare spaced letters
-   * get run back together into a word.
-   */
-  function spellLetters(value) {
-    return String(value || "")
-      .trim()
-      .split(/\s+/)
-      .map((word) => word.replace(/[^A-Za-z0-9]/g, "").toUpperCase().split("").join("-"))
-      .filter(Boolean)
-      .join(", ");
-  }
-
-  /** Renders one configured summary part against what the section captured. */
-  function summaryPart(part, captured) {
-    if (typeof part === "string") return part;
-
-    if (Array.isArray(part.fields)) {
-      return part.fields
-        .map((name) => captured[name])
-        .filter((value) => value !== null && value !== undefined && value !== "")
-        .join(part.join ?? " ");
-    }
-
-    const raw = captured[part.field];
-    const empty = raw === null || raw === undefined || raw === ""
-      || (Array.isArray(raw) && !raw.length);
-    if (empty) return part.fallback ?? "";
-
-    let text;
-    if (part.format === "money") text = money(raw);
-    else if (part.format === "spell") text = spellOut(raw);
-    else if (part.format === "list") text = (Array.isArray(raw) ? raw : [raw]).join(", ");
-    else text = String(raw);
-
-    return `${part.prefix ?? ""}${text}${part.suffix ?? ""}`;
-  }
-
-  function buildSummary(parts, captured) {
-    return (parts || [])
-      .map((part) => summaryPart(part, captured))
-      .join("")
-      .replace(/\s+/g, " ")
-      .replace(/\s+([.,])/g, "$1")
-      .trim();
-  }
-
   /** Fills {token} placeholders in the shorter runtime prompts. */
   function fillPrompt(template, values) {
     return String(template || "").replace(/\{(\w+)\}/g, (_, key) =>
       values[key] === null || values[key] === undefined ? "" : String(values[key]));
-  }
-
-  function configuredStep(step) {
-    return {
-      name: step.name,
-      label: step.label,
-      optional: Boolean(step.optional),
-      // How long to wait through a pause before deciding the answer is over,
-      // and the extra words that let "fix the rate" find this step.
-      patience: step.patience,
-      aliases: step.aliases,
-      // Prompts are resolved against everything captured so far, so
-      // "{customerName}'s car" reads back the name that was just confirmed
-      // instead of asking the same generic question a second time.
-      prompt: (context) => fillPrompt(step.prompt, context || {}),
-      retryAfterNo: step.retryAfterNo,
-      confirmEach: step.confirmEach
-        ? (value) => fillPrompt(step.confirmEach, {
-          value: Array.isArray(value) ? value.join(", ") : String(value ?? ""),
-          spelled: spellLetters(value)
-        })
-        : undefined,
-      parse: voiceParser(step.parse),
-      apply: (value, captured) => {
-        if (step.apply) voiceAppliers[step.apply]?.(value, captured);
-        else if (step.field) setField(jobForm, step.field, value ?? "");
-      }
-    };
-  }
-
-  function configuredSection(section) {
-    return {
-      steps: section.steps.map(configuredStep),
-      summary: (captured) => buildSummary(section.summary, captured),
-      // What Ken says when a read-back comes back wrong, so only the named
-      // part is re-asked instead of the whole section.
-      repair: (voiceConfig.newJob || {}).repair
-    };
   }
 
   /** "autozone spark plugs" -> { vendor: "AutoZone", parts: "spark plugs" } */
@@ -3617,51 +3608,218 @@
     return true;
   }
 
-  async function voiceNewJob() {
-    if (voiceUnavailable()) return;
-    if (!(await ensureCloudSync())) return;
-    const flow = voiceConfig.newJob || {};
-    openJobDialog();
+  // ------------------------------------------------------------- shop agent
+  // The agent never touches app state directly. It writes through the same
+  // inputs and the same submit path a thumb uses, so a conversation that stops
+  // halfway leaves a normal half-filled sheet, and every validation, autosave
+  // and sync rule that already exists still runs exactly once.
 
-    const outcome = await window.GMMVoice.run(async ({ speak, ask, runSection }) => {
-      if (flow.intro) await speak(flow.intro);
-
-      // One shared context for the whole interview: the vehicle question needs
-      // the customer name captured back in the first section.
-      const interview = {};
-      for (const section of flow.sections || []) {
-        await runSection(configuredSection(section), interview);
-      }
-
-      if (flow.creating) await speak(flow.creating);
-      // Submit through the normal path so every existing validation still runs.
-      jobForm.requestSubmit();
-
-      // The job exists and is open from here, so the clock can be started
-      // without ever putting the phone down.
-      const created = findJob(selectedJobId);
-      if (created?.status === "draft" && flow.clockIn) {
-        const startNow = await ask({
-          name: "clockIn",
-          label: flow.clockIn.label,
-          prompt: flow.clockIn.prompt,
-          parse: window.GMMVoice.parse.yesNo
-        });
-        if (startNow === true) {
-          timerAction(created, "clock_in");
-          await speak(flow.clockIn.yes);
-        } else {
-          await speak(flow.clockIn.no);
-        }
-      }
-      return true;
-    });
-
-    if (!outcome.ok) {
-      if (outcome.reason === "error") notify(outcome.message, true);
-      else notify(flow.stopped || "Voice stopped.");
+  /**
+   * Every distinct customer-and-vehicle pair already on the ledger, newest
+   * first. Feeds both the tap-a-car picker and the agent's matching, so "the
+   * Suburban" resolves to a real record instead of a fresh interview.
+   */
+  function knownVehicles() {
+    const seen = new Set();
+    const cars = [];
+    const newestFirst = [...state.jobs].sort((a, b) =>
+      String(b.createdAt).localeCompare(String(a.createdAt)));
+    for (const job of newestFirst) {
+      const car = {
+        customerName: job.customerName || "",
+        customerPhone: job.customerPhone || "",
+        customerEmail: job.customerEmail || "",
+        vehicleYear: job.vehicleYear || "",
+        vehicleMake: job.vehicleMake || "",
+        vehicleModel: job.vehicleModel || "",
+        vehiclePlate: job.vehiclePlate || ""
+      };
+      if (!car.customerName && !car.vehicleMake) continue;
+      const key = [car.customerName, car.vehicleYear, car.vehicleMake, car.vehicleModel]
+        .join("|").toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cars.push(car);
+      if (cars.length >= 40) break;
     }
+    return cars;
   }
+
+  function renderCarPicker() {
+    const picker = $("carPicker");
+    const chips = $("carChips");
+    if (!picker || !chips) return;
+    const cars = knownVehicles();
+    picker.classList.toggle("hidden", !cars.length);
+    chips.innerHTML = cars.map((car, index) => `
+      <button class="car-chip" type="button" data-car-index="${index}">
+        <strong>${escapeHtml([car.vehicleYear, car.vehicleMake, car.vehicleModel].filter(Boolean).join(" ") || "Vehicle not recorded")}</strong>
+        <span>${escapeHtml(car.customerName || "Owner not recorded")}${car.vehiclePlate ? ` · ${escapeHtml(car.vehiclePlate)}` : ""}</span>
+      </button>`).join("");
+    // Bound once per render, on the container: re-binding per chip on an
+    // innerHTML swap is how a tap ends up firing twice.
+    chips.onclick = (event) => {
+      const chip = event.target.closest("[data-car-index]");
+      if (!chip) return;
+      const car = cars[Number(chip.dataset.carIndex)];
+      if (!car) return;
+      Object.entries(car).forEach(([name, value]) => {
+        if (value) setField(jobForm, name, value);
+      });
+      notify(`${car.customerName || "Vehicle"} filled in. Add the work and the rate.`);
+    };
+  }
+
+  /** What the sheet already holds, so the agent does not re-ask for it. */
+  function filledFields() {
+    const filled = {};
+    jobForm.querySelectorAll("[name]").forEach((input) => {
+      const name = input.getAttribute("name");
+      const text = String(input.value || "").trim();
+      if (name && text && !(name in filled)) filled[name] = text;
+    });
+    return filled;
+  }
+
+  /**
+   * The job Anya is standing in front of, or null when none is open.
+   *
+   * NOT named `openJob` — that is already the router that opens a work order,
+   * and a second function declaration of the same name in this scope silently
+   * replaces it. Everything still boots; job cards just stop opening.
+   */
+  function agentJob() {
+    const job = findJob(selectedJobId);
+    if (!job) return null;
+    return $("jobView").classList.contains("hidden") ? null : job;
+  }
+
+  /**
+   * Runs one of Anya's job-changing tools and reports what actually happened.
+   *
+   * Every branch returns a sentence she can say out loud, and `ok: false` on
+   * anything refused — she reports the result, so a refusal that came back
+   * looking like a success is her telling him the clock is running when it is
+   * not, and that is money off a customer's invoice.
+   */
+  function runAction(name, input = {}) {
+    const job = agentJob();
+    if (!job) {
+      return { ok: false, message: "No job is open on his screen, so nothing could be changed." };
+    }
+    if (job.status === "invoiced") {
+      return { ok: false, message: "That job's invoice is already filed and locked. He has to unsubmit it first." };
+    }
+
+    if (name === "clock_in") {
+      if (job.status === "in_progress") return { ok: false, message: "He is already on the clock." };
+      timerAction(job, "clock_in");
+      void renderJob();
+      return { ok: true, message: "Clocked in. Billable time is running." };
+    }
+
+    if (name === "clock_out") {
+      if (job.status !== "in_progress") return { ok: false, message: "He is not on the clock right now." };
+      timerAction(job, "clock_out");
+      void renderJob();
+      return { ok: true, message: "Clocked out. Billable time is stopped." };
+    }
+
+    if (name === "add_note") {
+      const note = String(input.note || "").trim();
+      if (!note) return { ok: false, message: "There was no note to add." };
+      // Appended, never replaced: these print on the invoice and an earlier
+      // observation is not superseded by a later one.
+      job.suggestions = [job.suggestions, note].map((part) => String(part || "").trim())
+        .filter(Boolean).join("\n");
+      queueJobSync(job);
+      void renderJob();
+      return { ok: true, message: "Added to the notes that print on the invoice." };
+    }
+
+    if (name === "set_agreed_work") {
+      const work = String(input.work || "").trim();
+      // Agreed work is what the invoice bills against; a blank is a mistake,
+      // never an instruction to erase the scope.
+      if (!work) return { ok: false, message: "No work description came through, so nothing was changed." };
+      job.agreedWork = work;
+      queueJobSync(job);
+      void renderJob();
+      return { ok: true, message: "Agreed work updated." };
+    }
+
+    return { ok: false, message: "That isn't something this app can do." };
+  }
+
+  window.GMMAgentBridge = {
+    notify,
+    knownVehicles,
+    filledFields,
+    runAction,
+    /** Something he mentioned that is not a field. Kept until the job exists. */
+    stashNote: (text) => {
+      const note = String(text || "").trim();
+      if (!note || agentNotes.includes(note)) return;
+      agentNotes.push(note);
+      scheduleJobDraftAutosave();
+    },
+    setField: (name, value) => setField(jobForm, name, value),
+    setMaterials: (list) => {
+      materialRows.innerHTML = "";
+      list.forEach((description) => addMaterialRow({ description }));
+      if (!list.length) addMaterialRow();
+      scheduleJobDraftAutosave();
+    },
+    /**
+     * Submits through the real form. Returns false when validation refused it,
+     * so Anya says what is wrong instead of claiming a job she never made.
+     * Notes gathered while talking, and a clock-in she was asked for, are
+     * applied to the job the submit just created.
+     */
+    submitJob: ({ clockIn = false } = {}) => {
+      const before = state.jobs.length;
+      jobForm.requestSubmit();
+      if (state.jobs.length <= before) return false;
+      const job = state.jobs[state.jobs.length - 1];
+      const note = agentNotes.join("\n").trim();
+      if (note) {
+        job.suggestions = [job.suggestions, note].map((part) => String(part || "").trim())
+          .filter(Boolean).join("\n");
+        queueJobSync(job);
+      }
+      if (clockIn && job.status === "draft") timerAction(job, "clock_in");
+      agentNotes = [];
+      return true;
+    },
+    /** What Anya is told about the job before she answers anything. */
+    jobContext: () => {
+      const job = agentJob();
+      if (job) {
+        return {
+          customerName: job.customerName || "",
+          vehicleYear: job.vehicleYear || "",
+          vehicleMake: job.vehicleMake || "",
+          vehicleModel: job.vehicleModel || "",
+          status: job.status || "",
+          agreedWork: job.agreedWork || "",
+          suggestions: job.suggestions || ""
+        };
+      }
+      // No job open, but the sheet may be half-filled — enough for her to know
+      // which vehicle the question is about, without any of the tools working.
+      const filled = filledFields();
+      if (!filled.vehicleMake && !filled.customerName) return null;
+      return {
+        customerName: filled.customerName || "",
+        vehicleYear: filled.vehicleYear || "",
+        vehicleMake: filled.vehicleMake || "",
+        vehicleModel: filled.vehicleModel || "",
+        status: "",
+        agreedWork: filled.agreedWork || "",
+        suggestions: ""
+      };
+    }
+  };
 
   /** Waits for File All Receipts to drain, so the invoice sees the parts total. */
   function waitForReceiptsFiled() {
@@ -3834,10 +3992,33 @@
 
   $("homeButton").addEventListener("click", showBoard);
   $("newJobButton").addEventListener("click", openNewJob);
-  $("voiceNewJobButton").addEventListener("click", () => {
+
+  /**
+   * Every agent call goes through here rather than touching `window.GMMAgent`
+   * directly. The agent is a separate script, and a phone running a stale
+   * service-worker shell can open this page without it — reaching for it
+   * unguarded took the whole app down at boot rather than losing one button.
+   * Clocking in has to keep working when the talking does not.
+   */
+  const agent = () => window.GMMAgent || null;
+
+  $("talkItInButton").addEventListener("click", async () => {
     // Unlock audio inside the tap itself — iOS ignores a later attempt.
     window.GMMVoice?.prime();
-    void voiceNewJob();
+    await agent()?.talkItIn();
+    renderCarPicker();
+  });
+
+  $("shopAgentButton").addEventListener("click", () => agent()?.openChat());
+
+  /**
+   * Both agent entry points stay hidden until the Worker says the key is set.
+   * A button that always answers "not configured" teaches people to stop
+   * tapping it, and they do not start again once it works.
+   */
+  void Promise.resolve(agent()?.available() ?? false).then((ready) => {
+    $("shopAgentButton").classList.toggle("hidden", !ready);
+    $("talkRow").classList.toggle("hidden", !ready);
   });
   /**
    * The button Thomas asked for: one tap, anywhere in the app, that writes

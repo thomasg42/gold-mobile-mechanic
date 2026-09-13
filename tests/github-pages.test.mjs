@@ -46,7 +46,11 @@ test("GitHub phone app syncs durable jobs, receipts, and clock history", async (
   assert.match(script, /backupData/);
   assert.match(script, /serviceWorker\.register/);
   assert.match(script, /SYNC_API/);
-  assert.match(script, /Authorization/);
+  // Every cloud call funnels through one wrapper. The owner PIN / Bearer sync
+  // key was deliberately removed in 4617d89 ("App is low-stakes; open access is
+  // fine") — the worker is CORS-locked to the Pages origin instead, so this no
+  // longer asserts an Authorization header.
+  assert.match(script, /async function cloudFetch\(path, options/);
   assert.match(script, /PENDING_JOBS_STORAGE/);
   assert.match(script, /PENDING_RECEIPTS_STORAGE/);
   assert.match(script, /eventHistory/);

@@ -1,4 +1,10 @@
-interface Env {
+import {
+  type AssistantEnv,
+  chatTurn,
+  invoiceTurn,
+} from "./assistant";
+
+interface Env extends AssistantEnv {
   DB: D1Database;
   /**
    * Set with `wrangler secret put ELEVENLABS_API_KEY --config wrangler.sync.jsonc`.
@@ -39,6 +45,14 @@ const MAX_TTS_CHARS = 800;
 const MAX_STT_BYTES = 4_000_000;
 const VOICE_RATE_LIMIT = 60;
 const VOICE_RATE_WINDOW_SECONDS = 60;
+
+// The shop agent spends Anthropic tokens and, in shop mode, billable web
+// searches. One mechanic talking through a job is a few dozen turns an hour;
+// anything past this is a stuck loop or somebody else's script, and either way
+// it should stop before it spends money.
+const ASSISTANT_RATE_LIMIT = 40;
+const ASSISTANT_RATE_WINDOW_SECONDS = 300;
+const MAX_ASSISTANT_BODY_BYTES = 200_000;
 
 // The customer portal is open by design, so this limit is not protecting the
 // data — it only stops one caller hammering the worker or bulk-scraping it.
@@ -779,11 +793,30 @@ async function getReceipt(
  * outright abuse attempt — either of which would spend real ElevenLabs credit.
  */
 async function withinVoiceRateLimit(request: Request, env: Env): Promise<boolean> {
+  return withinRateLimit(request, env, "voice", VOICE_RATE_LIMIT, VOICE_RATE_WINDOW_SECONDS);
+}
+
+async function withinAssistantRateLimit(request: Request, env: Env): Promise<boolean> {
+  return withinRateLimit(request, env, "ai", ASSISTANT_RATE_LIMIT, ASSISTANT_RATE_WINDOW_SECONDS);
+}
+
+/**
+ * Per-caller cap shared by every billable route. The `prefix` keeps each
+ * feature in its own bucket, so a long voice interview cannot use up the shop
+ * agent's allowance or the other way round.
+ */
+async function withinRateLimit(
+  request: Request,
+  env: Env,
+  prefix: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<boolean> {
   const caller = request.headers.get("CF-Connecting-IP") || "unknown";
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const window = Math.floor(nowSeconds / VOICE_RATE_WINDOW_SECONDS);
-  const bucket = `${caller}|${window}`;
-  const expiresAt = (window + 1) * VOICE_RATE_WINDOW_SECONDS;
+  const window = Math.floor(nowSeconds / windowSeconds);
+  const bucket = `${prefix}|${caller}|${window}`;
+  const expiresAt = (window + 1) * windowSeconds;
   try {
     const row = await env.DB.prepare(
       `INSERT INTO voice_usage (bucket, count, expires_at) VALUES (?1, 1, ?2)
@@ -798,7 +831,7 @@ async function withinVoiceRateLimit(request: Request, env: Env): Promise<boolean
         .bind(nowSeconds)
         .run();
     }
-    return (row?.count ?? 0) <= VOICE_RATE_LIMIT;
+    return (row?.count ?? 0) <= limit;
   } catch {
     // A limiter outage must not take the feature down with it.
     return true;
@@ -881,6 +914,47 @@ async function transcribeAudio(request: Request, env: Env): Promise<Response> {
   return json(request, { text: typeof result?.text === "string" ? result.text : "" });
 }
 
+async function runAssistant(
+  request: Request,
+  env: Env,
+  pathname: string,
+): Promise<Response> {
+  if (!env.ANTHROPIC_API_KEY) {
+    return json(request, { error: "The shop agent is not configured." }, 503);
+  }
+  if (!(await withinAssistantRateLimit(request, env))) {
+    return json(request, { error: "The agent is busy. Give it a minute." }, 429);
+  }
+
+  const body = await request.text();
+  if (body.length > MAX_ASSISTANT_BODY_BYTES) {
+    return json(request, { error: "That conversation is too long to send." }, 413);
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(body) as Record<string, unknown>;
+  } catch {
+    return json(request, { error: "Bad request." }, 400);
+  }
+
+  try {
+    const result =
+      pathname === "/api/assistant/invoice"
+        ? await invoiceTurn(env, payload)
+        : pathname === "/api/assistant/chat"
+          ? await chatTurn(env, payload)
+          : null;
+    if (!result) return json(request, { error: "Not found." }, 404);
+    return json(request, result.body, result.status);
+  } catch (error) {
+    // Never surface the upstream error text — it can carry request detail, and
+    // on a phone in a driveway an actionable sentence beats a stack trace.
+    console.error("assistant failure", error);
+    return json(request, { error: "The agent could not answer. Try again." }, 502);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -897,6 +971,7 @@ export default {
         ok: true,
         service: "gold-mobile-mechanic-sync",
         voice: Boolean(env.ELEVENLABS_API_KEY),
+        assistant: Boolean(env.ANTHROPIC_API_KEY),
       });
     }
 
@@ -925,6 +1000,18 @@ export default {
         return transcribeAudio(request, env);
       }
       return json(request, { error: "Not found." }, 404);
+    }
+
+    // The shop agent spends Anthropic credit on every call, so like the voice
+    // routes it refuses anything that is not the app's own origin.
+    if (url.pathname.startsWith("/api/assistant/")) {
+      if (!allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      if (request.method !== "POST") {
+        return json(request, { error: "Not found." }, 404);
+      }
+      return runAssistant(request, env, url.pathname);
     }
 
     if (url.pathname === "/api/jobs" && request.method === "GET") {

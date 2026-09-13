@@ -49,7 +49,9 @@ function makeD1(migrations) {
 async function loadWorker() {
   const result = await build({
     entryPoints: [fileURLToPath(new URL("sync-worker/index.ts", root))],
-    bundle: false,
+    // Bundled, not just transpiled: index.ts imports the shop agent module, and
+    // a bare relative import cannot resolve inside the data: URL below.
+    bundle: true,
     write: false,
     format: "esm",
     logLevel: "silent"

@@ -1,4 +1,4 @@
-const CACHE = "gold-mobile-mechanic-v26-patient-voice-and-edit";
+const CACHE = "gold-mobile-mechanic-v29-anya";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -6,6 +6,7 @@ const APP_SHELL = [
   "./app.js",
   "./voice-config.js",
   "./voice.js",
+  "./assistant.js",
   "./portal.html",
   "./portal.js",
   "./icon-192.png",

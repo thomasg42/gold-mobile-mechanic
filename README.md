@@ -16,8 +16,15 @@ last-known recovery copy and queues changes while offline.
 
 ## Operator workflow
 
-1. Create a job in the GitHub app with the customer, vehicle, labor rate,
-   agreed work, and approved materials. The server assigns a durable
+1. **Add invoice** opens the sheet. Every car already on the ledger is listed
+   at the top — tap one and the customer and vehicle fill themselves in. Fill
+   the rest by thumb, or tap **Talk to Anya** and just say it, all in one go if
+   you want: she takes every field out of what you said, asks only for what is
+   genuinely still missing, and writes each answer into the real form input as
+   you go. Anything you mention that is not a field — a worn part, something to
+   check next visit — goes to the notes that print on the invoice. She reads the
+   sheet back and saves nothing until you say yes, and starts the clock on the
+   new job if you told her to. The server assigns a durable
    `GMM-YYYYMMDD-XXXX` job ID.
 2. Clock in. Pause/resume as needed. Every action writes both the current
    interval and an append-only clock-history event. A unique mutation ID makes
@@ -36,6 +43,18 @@ last-known recovery copy and queues changes while offline.
 7. Create the invoice. Labor is calculated from work seconds × hourly rate;
    agreed materials are added separately. Download or share the invoice with
    embedded receipt images, or open the prepared customer email.
+8. Send the customer their invoice link. The filed-invoice card shows a
+   permanent portal link — `portal.html#customer/<id>` — that opens straight to
+   that one customer's filed invoices. **Copy link** puts it on the clipboard,
+   and the prepared email already carries it. The `<id>` is a hash of the
+   customer's name and phone (matching the sync worker), so correcting either
+   one afterward mints a new link.
+9. Unsubmit an invoice if something has to change. **Unsubmit invoice** (on the
+   filed-invoice card and at the bottom of the work order) reopens the job
+   clocked out, withdraws the filed invoice so it leaves the customer portal,
+   and unlocks every field. Billable time, intervals, and the clock ledger are
+   untouched. Fix what's needed, clock back in if you owe more time, then hit
+   Finish Project to file it again.
 
 The app does not claim an email was sent before the phone's mail/share sheet
 confirms it. Fully automatic Gmail sending is a separate connected-backend
@@ -89,12 +108,16 @@ docs/
   index.html                      Canonical GitHub Pages phone shell
   styles.css                      Matching responsive charcoal/gold design
   app.js                          Cloud sync, offline recovery, timers, receipts, invoices
+  assistant.js                    Anya: the sheet conversation, and the chat that can act on a job
+  voice.js                        The spoken turn — mic, silence detection, type-instead
+  voice-config.js                 Wording for the scripted receipt and closeout interviews
   icon-192.png / icon-512.png      Home-screen and install icons
   manifest.webmanifest            Home-screen installation metadata
   sw.js                           Offline application shell
 tests/github-pages.test.mjs       Public phone-edition contract checks
 sync-worker/
   index.ts                        Authenticated jobs and receipts API
+  assistant.ts                    Anya's Anthropic proxy — holds the API key, runs no job changes
   migrations/                     Private durable D1 schema
 wrangler.sync.jsonc               Backend deployment configuration
 ```
@@ -126,6 +149,80 @@ draft
 ```
 
 Invalid transitions return HTTP `409`. Clock-out is unavailable during a break.
+
+## Anya
+
+Two surfaces, one model, one endpoint group on the Worker. **The phone never
+holds an API key** — every turn goes to `/api/assistant/*`, which is locked to
+the GitHub Pages origin and rate-limited per caller, exactly like the voice
+routes.
+
+| Surface | Where | What it does |
+|---|---|---|
+| **Talk to Anya** | Top of the Add invoice sheet | Fills the sheet by conversation (`/api/assistant/invoice`). Returns structured JSON, never prose — a misheard sentence cannot land in a customer record as if it were a value. |
+| **Ask Anya** | Board, and inside a job | A real chat (`/api/assistant/chat`). Repair help with the video first, and she can act on the open job. |
+
+Both stay hidden until `GET /api/health` reports `assistant: true`, so a button
+that would always fail is never shown.
+
+### What she can actually do, and who runs it
+
+Web search runs on Anthropic's servers. Every job-changing tool runs **on the
+phone** — the Worker returns the call unexecuted, the app applies it through the
+same function the button calls, and the outcome goes back as a tool result. The
+Worker never touches a job: the phone is what holds the offline queue, the sync
+state and the timer, and a change made around it is a change the app does not
+know it made.
+
+| Tool | What it does | Refuses when |
+|---|---|---|
+| `clock_in` | Starts billable time | Already on the clock, or no job open |
+| `clock_out` | Stops billable time | Not on the clock |
+| `add_note` | Appends to the notes that print on the invoice | Empty note |
+| `set_agreed_work` | Replaces what the invoice bills against | Empty description |
+
+A refusal goes back as `is_error`, so she reports what actually happened. "You're
+on the clock" said over a clock that never started is unbilled labour.
+
+Nothing is possible when no job is open, and everything is refused on a job whose
+invoice is already filed — she says to unsubmit it first.
+
+### Phone first
+
+This is used one-handed, outdoors, on a phone, with the truck still in front of
+him. The layout is built at phone width and only widens past 620px. Three rules
+in `styles.css` are load-bearing and are pinned by a test, because all three fail
+silently: 16px minimum on any input (below that iOS zooms the page on focus and
+never zooms back), `dvh` rather than `vh` (or the keyboard buries the composer),
+and `env(safe-area-inset-bottom)` on the composer (or it sits under the home
+indicator). Tap targets are 48px and up.
+
+**Two rules in her prompts are not decoration, and must not be softened:**
+
+- **Pricing is never invented.** The agent asks for the labor rate and uses
+  exactly what it is told. It never suggests one.
+- **Specs are never guessed.** A torque figure, capacity, clearance or
+  tightening sequence must come from a source the agent actually searched that
+  turn, or it has to say it could not confirm it. A wrong torque number on a
+  steering or suspension fastener is a safety failure, not a bad answer.
+
+The Worker also overrules the model on completeness: `ready` is refused while
+any of customer name, make, model, agreed work or labor rate is blank, and the
+form's own validation still runs on submit. The model's opinion is an opinion.
+
+### Turning it on
+
+```bash
+wrangler secret put ANTHROPIC_API_KEY --config wrangler.sync.jsonc
+wrangler deploy --config wrangler.sync.jsonc
+curl -s https://gold-mobile-mechanic-sync.forevergoldai.workers.dev/api/health
+# -> {"ok":true,...,"assistant":true}
+```
+
+Costs run on the Anthropic API: Claude Opus 5 tokens on every turn, plus a
+billable web search per shop-mode lookup. The per-caller cap
+(`ASSISTANT_RATE_LIMIT`) is a runaway guard, not a budget — set a spend limit
+in the Anthropic console if that matters.
 
 ## Local development
 

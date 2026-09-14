@@ -8,7 +8,12 @@ test("GitHub Pages phone shell exposes the complete field workflow", async () =>
   const html = await read("docs/index.html");
 
   assert.match(html, /Gold Mobile Mechanic/);
-  assert.match(html, /New job/);
+  // "New job" until 2026-09-12, when the Anya build renamed it. Pin the id as
+  // well as the label: the id is what app.js binds to, and a test that only
+  // knows the wording goes stale every time the wording improves.
+  assert.match(html, /id="newJobButton"/);
+  assert.match(html, /Add invoice/);
+  assert.match(html, /Talk to Anya/);
   assert.match(html, /Customer name/);
   assert.match(html, /Vehicle/);
   assert.match(html, /Agreed work/);
@@ -45,12 +50,35 @@ test("GitHub phone app syncs durable jobs, receipts, and clock history", async (
   assert.match(script, /mailto:/);
   assert.match(script, /backupData/);
   assert.match(script, /serviceWorker\.register/);
-  assert.match(script, /SYNC_API/);
-  // Every cloud call funnels through one wrapper. The owner PIN / Bearer sync
-  // key was deliberately removed in 4617d89 ("App is low-stakes; open access is
-  // fine") — the worker is CORS-locked to the Pages origin instead, so this no
-  // longer asserts an Authorization header.
+  // Every cloud call funnels through one wrapper, and that wrapper goes through
+  // the pairing module rather than calling `fetch` itself.
+  //
+  // This assertion used to say the opposite. The owner PIN was removed in
+  // 4617d89 ("App is low-stakes; open access is fine"), and this file was
+  // edited to match — which left the test agreeing with the hole instead of
+  // catching it. `GET /api/jobs` then served every customer's name, phone,
+  // cost basis and clock ledger to anyone who read the Worker URL out of this
+  // repository. CORS is not a gate: it binds browsers, and curl is not one.
   assert.match(script, /async function cloudFetch\(path, options/);
+  assert.match(script, /window\.GMMAuth\.request/);
+  assert.doesNotMatch(script, /fetch\(`\$\{SYNC_API\}/,
+    "app.js must not reach the sync API around the pairing module");
+
+  const auth = await read("docs/sync-auth.js");
+  assert.match(auth, /Authorization/);
+  assert.match(auth, /Bearer/);
+  assert.match(auth, /\/api\/pair/);
+  // A 401 has to re-pair and retry, or locking the Worker would strand every
+  // phone still running the previous build until someone reinstalled the app.
+  assert.match(auth, /401/);
+  // The PIN is a pairing credential, never a stored one.
+  assert.doesNotMatch(auth, /setItem\(\s*["'`]gmm-pin/, "the PIN itself is never persisted");
+
+  const shell = await read("docs/index.html");
+  assert.match(shell, /<script src="\.\/sync-auth\.js"><\/script>[\s\S]*<script src="\.\/app\.js">/,
+    "sync-auth.js must load before app.js");
+  const worker = await read("docs/sw.js");
+  assert.match(worker, /"\.\/sync-auth\.js"/, "the offline shell must cache the pairing module");
   assert.match(script, /PENDING_JOBS_STORAGE/);
   assert.match(script, /PENDING_RECEIPTS_STORAGE/);
   assert.match(script, /eventHistory/);

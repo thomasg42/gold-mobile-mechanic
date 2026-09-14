@@ -119,7 +119,10 @@ function boot({ store, cloud, calls }) {
   context.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   vm.createContext(context);
-  vm.runInContext(readFileSync(`${DOCS}/app.js`, "utf8"), context, { filename: "app.js" });
+  // sync-auth.js first: app.js calls through it for every cloud request.
+  for (const file of ["sync-auth.js", "app.js"]) {
+    vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
+  }
   return { dom, context };
 }
 
@@ -132,7 +135,7 @@ const settle = async (until, label = "the app") => {
 };
 
 test("every line of a work order can be corrected after the fact", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map([["gold-mobile-mechanic-phone-v1", JSON.stringify(SEED)]]);
+  const store = new Map([["gmm-sync-token", "test-device.signature"], ["gold-mobile-mechanic-phone-v1", JSON.stringify(SEED)]]);
   const cloud = new Map();
   const calls = [];
 
@@ -202,7 +205,7 @@ test("every line of a work order can be corrected after the fact", { skip: parse
 });
 
 test("editing two panels in one visit saves both", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map([["gold-mobile-mechanic-phone-v1", JSON.stringify(SEED)]]);
+  const store = new Map([["gmm-sync-token", "test-device.signature"], ["gold-mobile-mechanic-phone-v1", JSON.stringify(SEED)]]);
   const cloud = new Map();
   const calls = [];
 

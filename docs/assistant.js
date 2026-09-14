@@ -54,7 +54,10 @@
   }
 
   async function post(path, payload) {
-    const response = await fetch(`${SYNC_API}${path}`, {
+    if (!window.GMMAuth) throw new Error("This app needs to finish updating. Close it and reopen.");
+    // Her routes spend Anthropic credit on Thomas's key, so they sit behind the
+    // same operator gate as the job records themselves.
+    const response = await window.GMMAuth.request(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)

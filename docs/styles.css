@@ -2057,6 +2057,18 @@ button {
   letter-spacing: 0.02em;
 }
 
+/* Says why the voice changed under him — a fall back to the phone's own
+ * recogniser, or both engines being gone. Amber rather than red: the app still
+ * works, it just sounds different. */
+.voice-notice:empty { display: none; }
+
+.voice-notice {
+  margin: 8px 0 0;
+  color: #f2c14e;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+}
+
 /* ----------------------------------------------------------------- Anya
  *
  * Phone first, and phone in a driveway: cold hands, one thumb, sunlight, a

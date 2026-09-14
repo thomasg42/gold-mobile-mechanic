@@ -8,11 +8,47 @@ invoice handoff.
 - Job/time data: private Cloudflare D1 ledger behind an authenticated sync API
 - Receipt images: private D1 receipt records, cached in IndexedDB on each phone
 
-GitHub Pages is the only user-facing app URL. Its private sync key is saved only
-on connected devices and sent to the hidden API as an authorization header; it
-is never committed to GitHub. D1 is the source of truth for jobs, timer
-intervals, append-only clock events, and receipt files. Each phone keeps a
-last-known recovery copy and queues changes while offline.
+GitHub Pages is the only user-facing app URL. Each phone is paired once with the
+owner PIN and stores a device token, which it sends to the hidden API as an
+authorization header; neither the PIN nor the token is ever committed to GitHub.
+D1 is the source of truth for jobs, timer intervals, append-only clock events,
+and receipt files. Each phone keeps a last-known recovery copy and queues
+changes while offline.
+
+## Pairing and the sync gate
+
+Every route that can read or change a customer's record requires a paired
+device. Three routes are public on purpose: `/api/health`, `/api/public/*`
+(the website's booking calendar), and `/api/portal/*`, the customer invoice
+portal, which publishes filed bills and deliberately withholds phone numbers,
+email addresses, receipts, cost basis, the clock ledger, and any job still in
+progress.
+
+Pairing a phone: open the app, enter the six-digit PIN when it asks. Once, per
+device. The PIN is exchanged at `POST /api/pair` for a device token — an HMAC of
+a random per-device id keyed on the PIN — and the token is what every later
+request carries. The PIN itself is never stored on the phone and never becomes
+the API credential, so the value sent a hundred times a day is a full signature
+rather than six guessable digits. `/api/pair` is capped at eight attempts an
+hour per caller.
+
+**This gate was missing between 2026-07-31 and 2026-09-12.** It was removed in
+4617d89 as "low-stakes; open access is fine" — true of a database with no real
+customers in it, and untrue by the time it had six. For those six weeks
+`GET /api/jobs` returned every customer name, phone number, cost basis and clock
+entry to anyone who read the Worker URL out of this public repository's
+JavaScript. If that window matters for a disclosure or a customer conversation,
+that is the date range.
+
+Rotating the PIN (do this if a phone is lost — it revokes every paired device at
+once, and each one re-pairs by entering the new PIN):
+
+```bash
+wrangler secret put OWNER_PIN --config wrangler.sync.jsonc
+```
+
+Never commit a PIN, a device token or a Worker secret to this repository, the
+wiki, or a log.
 
 ## Operator workflow
 
@@ -107,6 +143,7 @@ tests/rendered-html.test.mjs      Product-shell and workflow contract checks
 docs/
   index.html                      Canonical GitHub Pages phone shell
   styles.css                      Matching responsive charcoal/gold design
+  sync-auth.js                    Device pairing: the PIN exchange and the Authorization header
   app.js                          Cloud sync, offline recovery, timers, receipts, invoices
   assistant.js                    Anya: the sheet conversation, and the chat that can act on a job
   voice.js                        The spoken turn — mic, silence detection, type-instead
@@ -116,7 +153,7 @@ docs/
   sw.js                           Offline application shell
 tests/github-pages.test.mjs       Public phone-edition contract checks
 sync-worker/
-  index.ts                        Authenticated jobs and receipts API
+  index.ts                        Authenticated jobs and receipts API; owns the pairing gate
   assistant.ts                    Anya's Anthropic proxy — holds the API key, runs no job changes
   migrations/                     Private durable D1 schema
 wrangler.sync.jsonc               Backend deployment configuration
@@ -216,8 +253,29 @@ form's own validation still runs on submit. The model's opinion is an opinion.
 wrangler secret put ANTHROPIC_API_KEY --config wrangler.sync.jsonc
 wrangler deploy --config wrangler.sync.jsonc
 curl -s https://gold-mobile-mechanic-sync.forevergoldai.workers.dev/api/health
-# -> {"ok":true,...,"assistant":true}
+# -> {"ok":true,...,"assistant":true,"locked":true}
 ```
+
+`locked` reports whether `OWNER_PIN` is set. If it is ever `false`, the Worker
+refuses every protected route rather than serving them — a deploy that lost its
+secret fails closed and is visible here.
+
+### When the voice stops working
+
+`"voice":true` in `/api/health` means an ElevenLabs key is SET, not that it
+WORKS. If the key expires or the plan lapses, every `/api/voice/*` call returns
+502 and the app falls back to the phone's own speech engine, saying so in the
+panel. Confirm with:
+
+```bash
+curl -s -X POST -H "Origin: https://thomasg42.github.io" \
+  -H "Content-Type: application/json" -d '{"text":"test"}' \
+  https://gold-mobile-mechanic-sync.forevergoldai.workers.dev/api/voice/tts
+```
+
+A JSON error rather than audio bytes means the key, not the app, is the
+problem. (This route now also requires a paired device; add
+`-H "Authorization: Bearer <token>"` from a paired phone to test it end to end.)
 
 Costs run on the Anthropic API: Claude Opus 5 tokens on every turn, plus a
 billable web search per shop-mode lookup. The per-caller cap

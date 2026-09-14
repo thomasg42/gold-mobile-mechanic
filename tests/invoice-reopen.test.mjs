@@ -131,7 +131,10 @@ function boot({ store, cloud, calls }) {
   context.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   vm.createContext(context);
-  vm.runInContext(readFileSync(`${DOCS}/app.js`, "utf8"), context, { filename: "app.js" });
+  // sync-auth.js first: app.js calls through it for every cloud request.
+  for (const file of ["sync-auth.js", "app.js"]) {
+    vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
+  }
   return { dom, context };
 }
 
@@ -144,7 +147,7 @@ const settle = async (until, label = "the app") => {
 };
 
 test("a filed invoice can be unsubmitted, and it carries the customer's own link", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map([["gold-mobile-mechanic-phone-v1", JSON.stringify({ version: 1, jobs: [INVOICED_JOB] })]]);
+  const store = new Map([["gmm-sync-token", "test-device.signature"], ["gold-mobile-mechanic-phone-v1", JSON.stringify({ version: 1, jobs: [INVOICED_JOB] })]]);
   const cloud = new Map([[INVOICED_JOB.id, structuredClone(INVOICED_JOB)]]);
   const calls = [];
 
@@ -192,7 +195,7 @@ test("a filed invoice can be unsubmitted, and it carries the customer's own link
 });
 
 test("the prepared email carries the customer's own portal link", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map([["gold-mobile-mechanic-phone-v1", JSON.stringify({ version: 1, jobs: [INVOICED_JOB] })]]);
+  const store = new Map([["gmm-sync-token", "test-device.signature"], ["gold-mobile-mechanic-phone-v1", JSON.stringify({ version: 1, jobs: [INVOICED_JOB] })]]);
   const cloud = new Map([[INVOICED_JOB.id, structuredClone(INVOICED_JOB)]]);
   const calls = [];
 

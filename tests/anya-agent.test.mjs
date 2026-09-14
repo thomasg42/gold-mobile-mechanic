@@ -29,6 +29,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { build } from "esbuild";
+import { TEST_PIN, authHeader } from "./pair-helper.mjs";
 
 const root = new URL("../", import.meta.url);
 const DOCS = fileURLToPath(new URL("docs/", root)).replace(/\/$/, "");
@@ -143,11 +144,15 @@ test("the worker's assistant routes hold their guards", async () => {
   };
 
   try {
-    const env = { DB: makeD1(migrations), ANTHROPIC_API_KEY: "sk-ant-test" };
+    const env = { DB: makeD1(migrations), ANTHROPIC_API_KEY: "sk-ant-test", OWNER_PIN: TEST_PIN };
     const call = (path, body, { origin = ORIGIN, method = "POST" } = {}) =>
       worker.fetch(new Request(`https://sync.example.com${path}`, {
         method,
-        headers: { ...(origin ? { Origin: origin } : {}), "Content-Type": "application/json" },
+        headers: {
+          ...(origin ? { Origin: origin } : {}),
+          "Content-Type": "application/json",
+          ...authHeader()
+        },
         body: body === undefined ? undefined : JSON.stringify(body)
       }), env);
 
@@ -155,9 +160,10 @@ test("the worker's assistant routes hold their guards", async () => {
 
     // --------------------------------------- the credential is server-side only
     const unset = await worker.fetch(new Request("https://sync.example.com/api/assistant/invoice", {
-      method: "POST", headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      method: "POST",
+      headers: { Origin: ORIGIN, "Content-Type": "application/json", ...authHeader() },
       body: JSON.stringify({ messages: turn })
-    }), { DB: makeD1(migrations) });
+    }), { DB: makeD1(migrations), OWNER_PIN: TEST_PIN });
     assert.equal(unset.status, 503, "no key means 503, not a broken call to Anthropic");
 
     // ------------------------------------------------------- origin is locked
@@ -370,7 +376,7 @@ function boot({ store, routes, calls, hash = "" }) {
   context.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   vm.createContext(context);
-  for (const file of ["voice-config.js", "assistant.js", "app.js"]) {
+  for (const file of ["sync-auth.js", "voice-config.js", "assistant.js", "app.js"]) {
     vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
   }
   return { dom, context };
@@ -412,7 +418,9 @@ const settle = async (until, label = "the app") => {
 
 test("Talk to Anya fills the real sheet, saves only on a yes, and starts the clock when asked",
   { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map();
+  // Already paired: pairing itself is covered in sync-auth.test.mjs, and an
+  // unpaired store would park these suites on a PIN prompt.
+  const store = new Map([["gmm-sync-token", "test-device.signature"]]);
   const calls = [];
   const spoken = [];
 

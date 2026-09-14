@@ -158,7 +158,7 @@ function boot({ turns, clock, spoken, transcripts, cloud, calls, agentReplies })
   }
 
   const { FakeRecognition } = scriptedRecognition({ turns, clock, transcripts });
-  const store = new Map();
+  const store = new Map([["gmm-sync-token", "test-device.signature"]]);
 
   // Unref'd so a recogniser or watchdog still ticking when the interview ends
   // cannot hold the test process open after the assertions have run.
@@ -244,7 +244,7 @@ function boot({ turns, clock, spoken, transcripts, cloud, calls, agentReplies })
   context.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   vm.createContext(context);
-  for (const file of ["voice-config.js", "voice.js", "assistant.js", "app.js"]) {
+  for (const file of ["sync-auth.js", "voice-config.js", "voice.js", "assistant.js", "app.js"]) {
     vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
   }
   return { dom, context, store };

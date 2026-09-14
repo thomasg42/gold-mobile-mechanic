@@ -21,7 +21,9 @@ try {
 }
 
 test("clocking in and out saves each event on its own, immediately", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map();
+  // Already paired: pairing itself is covered in sync-auth.test.mjs, and an
+  // unpaired store would park these suites on a PIN prompt.
+  const store = new Map([["gmm-sync-token", "test-device.signature"]]);
   const calls = [];
 
   const html = readFileSync(`${DOCS}/index.html`, "utf8");
@@ -71,7 +73,10 @@ test("clocking in and out saves each event on its own, immediately", { skip: par
 
 
   vm.createContext(context);
-  vm.runInContext(readFileSync(`${DOCS}/app.js`, "utf8"), context, { filename: "app.js" });
+  // sync-auth.js first: app.js calls through it for every cloud request.
+  for (const file of ["sync-auth.js", "app.js"]) {
+    vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
+  }
 
   // The app renders and syncs asynchronously, so wait for the condition rather
   // than for an arbitrary number of milliseconds.

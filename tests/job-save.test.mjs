@@ -92,7 +92,10 @@ function boot({ store, cloud, calls }) {
   context.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   vm.createContext(context);
-  vm.runInContext(readFileSync(`${DOCS}/app.js`, "utf8"), context, { filename: "app.js" });
+  // sync-auth.js first: app.js calls through it for every cloud request.
+  for (const file of ["sync-auth.js", "app.js"]) {
+    vm.runInContext(readFileSync(`${DOCS}/${file}`, "utf8"), context, { filename: file });
+  }
   return { dom, context };
 }
 
@@ -105,7 +108,7 @@ const settle = async (until) => {
 };
 
 test("a new customer is saved on the phone and reaches the cloud", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map();
+  const store = new Map([["gmm-sync-token", "test-device.signature"]]);
   const cloud = new Map();
   const calls = [];
 
@@ -183,7 +186,7 @@ test("a new customer is saved on the phone and reaches the cloud", { skip: parse
 });
 
 test("the top-bar Save button drains the queue and reports the truth", { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
-  const store = new Map();
+  const store = new Map([["gmm-sync-token", "test-device.signature"]]);
   const cloud = new Map();
   const calls = [];
 

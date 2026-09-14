@@ -1,9 +1,10 @@
-const CACHE = "gold-mobile-mechanic-v29-anya";
+const CACHE = "gold-mobile-mechanic-v30-paired";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./sync-auth.js",
   "./voice-config.js",
   "./voice.js",
   "./assistant.js",
@@ -29,6 +30,11 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
+  // The application shell only. API responses were being written to the cache
+  // too, which put every customer's name, phone and job history on disk in a
+  // store nothing re-checks the pairing against — and served them back from
+  // there. The app's own offline copy lives in localStorage and IndexedDB.
+  if (new URL(event.request.url).pathname.startsWith("/api/")) return;
   event.respondWith(
     fetch(event.request)
       .then((response) => {

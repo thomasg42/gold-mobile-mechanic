@@ -7,6 +7,16 @@ import {
 interface Env extends AssistantEnv {
   DB: D1Database;
   /**
+   * The operator PIN, set with
+   * `wrangler secret put OWNER_PIN --config wrangler.sync.jsonc`.
+   *
+   * Every route that can read or change a customer's record is behind it. When
+   * it is UNSET those routes return 401 rather than falling open — a Worker
+   * deployed without its secret should be loudly broken, not quietly public,
+   * which is the exact failure this gate exists to undo.
+   */
+  OWNER_PIN?: string;
+  /**
    * Set with `wrangler secret put ELEVENLABS_API_KEY --config wrangler.sync.jsonc`.
    * When absent the voice routes return 503 and the phone falls back to the
    * browser's own speech engine, so the app keeps working either way.
@@ -54,6 +64,16 @@ const ASSISTANT_RATE_LIMIT = 40;
 const ASSISTANT_RATE_WINDOW_SECONDS = 300;
 const MAX_ASSISTANT_BODY_BYTES = 200_000;
 
+// Pairing is the only place a guessable secret is accepted, so it is the only
+// place brute force buys anything. Eight tries an hour per caller turns a
+// six-digit PIN into roughly fourteen years of guessing, while still leaving
+// room for a mistyped thumb. Every later request carries the device token
+// instead, which is a full HMAC and is not guessable at all.
+const PAIR_RATE_LIMIT = 8;
+const PAIR_RATE_WINDOW_SECONDS = 3600;
+/** Bumping this invalidates every issued device token. */
+const DEVICE_TOKEN_VERSION = "v1";
+
 // The customer portal is open by design, so this limit is not protecting the
 // data — it only stops one caller hammering the worker or bulk-scraping it.
 const PORTAL_RATE_LIMIT = 120;
@@ -70,7 +90,7 @@ function allowedOrigin(request: Request): string | null {
 
 function corsHeaders(request: Request): Headers {
   const headers = new Headers({
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
@@ -89,6 +109,96 @@ function json(
   headers.set("Content-Type", "application/json; charset=utf-8");
   headers.set("Cache-Control", "no-store");
   return new Response(JSON.stringify(payload), { status, headers });
+}
+
+/** Compares without leaking, through timing, how much of a value matched. */
+function constantTimeEqual(a: string, b: string): boolean {
+  const left = new TextEncoder().encode(a);
+  const right = new TextEncoder().encode(b);
+  // Length is not secret, but bail on a fixed-cost compare rather than a short
+  // one so the early return cannot itself be timed.
+  let diff = left.length ^ right.length;
+  const max = Math.max(left.length, right.length);
+  for (let index = 0; index < max; index += 1) {
+    diff |= (left[index] ?? 0) ^ (right[index] ?? 0);
+  }
+  return diff === 0;
+}
+
+function base64Url(buffer: ArrayBuffer): string {
+  return arrayBufferToBase64(buffer)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/**
+ * This device's half of the credential: an HMAC of its random id under the
+ * PIN. The Worker stores nothing — it re-derives the signature and compares —
+ * so there is no device table to migrate, and rotating the PIN revokes every
+ * phone at once, which is exactly what you want the morning one goes missing.
+ */
+async function signDevice(pin: string, deviceId: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(pin),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`gmm-device|${DEVICE_TOKEN_VERSION}|${deviceId}`),
+  );
+  return base64Url(signature);
+}
+
+/** Is this request carrying a device token this Worker actually issued? */
+async function operatorAuthorized(request: Request, env: Env): Promise<boolean> {
+  if (!env.OWNER_PIN) return false;
+  const match = /^Bearer\s+(.+)$/i.exec(request.headers.get("Authorization") || "");
+  if (!match) return false;
+  const separator = match[1].lastIndexOf(".");
+  if (separator <= 0) return false;
+  const deviceId = match[1].slice(0, separator);
+  const signature = match[1].slice(separator + 1);
+  if (!deviceId || !signature) return false;
+  return constantTimeEqual(signature, await signDevice(env.OWNER_PIN, deviceId));
+}
+
+/** Trades the PIN for this device's token, once per phone. */
+async function pairDevice(request: Request, env: Env): Promise<Response> {
+  if (!env.OWNER_PIN) {
+    return json(request, { error: "Pairing is not configured yet." }, 503);
+  }
+  // Fail CLOSED here, unlike the billable-route limiters. If the counter cannot
+  // be read there is no cap, and an uncapped PIN endpoint is a six-digit secret
+  // being enumerated. Pairing is rare and the records live in the same database
+  // the counter does, so refusing costs a retry and protects the only guessable
+  // credential in the system.
+  if (!(await withinRateLimit(request, env, "pair", PAIR_RATE_LIMIT, PAIR_RATE_WINDOW_SECONDS, false))) {
+    return json(request, { error: "Too many pairing attempts. Try again later." }, 429);
+  }
+
+  let payload: { pin?: unknown; deviceId?: unknown };
+  try {
+    payload = (await request.json()) as { pin?: unknown; deviceId?: unknown };
+  } catch {
+    return json(request, { error: "Bad request." }, 400);
+  }
+
+  const deviceId = String(payload?.deviceId ?? "").trim();
+  // The id only names a phone, but it is signed material, so keep it to a
+  // charset that cannot smuggle a separator into the token.
+  if (!deviceId || deviceId.length > 100 || !/^[A-Za-z0-9-]+$/.test(deviceId)) {
+    return json(request, { error: "Bad request." }, 400);
+  }
+  if (!constantTimeEqual(String(payload?.pin ?? ""), env.OWNER_PIN)) {
+    return json(request, { error: "That PIN did not work." }, 401);
+  }
+
+  return json(request, { token: `${deviceId}.${await signDevice(env.OWNER_PIN, deviceId)}` });
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -811,6 +921,7 @@ async function withinRateLimit(
   prefix: string,
   limit: number,
   windowSeconds: number,
+  allowOnError = true,
 ): Promise<boolean> {
   const caller = request.headers.get("CF-Connecting-IP") || "unknown";
   const nowSeconds = Math.floor(Date.now() / 1000);
@@ -833,8 +944,10 @@ async function withinRateLimit(
     }
     return (row?.count ?? 0) <= limit;
   } catch {
-    // A limiter outage must not take the feature down with it.
-    return true;
+    // A limiter outage must not take a billable feature down with it — but the
+    // pairing endpoint passes `false`, because there the limiter IS the
+    // protection.
+    return allowOnError;
   }
 }
 
@@ -972,6 +1085,9 @@ export default {
         service: "gold-mobile-mechanic-sync",
         voice: Boolean(env.ELEVENLABS_API_KEY),
         assistant: Boolean(env.ANTHROPIC_API_KEY),
+        // Not a secret, and the fastest way to catch a deploy that shipped the
+        // code without the secret it depends on.
+        locked: Boolean(env.OWNER_PIN),
       });
     }
 
@@ -987,8 +1103,46 @@ export default {
       return bookWebsiteDay(request, env);
     }
 
-    // The voice routes spend real ElevenLabs credit, so unlike the sync routes
-    // they refuse anything that is not the app's own origin.
+    if (url.pathname === "/api/portal/customers" && request.method === "GET") {
+      if (request.headers.get("Origin") && !allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      return portalDirectory(request, env);
+    }
+
+    const portalProfile = /^\/api\/portal\/customers\/([^/]+)$/.exec(url.pathname);
+    if (portalProfile && request.method === "GET") {
+      if (request.headers.get("Origin") && !allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      return portalCustomer(request, env, decodeURIComponent(portalProfile[1]));
+    }
+
+    // Pairing is the door itself, so it cannot sit behind the lock. It is a
+    // browser-only route: nothing but the app has any business calling it.
+    if (url.pathname === "/api/pair" && request.method === "POST") {
+      if (!allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      return pairDevice(request, env);
+    }
+
+    // ------------------------------------------------------------- the gate
+    //
+    // Everything ABOVE this line is public on purpose: the health probe, the
+    // website's booking form, and the customer invoice portal (which publishes
+    // filed bills only — never a phone number, a cost basis or an open job).
+    //
+    // Everything BELOW it is the shop's own records and the two routes that
+    // spend money on Thomas's accounts. New routes land below by default, and
+    // that is the point: the previous version of this file lost its gate and
+    // nothing about adding a route ever said so.
+    if (!(await operatorAuthorized(request, env))) {
+      return json(request, { error: "Pair this device to use the app." }, 401);
+    }
+
+    // The voice routes spend real ElevenLabs credit, so on top of the operator
+    // gate they refuse anything that is not the app's own origin.
     if (url.pathname.startsWith("/api/voice/")) {
       if (!allowedOrigin(request)) {
         return json(request, { error: "Forbidden." }, 403);
@@ -1024,21 +1178,6 @@ export default {
     }
     if (receipt && request.method === "GET") {
       return getReceipt(request, env, receipt.jobId, receipt.receiptId);
-    }
-
-    if (url.pathname === "/api/portal/customers" && request.method === "GET") {
-      if (request.headers.get("Origin") && !allowedOrigin(request)) {
-        return json(request, { error: "Forbidden." }, 403);
-      }
-      return portalDirectory(request, env);
-    }
-
-    const portalProfile = /^\/api\/portal\/customers\/([^/]+)$/.exec(url.pathname);
-    if (portalProfile && request.method === "GET") {
-      if (request.headers.get("Origin") && !allowedOrigin(request)) {
-        return json(request, { error: "Forbidden." }, 403);
-      }
-      return portalCustomer(request, env, decodeURIComponent(portalProfile[1]));
     }
 
     const jobEvent = jobEventsPath(url.pathname);

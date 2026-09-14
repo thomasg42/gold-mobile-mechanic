@@ -41,6 +41,8 @@
 
   let engine = "browser";
   let engineChecked = null;
+  /** Shown once in the panel after a fall back, so silence is never unexplained. */
+  let engineNotice = "";
   let sharedAudio = null;
   let audioContext = null;
   let activeStream = null;
@@ -71,6 +73,13 @@
   }
 
   class VoiceCancelled extends Error {}
+
+  /**
+   * The hosted recogniser could not answer at all — dead key, expired plan, no
+   * network. Emphatically NOT the same as it listening and hearing nothing,
+   * and keeping the two apart is what makes the fallback below possible.
+   */
+  class VoiceEngineFailure extends Error {}
 
   function assertLive() {
     if (cancelled) throw new VoiceCancelled("Voice stopped.");
@@ -106,6 +115,24 @@
     } catch {
       /* Same. */
     }
+  }
+
+  /**
+   * Stops using the hosted engine for the rest of this session.
+   *
+   * BOTH of these assignments are required, and the missing second one is why
+   * a dead ElevenLabs key used to make the talk button do nothing at all.
+   * `detectEngine()` memoises its ANSWER, not the variable, so setting
+   * `engine` alone left the cached promise still resolving to "elevenlabs" —
+   * every turn kept calling a service that had already failed, while the
+   * fallback that checks `engine` was skipped for the same reason.
+   */
+  function degradeToBrowser(notice) {
+    if (engine !== "elevenlabs") return;
+    engine = "browser";
+    engineChecked = Promise.resolve("browser");
+    engineNotice = notice || "Using this phone's own voice.";
+    setOverlay({ notice: engineNotice });
   }
 
   async function detectEngine() {
@@ -176,7 +203,7 @@
     setOverlay({ state: "speaking", question: line });
     if ((await detectEngine()) === "elevenlabs") {
       try {
-        const response = await fetch(`${SYNC_API}/api/voice/tts`, {
+        const response = await window.GMMAuth.request("/api/voice/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: line })
@@ -185,10 +212,12 @@
           await playBlob(await response.blob());
           return;
         }
-        // A 503 means the key was never set; stop paying the round trip.
-        if (response.status === 503) engine = "browser";
+        // ANY refusal, not just a 503. A 502 is the service itself failing —
+        // an expired plan reads exactly like this — and retrying it on every
+        // line only buys a round trip of silence before each sentence.
+        degradeToBrowser("Using this phone's own voice.");
       } catch {
-        /* Fall through to the browser voice. */
+        /* A network blip: use the browser voice for this line and try again. */
       }
     }
     await speakWithBrowser(line);
@@ -305,14 +334,19 @@
     assertLive();
     if (!heardSpeech || blob.size < 1200) return "";
     setOverlay({ state: "thinking" });
-    const response = await fetch(`${SYNC_API}/api/voice/stt`, {
-      method: "POST",
-      headers: { "Content-Type": blob.type || "audio/webm" },
-      body: blob
-    });
+    let response;
+    try {
+      response = await window.GMMAuth.request("/api/voice/stt", {
+        method: "POST",
+        headers: { "Content-Type": blob.type || "audio/webm" },
+        body: blob
+      });
+    } catch {
+      throw new VoiceEngineFailure("Could not reach the transcriber.");
+    }
     if (!response.ok) {
-      if (response.status === 503) engine = "browser";
-      throw new Error("Could not hear that.");
+      degradeToBrowser("Using this phone's own dictation.");
+      throw new VoiceEngineFailure("Could not hear that.");
     }
     const payload = await response.json();
     return String(payload?.text || "").trim();
@@ -441,21 +475,54 @@
     });
   }
 
+  /**
+   * One turn of listening, with a fallback that is actually reachable.
+   *
+   * The bug this shape exists to prevent: when the hosted recogniser is the
+   * engine and it FAILS, the old guard here (`engine !== "elevenlabs"`) was
+   * false, so the phone's own recogniser was never tried. With a dead
+   * ElevenLabs key that produced exactly one symptom — the panel records, the
+   * "take your time" counter runs down, and then nothing happens, every turn,
+   * with no error anywhere. Talking to Anya looked broken because listening
+   * silently returned "" forever.
+   *
+   * So the two outcomes are kept apart. Hearing nothing is a COMPLETED listen:
+   * the mechanic said nothing, and re-recording would only ask him to repeat
+   * himself into a second microphone grant. A failure is not a listen at all,
+   * and it hands the turn to the browser engine instead.
+   */
   async function listen(patience) {
     assertLive();
     const pacing = pacingFor(patience);
-    setOverlay({ state: "listening", heard: "", waiting: null });
+    setOverlay({ state: "listening", heard: "", waiting: null, notice: engineNotice });
     let heard = "";
+    let remoteFailed = false;
+
     if ((await detectEngine()) === "elevenlabs") {
       try {
         heard = await listenWithElevenLabs(pacing);
       } catch (error) {
         if (error instanceof VoiceCancelled) throw error;
-        heard = "";
+        remoteFailed = true;
       }
     }
-    if (!heard && engine !== "elevenlabs") heard = await listenWithBrowser(pacing);
+
+    if (!heard && (remoteFailed || engine !== "elevenlabs")) {
+      try {
+        heard = await listenWithBrowser(pacing);
+      } catch (error) {
+        if (error instanceof VoiceCancelled) throw error;
+        // Both engines are gone — an old Android WebView with no
+        // SpeechRecognition, on a phone whose hosted key has expired. Say so
+        // and open the keyboard, rather than looping "I didn't catch that".
+        offerTyping("Voice isn't working on this phone — type your answer.");
+      }
+    }
+
     assertLive();
+    // A turn that recorded and came back with nothing is where a mechanic gets
+    // stuck, so put the keyboard in front of him instead of asking again.
+    if (!heard) offerTyping();
     setOverlay({ heard, waiting: null });
     return heard;
   }
@@ -768,6 +835,7 @@
         <p class="voice-question" id="voiceQuestion"></p>
         <p class="voice-heard" id="voiceHeard"></p>
         <p class="voice-waiting" id="voiceWaiting"></p>
+        <p class="voice-notice" id="voiceNotice"></p>
         <div class="voice-typed hidden" id="voiceTypedRow">
           <input id="voiceTypedInput" placeholder="Type the answer" autocomplete="off">
           <button class="button button-gold" id="voiceTypedSubmit" type="button">Use this</button>
@@ -830,6 +898,23 @@
         ? ""
         : `Still listening — take your time (${patch.waiting}s)`;
     }
+    if (patch.notice !== undefined) {
+      overlay.querySelector("#voiceNotice").textContent = patch.notice || "";
+    }
+  }
+
+  /**
+   * Opens the typing row without waiting to be asked.
+   *
+   * "Type instead" was always there, behind a button, which is no help at all
+   * when the failure mode is that nothing visibly happens — there is no moment
+   * that tells you to go looking for it.
+   */
+  function offerTyping(notice) {
+    if (!overlay) return;
+    const row = overlay.querySelector("#voiceTypedRow");
+    if (row) row.classList.remove("hidden");
+    if (notice) setOverlay({ notice });
   }
 
   function showOverlay() {

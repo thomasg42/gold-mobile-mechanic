@@ -10,6 +10,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { build } from "esbuild";
+import { TEST_PIN, authHeader } from "./pair-helper.mjs";
 
 const root = new URL("../", import.meta.url);
 const migrationsDir = fileURLToPath(new URL("sync-worker/migrations/", root));
@@ -64,13 +65,13 @@ test("sync worker records clock events durably and serves the customer portal", 
   const worker = await loadWorker();
   const migrations = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()
     .map((f) => readFileSync(`${migrationsDir}${f}`, "utf8"));
-  const env = { DB: makeD1(migrations) };
+  const env = { DB: makeD1(migrations), OWNER_PIN: TEST_PIN };
 
   const ORIGIN = "https://thomasg42.github.io";
-  const call = (path, { method = "GET", body } = {}) =>
+  const call = (path, { method = "GET", body, headers = {} } = {}) =>
     worker.fetch(new Request(`https://sync.example.com${path}`, {
       method,
-      headers: { Origin: ORIGIN, "Content-Type": "application/json" },
+      headers: { Origin: ORIGIN, "Content-Type": "application/json", ...authHeader(), ...headers },
       body: body === undefined ? undefined : JSON.stringify(body)
     }), env);
   const ok = () => {};

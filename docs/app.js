@@ -5,7 +5,6 @@
   const NEW_JOB_DRAFT_STORAGE = "gold-mobile-mechanic-new-job-draft-v1";
   const RECEIPT_DB = "gold-mobile-mechanic-receipts";
   const RECEIPT_STORE = "receipts";
-  const SYNC_API = "https://gold-mobile-mechanic-sync.forevergoldai.workers.dev";
   // Where customers look their own invoices up. Same GitHub Pages site.
   const PORTAL_URL = `${window.location.origin}${window.location.pathname.replace(/[^/]*$/, "")}portal.html`;
   const OCR_BASE = "./vendor/tesseract";
@@ -355,13 +354,22 @@
     void flushSyncQueue().catch(() => {});
   }
 
+  /**
+   * Every call that touches the shop's own records. The Authorization header,
+   * the one-time PIN prompt and the retry after a 401 all live in
+   * `sync-auth.js`; this wrapper only turns a failure into a sentence.
+   *
+   * The `GMMAuth` guard is not defensive padding. A phone running a stale
+   * service-worker shell can have `app.js` without the newer file beside it,
+   * and an app that throws at boot over a missing helper is worse than one
+   * that runs and reports that sync is unavailable.
+   */
   async function cloudFetch(path, options = {}) {
-    const headers = new Headers(options.headers || {});
-    const response = await fetch(`${SYNC_API}${path}`, {
-      ...options,
-      cache: "no-store",
-      headers
-    });
+    if (!window.GMMAuth) throw new Error("This app needs to finish updating. Close it and reopen.");
+    const response = await window.GMMAuth.request(path, options);
+    if (response.status === 401) {
+      throw new Error("This phone isn't paired yet. Enter your PIN to sync.");
+    }
     if (!response.ok) {
       let message = `Cloud sync failed (${response.status}).`;
       try {

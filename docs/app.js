@@ -727,6 +727,75 @@
     return "";
   }
 
+  /**
+   * Anya's finish check, computed on the phone rather than guessed by the model
+   * — the same principle as the Worker overruling `ready`. Returns the boxes
+   * that MUST be filled before this can be a real invoice, the ones worth having
+   * but not required, the next workflow step, and a plain-English history of
+   * this exact job so she can double-check it the way a person would before
+   * filing.
+   */
+  function buildInvoiceReview(job) {
+    const has = (value) => String(value ?? "").trim().length > 0;
+
+    const blocking = [];
+    if (!has(job.customerName)) blocking.push("the customer's name");
+    if (!has(job.vehicleMake)) blocking.push("the vehicle make");
+    if (!has(job.vehicleModel)) blocking.push("the vehicle model");
+    if (!has(job.agreedWork)) blocking.push("the agreed work the invoice bills against");
+    if (!Number(job.laborRateCents || 0)) blocking.push("the hourly labor rate");
+    (job.receipts || []).forEach((receipt, index) => {
+      const label = `receipt ${index + 1}`;
+      if (!has(receipt.vendor)) blocking.push(`${label} is missing its vendor`);
+      if (!has(receipt.receiptParts || receipt.orderId)) blocking.push(`${label} is missing its parts`);
+      if (!Number(receipt.amountCents || 0)) blocking.push(`${label} is missing its total amount`);
+    });
+
+    const recommended = [];
+    if (!has(job.customerPhone)) recommended.push("a phone number");
+    if (!has(job.customerEmail)) recommended.push("an email to send the invoice to");
+    if (!has(job.vehicleYear)) recommended.push("the vehicle year");
+    if (!has(job.vehiclePlate)) recommended.push("the license plate");
+    if (!has(job.suggestions)) recommended.push("any notes or recommendations to print on the invoice");
+
+    // The workflow step still owed, kept apart from missing data so she doesn't
+    // report "clock out" as if it were a blank field.
+    let nextStep = "";
+    if (job.status === "in_progress") nextStep = "He's still on the clock — Finish Project closes the timer and files it.";
+    else if (job.status === "clocked_out") nextStep = "Clocked out — Finish Project files the invoice.";
+    else if (job.status === "draft") nextStep = "Not clocked in yet, so there's no billable time on it.";
+    else if (job.status === "completed") nextStep = "Timer's closed — Create & share invoice files it.";
+    else if (job.status === "invoiced") nextStep = "Already filed. Unsubmit it first to change anything.";
+
+    const draft = invoiceDraft(job);
+    return {
+      ready: blocking.length === 0,
+      blocking,
+      recommended,
+      nextStep,
+      billedMinutes: Math.round((draft.workSeconds || 0) / 60),
+      laborRate: job.laborRateCents ? money(job.laborRateCents) : "",
+      total: money(draft.totalCents),
+      history: summarizeJobHistory(job)
+    };
+  }
+
+  /** A compact, spoken-friendly log of the clock events on this exact job. */
+  function summarizeJobHistory(job) {
+    const label = {
+      clock_in: "clocked in", clock_out: "clocked out",
+      finished: "finished", invoice_reopened: "invoice reopened"
+    };
+    const parts = (Array.isArray(job.eventHistory) ? job.eventHistory : [])
+      .map((event) => {
+        const name = label[event.action] || String(event.action || "").replace(/_/g, " ");
+        const at = clockTime(event.occurredAt);
+        return at ? `${name} ${at}` : name;
+      })
+      .filter(Boolean);
+    return parts.length ? parts.join(", ") : "no clock events recorded yet";
+  }
+
   function laborAdjustmentNote(job, draft = invoiceDraft(job)) {
     const magnitude = Math.abs(Number(draft.laborAdjustmentCents || 0));
     if (!magnitude) return "No labor adjustment.";
@@ -1696,7 +1765,8 @@
         <div class="card-cta">
           ${job.status === "invoiced"
             ? `<button class="button button-quiet unsubmit-button" data-unsubmit-invoice type="button">Unsubmit invoice</button>`
-            : `<button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
+            : `<button class="button button-talk hidden" id="finishReviewButton" type="button"><span aria-hidden="true">💬</span> Ask Anya to finish your invoice</button>
+          <button class="button button-voice" id="voiceFinishButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}><span aria-hidden="true">🎙</span> Close it by voice</button>
           <button class="button button-red" id="clockOutButton" type="button" ${job.status === "in_progress" || job.status === "clocked_out" ? "" : "disabled"}>Finish Project</button>`}
         </div>
       </section>`;
@@ -1942,6 +2012,16 @@
       // is rebuilt by innerHTML, so this is a fresh button every time.
       void Promise.resolve(window.GMMAgent?.available() ?? false).then((ready) => {
         jobShopAgentButton.classList.toggle("hidden", !ready);
+      });
+    }
+
+    const finishReviewButton = $("finishReviewButton");
+    if (finishReviewButton) {
+      finishReviewButton.addEventListener("click", () => window.GMMAgent?.reviewInvoice());
+      // Same per-render availability gate as the other Anya buttons: a finish
+      // check that could only answer "not switched on" is never shown.
+      void Promise.resolve(window.GMMAgent?.available() ?? false).then((ready) => {
+        finishReviewButton.classList.toggle("hidden", !ready);
       });
     }
 
@@ -3826,6 +3906,14 @@
         agreedWork: filled.agreedWork || "",
         suggestions: ""
       };
+    },
+    /**
+     * The deterministic finish check for the job on screen — every missing box,
+     * computed here so Anya reports facts, not a guess. Null when no job is open.
+     */
+    invoiceReview: () => {
+      const job = agentJob();
+      return job ? buildInvoiceReview(job) : null;
     }
   };
 

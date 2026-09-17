@@ -429,12 +429,46 @@
     if (panel) panel.querySelector("#agentThread").innerHTML = "";
   }
 
+  /**
+   * The finish check. The phone computes what is missing deterministically —
+   * facts, not the model's opinion, the same principle as the Worker overruling
+   * `ready` — and hands those facts to Anya so she double-checks the invoice out
+   * loud, reads the job's own history, and helps fill any gap before he files.
+   */
+  function reviewMessage(review) {
+    const lines = ["Finish-check this invoice before I file it. Go through it box by box."];
+    lines.push(review.blocking.length
+      ? `Required boxes still empty: ${review.blocking.join("; ")}.`
+      : "Every required box is filled.");
+    if (review.recommended.length) {
+      lines.push(`Missing but not required: ${review.recommended.join("; ")}.`);
+    }
+    if (review.nextStep) lines.push(review.nextStep);
+    lines.push(`This job's history so far: ${review.history}.`);
+    lines.push(review.laborRate
+      ? `Rate ${review.laborRate}, ${review.billedMinutes} minutes billed, total ${review.total}.`
+      : `Total so far ${review.total}.`);
+    lines.push("Tell me plainly whether this is a complete, fileable invoice, and if not, exactly what to fix first. If I dictate a note or a scope change, put it on.");
+    return lines.join(" ");
+  }
+
+  async function reviewInvoice() {
+    const review = bridge().invoiceReview?.();
+    if (!review) {
+      bridge().notify?.("Open a job first, then I'll double-check its invoice.", true);
+      return;
+    }
+    openChat();
+    await ask(reviewMessage(review));
+  }
+
   window.GMMAgent = {
     name: AGENT_NAME,
     available,
     talkItIn,
     openChat,
     closeChat,
-    resetChat
+    resetChat,
+    reviewInvoice
   };
 })();

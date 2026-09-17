@@ -451,7 +451,7 @@ test("Talk to Anya fills the real sheet, saves only on a yes, and starts the clo
 
   await settle(() => !doc.getElementById("talkRow").classList.contains("hidden"), "her buttons to appear");
   assert.ok(!doc.getElementById("shopAgentButton").classList.contains("hidden"));
-  assert.match(doc.getElementById("talkItInButton").textContent, /Talk to Anya/);
+  assert.match(doc.getElementById("talkItInButton").textContent, /Ask Anya to create invoice/);
   assert.match(doc.getElementById("shopAgentButton").textContent, /Ask Anya/);
 
   const addInvoice = doc.getElementById("newJobButton");
@@ -642,4 +642,71 @@ test("the agent surfaces are built for a phone", () => {
     "the panel is not defined desktop-first and patched down for phones");
   assert.match(agent, /@media \(hover: hover\)/,
     "hover styles are gated, because a thumb never hovers");
+});
+
+// The finish check is deterministic on the phone — facts, not the model's
+// opinion, the same principle as the Worker overruling `ready`. This pins that
+// it flags the actually-blank boxes and, just as importantly, does NOT flag the
+// filled ones, so it can't pass by listing everything or nothing.
+const INCOMPLETE = {
+  version: 1,
+  jobs: [{
+    id: "GMM-0042", customerName: "Dale", customerPhone: "", customerEmail: "",
+    vehicleYear: "2019", vehicleMake: "Ford", vehicleModel: "F-150", vehiclePlate: "",
+    laborRateCents: 0, status: "clocked_out", materials: [], receipts: [],
+    timeEntries: [{ id: "t1", kind: "work", startedAt: "2026-09-12T14:00:00.000Z", endedAt: "2026-09-12T15:00:00.000Z" }],
+    eventHistory: [
+      { id: "e1", action: "clock_in", occurredAt: "2026-09-12T14:00:00.000Z" },
+      { id: "e2", action: "clock_out", occurredAt: "2026-09-12T15:00:00.000Z" }
+    ],
+    agreedWork: "Front brakes", suggestions: "",
+    startedAt: "2026-09-12T14:00:00.000Z", createdAt: "2026-09-12T14:00:00.000Z",
+    updatedAt: "2026-09-12T14:00:00.000Z"
+  }]
+};
+
+test("Ask Anya to finish the invoice reports the real missing boxes, not a guess",
+  { skip: parseHTML ? false : "linkedom is not installed" }, async () => {
+  const store = new Map([["gold-mobile-mechanic-phone-v1", JSON.stringify(INCOMPLETE)]]);
+  const calls = [];
+  const { dom, context } = boot({
+    store, calls, hash: "#job/GMM-0042",
+    routes: {
+      "/api/health": () => ({ ok: true, assistant: true }),
+      "/api/jobs": () => ({ jobs: [] })
+    }
+  });
+  const doc = dom.document;
+  // boot() doesn't load voice.js, so the work order's voice buttons need a stub
+  // the same way the clock-in test does, or rendering the job throws.
+  context.GMMVoice = fakeVoice([], []);
+
+  await settle(() => !doc.getElementById("jobView").classList.contains("hidden"), "the work order");
+
+  const review = context.GMMAgentBridge.invoiceReview();
+  assert.equal(review.ready, false, "a job missing its rate is not a fileable invoice");
+
+  // The deliberately-blank required box is named.
+  assert.ok(review.blocking.some((line) => /labor rate/i.test(line)), "flags the blank hourly rate");
+
+  // Not vacuous: the filled required boxes are NOT flagged.
+  assert.ok(!review.blocking.some((line) => /agreed work/i.test(line)),
+    "agreed work is filled, so it is not flagged as missing");
+  assert.ok(!review.blocking.some((line) => /vehicle make|vehicle model|customer's name/i.test(line)),
+    "the customer and vehicle are filled, so they are not flagged");
+
+  // Optional-but-missing is kept apart from blocking; a present optional (year)
+  // is not listed.
+  assert.ok(review.recommended.some((line) => /phone/i.test(line)), "notes the missing phone");
+  assert.ok(review.recommended.some((line) => /email/i.test(line)), "notes the missing email");
+  assert.ok(!review.recommended.some((line) => /year/i.test(line)),
+    "the year is filled, so it is not recommended");
+
+  // She reads the job's own history, not an empty log.
+  assert.match(review.history, /clocked in/i);
+  assert.match(review.history, /clocked out/i);
+
+  // The button that triggers her is on the work order and gated on availability.
+  await settle(() => doc.getElementById("finishReviewButton"), "the finish-check button");
+  assert.match(doc.getElementById("finishReviewButton").textContent, /Ask Anya to finish your invoice/);
 });

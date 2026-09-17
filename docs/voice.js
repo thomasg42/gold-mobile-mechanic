@@ -279,6 +279,13 @@
     const samples = analyser ? new Uint8Array(analyser.fftSize) : null;
     let heardSpeech = false;
     let quietSince = 0;
+    // The room's own noise level, learned live. A fixed threshold is why the
+    // countdown used to stick: a running engine or a busy street sits above any
+    // one number, so every loop looked like speech and the silence timer reset
+    // forever. The floor tracks the quietest recent moment (the gaps between his
+    // words, or the ambient before he starts) and drifts up only slowly, so his
+    // voice still reads well above it while background hum does not.
+    let noiseFloor = 0;
 
     while (recorder.state === "recording") {
       await sleep(90);
@@ -299,12 +306,23 @@
         sum += value * value;
       }
       const rms = Math.sqrt(sum / samples.length);
+      // Drop instantly toward any quieter level, rise only a sip at a time. It
+      // starts at zero, NOT at the first sample, so a loud opening word cannot
+      // seed the floor up above his own voice and lock speech out entirely — the
+      // floor only climbs on the ambient it sees between and around his words.
+      // The absolute SPEECH_RMS stays a minimum, so a silent room still needs
+      // real sound to count as speech.
+      noiseFloor = rms < noiseFloor ? rms : noiseFloor + (rms - noiseFloor) * 0.02;
+      const speechThreshold = Math.max(SPEECH_RMS, noiseFloor * 2.2 + 0.006);
+
+      // Count down from the whole hold the instant he pauses, and show it as a
+      // ceiling so it reads 7, 6, 5 rather than starting at 6.
       const waiting = heardSpeech && quietSince
-        ? Math.max(0, Math.round((pacing.silenceHoldMs - (Date.now() - quietSince)) / 1000))
+        ? Math.max(0, Math.ceil((pacing.silenceHoldMs - (Date.now() - quietSince)) / 1000))
         : null;
       setOverlay({ level: Math.min(1, rms / 0.08), waiting });
 
-      if (rms > SPEECH_RMS) {
+      if (rms > speechThreshold) {
         heardSpeech = true;
         quietSince = 0;
       } else if (heardSpeech) {
@@ -374,6 +392,12 @@
       let finalText = "";
       let liveText = "";
       let lastVoiceAt = Date.now();
+      // Silence is measured as "no new words", not "no events". The phone's
+      // recogniser fires `onresult` repeatedly while it re-interprets the same
+      // audio, and a noisy room keeps it firing — which used to refresh the
+      // countdown every tick so it never fell. Only real transcript growth now
+      // counts as him still talking.
+      let lastHeardLen = 0;
       let settled = false;
       let current = null;
       let watchdog = null;
@@ -412,8 +436,15 @@
             else interim += result[0].transcript;
           }
           liveText = interim;
-          lastVoiceAt = Date.now();
-          setOverlay({ heard: transcript() });
+          const spoken = transcript();
+          // Only a longer transcript is fresh speech; a re-fire that adds no
+          // words is the recogniser chewing on silence, and must not reset the
+          // pause timer or the countdown freezes at the top.
+          if (spoken.length > lastHeardLen) {
+            lastHeardLen = spoken.length;
+            lastVoiceAt = Date.now();
+          }
+          setOverlay({ heard: spoken });
         };
 
         recognition.onerror = (event) => {
@@ -463,8 +494,8 @@
         const quietFor = Date.now() - lastVoiceAt;
         const spoken = transcript();
         if (spoken) {
-          const remaining = Math.max(0, Math.round((pacing.silenceHoldMs - quietFor) / 1000));
-          setOverlay({ waiting: quietFor > 900 ? remaining : null });
+          const remaining = Math.max(0, Math.ceil((pacing.silenceHoldMs - quietFor) / 1000));
+          setOverlay({ waiting: quietFor > 400 ? remaining : null });
         }
         if (elapsed >= pacing.maxMs) return finish(spoken);
         if (spoken && quietFor >= pacing.silenceHoldMs) return finish(spoken);

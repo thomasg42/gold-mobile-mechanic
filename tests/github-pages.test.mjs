@@ -13,7 +13,7 @@ test("GitHub Pages phone shell exposes the complete field workflow", async () =>
   // knows the wording goes stale every time the wording improves.
   assert.match(html, /id="newJobButton"/);
   assert.match(html, /Add invoice/);
-  assert.match(html, /Talk to Anya/);
+  assert.match(html, /Ask Anya to create invoice/);
   assert.match(html, /Customer name/);
   assert.match(html, /Vehicle/);
   assert.match(html, /Agreed work/);

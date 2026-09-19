@@ -2405,3 +2405,148 @@ button {
     border-color: var(--gold-dark);
   }
 }
+
+/* ---------------------------------------------------------------- customers
+   "Every customer, every job" — the same ledger folded by person. Static by
+   design: no reveal, no transition on the job rows. This is the working tool,
+   and nothing animated belongs between a thumb and a work order. */
+.board-modes {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 18px;
+  flex-wrap: wrap;
+}
+
+.board-mode {
+  min-height: 48px;
+  padding: 12px 18px;
+  border: 1px solid var(--line-dark);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--paper);
+  font: inherit;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.board-mode.is-active {
+  border-color: var(--gold);
+  background: var(--gold);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.customer-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.customer-card {
+  padding: 22px;
+  border: 1px solid var(--line-dark);
+  border-radius: 18px;
+  background: var(--ink-soft);
+}
+
+.customer-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.customer-card-head h3 {
+  margin: 0;
+  color: var(--paper);
+  font-size: 1.25rem;
+}
+
+.customer-count {
+  color: var(--gold);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.customer-phones {
+  margin: 6px 0 12px;
+  color: var(--slate);
+  font-size: 0.95rem;
+}
+
+.customer-cars {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.customer-cars span {
+  padding: 5px 11px;
+  border: 1px solid var(--line-dark);
+  border-radius: 999px;
+  color: var(--paper);
+  font-size: 0.82rem;
+}
+
+.customer-review {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--gold);
+  background: rgba(208, 168, 67, 0.12);
+  color: var(--gold-light);
+  font-size: 0.85rem;
+}
+
+.customer-jobs {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.customer-job {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px 12px;
+  min-height: 48px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-dark);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--paper);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.customer-job-id {
+  color: var(--gold);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+}
+
+.customer-job-car {
+  font-size: 0.95rem;
+}
+
+.customer-job-time {
+  grid-column: 3;
+  color: var(--slate);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 460px) {
+  .customer-job {
+    grid-template-columns: 1fr auto;
+  }
+
+  .customer-job-car {
+    grid-column: 1 / -1;
+  }
+}
+
+.customer-aliases {
+  margin: 6px 0 0;
+  color: var(--slate);
+  font-size: 0.85rem;
+}

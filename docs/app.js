@@ -1189,8 +1189,289 @@
     });
   }
 
+  // -------------------------------------------------------------------------
+  // Every customer, every job
+  //
+  // THERE IS NO CUSTOMER TABLE. The live ledger is `jobs(id, data, updated_at)`
+  // — one JSON blob per work order — so a customer exists only as a name and a
+  // phone number copied onto each job. Nothing below merges, rewrites or
+  // deletes a record: the grouping is derived at render time from the jobs
+  // already loaded. That is deliberate. It means a wrong grouping is a
+  // cosmetic bug that a reload re-derives, never a lost invoice, and it is why
+  // this needed no D1 write and no union-merge safety dance.
+  //
+  // Thomas's rule, verbatim: "if the name is somewhat similar and/or the phone
+  // number is the same, put those invoices together because it is obviously
+  // the same person."
+  // -------------------------------------------------------------------------
+
+  /** Digits only, last ten — so (406) 555-0147 and 4065550147 are one number. */
+  function phoneKey(value) {
+    const digits = String(value || "").replace(/\D/g, "");
+    return digits.length >= 10 ? digits.slice(-10) : "";
+  }
+
+  function nameTokens(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length > 1);
+  }
+
+  /** Plate, then year+make+model — the two ways the same car shows up twice. */
+  function vehicleKeys(job) {
+    const keys = [];
+    const plate = String(job.vehiclePlate || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (plate.length >= 4) keys.push(`plate:${plate}`);
+    const parts = [job.vehicleYear, job.vehicleMake, job.vehicleModel]
+      .map((part) => String(part || "").trim().toLowerCase())
+      .filter(Boolean);
+    if (parts.length >= 2) keys.push(`model:${parts.join(" ")}`);
+    return keys;
+  }
+
+  /** One typo apart — Klaver / Claver, thumbed in at the roadside. */
+  function withinOneEdit(a, b) {
+    if (a === b) return true;
+    if (Math.abs(a.length - b.length) > 1) return false;
+    const short = a.length <= b.length ? a : b;
+    const long = a.length <= b.length ? b : a;
+    let i = 0;
+    let j = 0;
+    let slack = 1;
+    while (i < short.length && j < long.length) {
+      if (short[i] === long[j]) {
+        i += 1;
+        j += 1;
+        continue;
+      }
+      if (!slack) return false;
+      slack -= 1;
+      if (short.length === long.length) i += 1;
+      j += 1;
+    }
+    return true;
+  }
+
+  /**
+   * "Somewhat similar", made precise: every token of the SHORTER name has to
+   * land in the longer one. So `Klaver` matches `Mike Klaver` and `Josh`
+   * matches `Josh Berg`, while `Jane Smith` and `John Smith` stay apart —
+   * a shared surname on its own is not a person.
+   */
+  function namesLookAlike(aTokens, bTokens) {
+    if (!aTokens.length || !bTokens.length) return false;
+    const small = aTokens.length <= bTokens.length ? aTokens : bTokens;
+    const large = aTokens.length <= bTokens.length ? bTokens : aTokens;
+    let shared = 0;
+    for (const token of small) {
+      const hit = large.find((other) => other === token
+        || (token.length >= 4 && other.length >= 4 && withinOneEdit(token, other)));
+      if (!hit) return false;
+      if (hit.length >= 3) shared += 1;
+    }
+    return shared > 0;
+  }
+
+  /**
+   * Folds the job list into one entry per person, newest activity first.
+   *
+   * Pass 1 joins on the phone number, which is the strong signal and needs no
+   * help from the name. Pass 2 joins on the name, which is why a group can end
+   * up holding two different numbers — that group is flagged `needsReview`
+   * rather than quietly presented as fact.
+   */
+  function customerGroups(jobs = state.jobs) {
+    const list = [...jobs];
+    const parent = new Map(list.map((job) => [job.id, job.id]));
+    const find = (id) => {
+      let root = id;
+      while (parent.get(root) !== root) root = parent.get(root);
+      let walk = id;
+      while (parent.get(walk) !== root) {
+        const next = parent.get(walk);
+        parent.set(walk, root);
+        walk = next;
+      }
+      return root;
+    };
+    const union = (a, b) => {
+      const rootA = find(a);
+      const rootB = find(b);
+      if (rootA !== rootB) parent.set(rootB, rootA);
+    };
+
+    // Pass 1 — same number, same person, whatever the name says.
+    const byPhone = new Map();
+    for (const job of list) {
+      const key = phoneKey(job.customerPhone);
+      if (!key) continue;
+      if (byPhone.has(key)) union(byPhone.get(key), job.id);
+      else byPhone.set(key, job.id);
+    }
+
+    // Pass 2 — similar name. Tens of jobs, so the pairwise sweep is free.
+    //
+    // ONE EXCEPTION, AND IT MATTERS. A job saved under a bare first name is a
+    // bridge: "Josh" looks similar to every Josh on the books, and because
+    // grouping is transitive, one such record would fold two unrelated
+    // customers into a single card. So a single-token name has to be
+    // corroborated by the car before it joins anything. That is what rescues
+    // "Klaver" — one word, no number — onto the right 2008 Honda, while a
+    // stray "Josh" on a different truck stays where it is.
+    const tokens = new Map(list.map((job) => [job.id, nameTokens(job.customerName)]));
+    const cars = new Map(list.map((job) => [job.id, vehicleKeys(job)]));
+    for (let i = 0; i < list.length; i += 1) {
+      for (let k = i + 1; k < list.length; k += 1) {
+        const a = list[i].id;
+        const b = list[k].id;
+        if (find(a) === find(b)) continue;
+        if (!namesLookAlike(tokens.get(a), tokens.get(b))) continue;
+        const thin = tokens.get(a).length < 2 || tokens.get(b).length < 2;
+        if (thin && !cars.get(a).some((key) => cars.get(b).includes(key))) continue;
+        union(a, b);
+      }
+    }
+
+    const groups = new Map();
+    for (const job of list) {
+      const root = find(job.id);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(job);
+    }
+
+    return [...groups.entries()]
+      .map(([id, members]) => {
+        const newestFirst = [...members].sort((a, b) =>
+          String(b.createdAt).localeCompare(String(a.createdAt)));
+        // The card needs one label. Fullest spelling first ("Mike Klaver" over
+        // "Klaver"), then the spelling he used most often, then the earliest —
+        // a typo is usually the one-off, and the one-off is usually the later
+        // entry. It is only a label: every job below keeps the name it was
+        // saved under, and any spelling that lost is listed as an alias, so
+        // nothing rides on this tiebreak.
+        const spellings = newestFirst
+          .map((job) => String(job.customerName || "").trim())
+          .filter(Boolean);
+        const uses = spellings.reduce((tally, spelling) => {
+          tally.set(spelling, (tally.get(spelling) || 0) + 1);
+          return tally;
+        }, new Map());
+        const ranked = [...new Set(spellings)].sort((a, b) =>
+          nameTokens(b).length - nameTokens(a).length
+          || uses.get(b) - uses.get(a)
+          || spellings.lastIndexOf(b) - spellings.lastIndexOf(a));
+        const name = ranked[0] || "Name not recorded";
+        const aliases = ranked.slice(1);
+        // One entry per actual number. `4065550188` and `(406) 555-0188` are
+        // the same phone typed twice, and printing both reads like a bug.
+        // The better-punctuated spelling wins, because that is the one a thumb
+        // can dial off the screen.
+        const phones = [...newestFirst
+          .map((job) => String(job.customerPhone || "").trim())
+          .filter(Boolean)
+          .reduce((best, spelling) => {
+            const key = phoneKey(spelling) || spelling;
+            const held = best.get(key);
+            const formatting = (value) => value.replace(/\d/g, "").length;
+            if (!held || formatting(spelling) > formatting(held)) best.set(key, spelling);
+            return best;
+          }, new Map())
+          .values()];
+        const vehicles = [...new Set(newestFirst.map((job) => vehicleName(job)).filter(Boolean))];
+        const distinctNumbers = new Set(newestFirst.map((job) => phoneKey(job.customerPhone)).filter(Boolean));
+        return {
+          id,
+          name,
+          aliases,
+          phones,
+          vehicles,
+          jobs: newestFirst,
+          // Only a name-based join can land two numbers in one group, so this
+          // is exactly the "same name, different person?" case — his to call.
+          needsReview: distinctNumbers.size > 1
+        };
+      })
+      .sort((a, b) => String(b.jobs[0].createdAt).localeCompare(String(a.jobs[0].createdAt)));
+  }
+
+  function renderBoardModes() {
+    const byCustomer = state.boardMode === "customer";
+    const jobsButton = $("boardModeJobs");
+    const customersButton = $("boardModeCustomers");
+    if (!jobsButton || !customersButton) return;
+    jobsButton.classList.toggle("is-active", !byCustomer);
+    customersButton.classList.toggle("is-active", byCustomer);
+    jobsButton.setAttribute("aria-pressed", String(!byCustomer));
+    customersButton.setAttribute("aria-pressed", String(byCustomer));
+  }
+
+  function renderCustomerBoard() {
+    const grid = $("customerGrid");
+    if (!grid) return;
+    const groups = customerGroups(state.jobs.filter((job) => !job.archived));
+
+    if (!groups.length) {
+      grid.innerHTML = `
+        <div class="empty-state">
+          <strong>No customers yet.</strong>
+          <p>Every work order you save files itself under the person who owns the car.</p>
+        </div>`;
+      return;
+    }
+
+    grid.innerHTML = groups.map((group) => {
+      const review = group.needsReview
+        ? `<p class="customer-review">Two different numbers under this name. Check it is one person.</p>`
+        : "";
+      const vehicles = group.vehicles.length
+        ? `<span class="customer-cars">${group.vehicles.map((car) => `<span>${escapeHtml(car)}</span>`).join("")}</span>`
+        : `<span class="customer-cars"><span>Vehicle not recorded</span></span>`;
+      const jobs = group.jobs.map((job) => `
+        <button class="customer-job" type="button" data-job-id="${escapeHtml(job.id)}" data-status="${escapeHtml(job.status)}">
+          <span class="customer-job-id">${escapeHtml(job.id)}</span>
+          <span class="customer-job-car">${escapeHtml(vehicleName(job) || "Vehicle not named")}</span>
+          <span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(STATUS_COPY[job.status] || job.status)}</span>
+          <span class="customer-job-time">${duration(billableSeconds(job))}</span>
+        </button>`).join("");
+      return `
+        <article class="customer-card" data-customer-id="${escapeHtml(group.id)}">
+          <header class="customer-card-head">
+            <h3>${escapeHtml(group.name)}</h3>
+            <span class="customer-count">${group.jobs.length} ${group.jobs.length === 1 ? "job" : "jobs"}</span>
+          </header>
+          ${group.aliases.length ? `<p class="customer-aliases">Also entered as ${group.aliases.map(escapeHtml).join(" · ")}</p>` : ""}
+          <p class="customer-phones">${group.phones.length ? group.phones.map(escapeHtml).join(" · ") : "No number on file"}</p>
+          ${vehicles}
+          ${review}
+          <div class="customer-jobs">${jobs}</div>
+        </article>`;
+    }).join("");
+
+    // Bound once, on the container. Re-binding per button after an innerHTML
+    // swap is how a tap ends up firing twice.
+    grid.onclick = (event) => {
+      const button = event.target.closest("[data-job-id]");
+      if (!button) return;
+      openJob(button.dataset.jobId);
+    };
+  }
+
   function renderBoard() {
     saveState();
+    renderBoardModes();
+    const byCustomer = state.boardMode === "customer";
+    const jobGrid = $("jobGrid");
+    const customerGrid = $("customerGrid");
+    if (jobGrid) jobGrid.classList.toggle("hidden", byCustomer);
+    if (customerGrid) customerGrid.classList.toggle("hidden", !byCustomer);
+    const archiveToggleHost = document.querySelector(".job-archive-toggle");
+    if (archiveToggleHost) archiveToggleHost.classList.toggle("hidden", byCustomer);
+    if (byCustomer) {
+      renderCustomerBoard();
+      return;
+    }
     const showArchived = Boolean(state.showArchivedJobs);
     const allJobs = [...state.jobs].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
     const archivedCount = allJobs.filter((job) => job.archived).length;
@@ -4088,6 +4369,18 @@
 
   $("homeButton").addEventListener("click", showBoard);
   $("newJobButton").addEventListener("click", openNewJob);
+
+  // The job list stays the default. Grouping by customer is a second way to
+  // read the same ledger, never a step between his thumb and a clock-in.
+  for (const [id, mode] of [["boardModeJobs", "jobs"], ["boardModeCustomers", "customer"]]) {
+    const button = $(id);
+    if (!button) continue;
+    button.addEventListener("click", () => {
+      if (state.boardMode === mode) return;
+      state.boardMode = mode;
+      renderBoard();
+    });
+  }
 
   /**
    * Every agent call goes through here rather than touching `window.GMMAgent`

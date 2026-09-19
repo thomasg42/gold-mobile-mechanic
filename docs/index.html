@@ -69,7 +69,13 @@
         </div>
       </div>
 
+      <div class="board-modes" role="group" aria-label="How to list the ledger">
+        <button class="board-mode is-active" id="boardModeJobs" type="button" aria-pressed="true">By job</button>
+        <button class="board-mode" id="boardModeCustomers" type="button" aria-pressed="false">Every customer, every job</button>
+      </div>
+
       <div class="job-grid" id="jobGrid"></div>
+      <div class="customer-grid hidden" id="customerGrid"></div>
     </section>
 
     <section class="hidden" id="jobView" aria-live="polite"></section>

@@ -163,9 +163,18 @@ wrangler.sync.jsonc               Backend deployment configuration
 
 - `jobs`: customer, vehicle, labor rate, agreed work, suggestions, status,
   receipt-review flag, start/end timestamps.
-- `time_entries`: `work` or `break`, with independent start/end timestamps.
+- `time_entries`: `work` or `break`, with independent start/end timestamps, and
+  a `voided` tombstone. A worked time removed by hand is tombstoned rather than
+  deleted: the Worker merges `timeEntries` as a union of ids, so a spliced row
+  would be handed straight back on the next sync and billed again. `voided` is
+  monotonic in that merge — once true, a phone still holding the live copy
+  cannot turn it back off.
 - `eventHistory`: append-only clock-in, pause, resume, and clock-out records
-  stored with each synchronized job.
+  stored with each synchronized job, plus `time_added` / `time_edited` /
+  `time_removed` for hand-entered work. Those three are deliberately NOT posted
+  to `/api/jobs/:id/events` — that route accepts `clock_in` and `clock_out`
+  only — and they are labelled "by hand" wherever they are shown. A hand entry
+  is not a tap and the audit trail never claims it was.
 - `materials`: agreed description, quantity, and unit cost.
 - `receipts`: job ownership, image bytes, MIME type, filename, vendor, amount,
   and timestamp.
@@ -186,6 +195,33 @@ draft
 ```
 
 Invalid transitions return HTTP `409`. Clock-out is unavailable during a break.
+
+### Work he did without touching the clock
+
+Under the timer on every work order is a **time sheet**: one row per span he
+actually worked — date, clock in, clock out, **Done** — added as many times as
+he wants. A saved row is billable time exactly like a tapped clock-in, and it
+takes a job that was never clocked into from `draft` to `clocked_out`, which is
+what enables Finish Project.
+
+It refuses rather than guesses, because every row is money on a customer's
+invoice:
+
+| Refused | Why |
+|---|---|
+| A span overlapping one already saved | Bills the same minutes twice; the message names the clash |
+| A start or end in the future | Bills hours nobody has worked yet (a minute of slack for clock drift) |
+| A missing date, clock-in, or clock-out | A row that looked saved but was not is a day billed at zero |
+| Longer than 24 hours | A typo, not a shift — split it |
+
+A clock-out earlier in the day than the clock-in is read as a shift that ran
+**past midnight**, not as a typo, and the toast says "next day".
+
+The span he is currently standing in shows as *On the clock now*: its start is
+correctable, it has no remove button, and correcting it never creates a second
+span. Unsaved rows live outside the job, so a Done on one row never wipes
+another row he was halfway through typing — and nothing reaches the invoice
+until that row's own Done.
 
 ## Anya
 
@@ -215,6 +251,7 @@ know it made.
 |---|---|---|
 | `clock_in` | Starts billable time | Already on the clock, or no job open |
 | `clock_out` | Stops billable time | Not on the clock |
+| `log_worked_time` | Records a span he worked but never clocked | Overlap, future time, missing date/start/end — the same refusals as the button |
 | `add_note` | Appends to the notes that print on the invoice | Empty note |
 | `set_agreed_work` | Replaces what the invoice bills against | Empty description |
 

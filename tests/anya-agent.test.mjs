@@ -225,8 +225,8 @@ test("the worker's assistant routes hold their guards", async () => {
       "no second execution environment alongside the dynamic-filtering search tool");
     assert.deepEqual(
       request.body.tools.filter((t) => !t.type).map((t) => t.name).sort(),
-      ["add_note", "clock_in", "clock_out", "set_agreed_work"],
-      "she is given exactly the four tools the phone knows how to run");
+      ["add_note", "clock_in", "clock_out", "log_worked_time", "set_agreed_work"],
+      "she is given exactly the five tools the phone knows how to run");
     assert.match(request.body.system[0].text, /Never state a torque spec/,
       "the safety rule on specs is in the shipped prompt");
     assert.match(request.body.system[1].text, /2016 Chevrolet Silverado 1500/);

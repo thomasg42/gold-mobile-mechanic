@@ -65,7 +65,7 @@
   function derivedEventHistory(job) {
     const events = [];
     [...(job.timeEntries || [])]
-      .filter((entry) => entry.kind === "work")
+      .filter((entry) => entry.kind === "work" && !entry.voided)
       .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))
       .forEach((entry) => {
         events.push({
@@ -89,7 +89,16 @@
       ...job,
       archived: Boolean(job.archived),
       materials: Array.isArray(job.materials) ? job.materials : [],
-      timeEntries: Array.isArray(job.timeEntries) ? job.timeEntries : [],
+      timeEntries: (Array.isArray(job.timeEntries) ? job.timeEntries : []).map((entry) => ({
+        ...entry,
+        // Every span has to be addressable to be correctable on the time sheet.
+        // A row with no id is dropped by the cloud merge anyway, so stamping
+        // one here can only rescue a local row, never duplicate a synced one.
+        id: entry?.id || uid(),
+        // A tombstone has to survive every reload and every merge, so it is
+        // normalized like any other field rather than left undefined.
+        voided: Boolean(entry && entry.voided)
+      })),
       receipts: (Array.isArray(job.receipts) ? job.receipts : []).map((receipt) => {
         const addCents = Number.isFinite(Number(receipt.addCents)) ? Math.max(0, Math.round(Number(receipt.addCents))) : 0;
         const subtractCents = Number.isFinite(Number(receipt.subtractCents)) ? Math.max(0, Math.round(Number(receipt.subtractCents))) : 0;
@@ -587,14 +596,6 @@
     }).format(new Date(value));
   }
 
-  function toDatetimeLocalValue(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return "";
-    const pad = (part) => String(part).padStart(2, "0");
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  }
-
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (character) => ({
       "&": "&amp;",
@@ -611,12 +612,59 @@
 
   function elapsedSeconds(job, kind, now = Date.now()) {
     return (job.timeEntries || [])
-      .filter((entry) => entry.kind === kind)
+      // A removed session is tombstoned, never spliced out: the cloud merges
+      // timeEntries as a union of ids, so a spliced entry comes straight back
+      // on the next sync and bills the customer for it again.
+      .filter((entry) => entry.kind === kind && !entry.voided)
       .reduce((total, entry) => {
         const start = Date.parse(entry.startedAt);
         const end = entry.endedAt ? Date.parse(entry.endedAt) : now;
         return total + Math.max(0, Math.floor((end - start) / 1000));
       }, 0);
+  }
+
+  /** Every session that still counts, oldest first. */
+  function workSessions(job) {
+    return (job.timeEntries || [])
+      .filter((entry) => entry.kind === "work" && !entry.voided)
+      .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
+  }
+
+  function toDateInputValue(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  function toTimeInputValue(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  /**
+   * A phone's date picker and time picker, read together as one local moment.
+   * Built field by field rather than by parsing a string, because "2026-09-24
+   * 08:00" is read as UTC by some engines and as local time by others — a five
+   * or seven hour swing straight onto a customer's invoice.
+   */
+  function fromDateAndTime(dateValue, timeValue) {
+    const dateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateValue || ""));
+    const timeParts = /^(\d{2}):(\d{2})/.exec(String(timeValue || ""));
+    if (!dateParts || !timeParts) return null;
+    const date = new Date(
+      Number(dateParts[1]), Number(dateParts[2]) - 1, Number(dateParts[3]),
+      Number(timeParts[1]), Number(timeParts[2]), 0, 0
+    );
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function spokenSpan(startIso, endIso) {
+    return `${calendarDate(startIso)} · ${clockTime(startIso)} – ${clockTime(endIso)}`;
   }
 
   function manualWorkSeconds(job) {
@@ -784,7 +832,9 @@
   function summarizeJobHistory(job) {
     const label = {
       clock_in: "clocked in", clock_out: "clocked out",
-      finished: "finished", invoice_reopened: "invoice reopened"
+      finished: "finished", invoice_reopened: "invoice reopened",
+      time_added: "worked time added by hand", time_edited: "worked time corrected by hand",
+      time_removed: "worked time removed by hand"
     };
     const parts = (Array.isArray(job.eventHistory) ? job.eventHistory : [])
       .map((event) => {
@@ -1071,6 +1121,9 @@
   function showBoard() {
     flushOpenJobAutosave = null;
     selectedJobId = null;
+    // Unsaved time-sheet rows belong to the job that was open. Carrying them to
+    // the next job would offer to bill one customer for another's hours.
+    timeSheetDrafts = [];
     window.location.hash = "";
     jobView.classList.add("hidden");
     boardView.classList.remove("hidden");
@@ -1590,6 +1643,7 @@
       showBoard();
       return;
     }
+    if (selectedJobId !== id) timeSheetDrafts = [];
     selectedJobId = id;
     window.location.hash = `job/${encodeURIComponent(id)}`;
     boardView.classList.add("hidden");
@@ -1731,6 +1785,109 @@
       </div>`;
   }
 
+  /**
+   * Rows he has started but not saved yet. Held outside the job so a re-render
+   * — a Done on the row above, the live timer, a sync landing — does not wipe a
+   * half-typed row, and so nothing reaches the invoice until he taps Done.
+   */
+  let timeSheetDrafts = [];
+
+  function newTimeSheetDraft() {
+    const now = new Date();
+    return { draftId: uid(), date: toDateInputValue(now.toISOString()), start: "", end: "" };
+  }
+
+  /**
+   * Copies what is currently typed in the draft rows back into timeSheetDrafts.
+   * Called before anything re-renders, so a second half-filled row survives a
+   * Done on the first one.
+   */
+  function readTimeSheetDrafts() {
+    document.querySelectorAll("[data-draft-id]").forEach((row) => {
+      const draft = timeSheetDrafts.find((item) => item.draftId === row.dataset.draftId);
+      if (!draft) return;
+      draft.date = row.querySelector("[data-session-date]")?.value || "";
+      draft.start = row.querySelector("[data-session-start]")?.value || "";
+      draft.end = row.querySelector("[data-session-end]")?.value || "";
+    });
+  }
+
+  function sessionRowMarkup({ key, attr, date, start, end, running, length }) {
+    return `
+      <li class="session-row" ${attr}="${escapeHtml(key)}">
+        <div class="session-fields">
+          <label class="field">
+            <span>Date</span>
+            <input type="date" data-session-date value="${escapeHtml(date)}">
+          </label>
+          <label class="field">
+            <span>Clock in</span>
+            <input type="time" data-session-start value="${escapeHtml(start)}">
+          </label>
+          <label class="field">
+            <span>Clock out</span>
+            ${running
+              ? `<input type="time" value="" disabled placeholder="Running">`
+              : `<input type="time" data-session-end value="${escapeHtml(end)}">`}
+          </label>
+        </div>
+        <div class="session-actions">
+          <span class="session-length">${running ? "On the clock now" : escapeHtml(length)}</span>
+          <button class="button button-quiet" type="button" data-session-done>Done</button>
+          ${running
+            ? ""
+            : `<button class="icon-button" type="button" data-session-remove aria-label="Remove this worked time">×</button>`}
+        </div>
+      </li>`;
+  }
+
+  /**
+   * The hand-written time sheet. He worked and never touched the clock, so each
+   * span he actually worked is entered here: date, in, out, Done — as many as
+   * he wants. What is saved here is billable time, exactly like a tapped span.
+   */
+  function timeSheetMarkup(job) {
+    const sessions = workSessions(job);
+    const rows = sessions.map((entry) => {
+      const running = !entry.endedAt;
+      const seconds = running
+        ? 0
+        : Math.max(0, Math.floor((Date.parse(entry.endedAt) - Date.parse(entry.startedAt)) / 1000));
+      const span = hoursMinutes(seconds);
+      return sessionRowMarkup({
+        key: entry.id,
+        attr: "data-entry-id",
+        date: toDateInputValue(entry.startedAt),
+        start: toTimeInputValue(entry.startedAt),
+        end: toTimeInputValue(entry.endedAt),
+        running,
+        length: `${span.hours}h ${String(span.minutes).padStart(2, "0")}m`
+      });
+    });
+    const drafts = timeSheetDrafts.map((draft) => sessionRowMarkup({
+      key: draft.draftId,
+      attr: "data-draft-id",
+      date: draft.date,
+      start: draft.start,
+      end: draft.end,
+      running: false,
+      length: "Not saved yet"
+    }));
+    const all = [...rows, ...drafts];
+    return `
+      <div class="time-sheet" id="timeSheet">
+        <div class="time-edit-heading">
+          <span class="detail-label">Times you worked</span>
+          <strong>${sessions.length} session${sessions.length === 1 ? "" : "s"}</strong>
+        </div>
+        <p class="time-edit-note">Worked without tapping the clock? Put the date and the hours in here. Each one you save is billable time on this invoice, same as a tapped clock-in.</p>
+        ${all.length ? `<ol class="session-list">${all.join("")}</ol>` : `<p class="time-edit-note">No worked time recorded yet.</p>`}
+        <div class="save-row time-edit-actions">
+          <button class="button button-quiet" id="addWorkedTimeButton" type="button">+ Add a time you worked</button>
+        </div>
+      </div>`;
+  }
+
   function clockHistoryMarkup(job) {
     const labels = {
       clock_in: "Clocked in",
@@ -1739,7 +1896,12 @@
       // correctly in its own history.
       break_start: "Clocked out",
       break_end: "Clocked in",
-      finished: "Finished project"
+      finished: "Finished project",
+      // Entered by hand, and labelled as such — the trail never claims a tap
+      // that never happened.
+      time_added: "Worked time added by hand",
+      time_edited: "Worked time corrected by hand",
+      time_removed: "Worked time removed by hand"
     };
     const events = [...(job.eventHistory || [])]
       .sort((a, b) => String(b.occurredAt).localeCompare(String(a.occurredAt)));
@@ -1751,6 +1913,7 @@
             <span class="history-dot" aria-hidden="true"></span>
             <span>
               <strong>${escapeHtml(labels[event.action] || event.action)}</strong>
+              ${event.detail ? `<small>${escapeHtml(event.detail)}</small>` : ""}
               <small>${calendarDate(event.occurredAt)} · ${clockTime(event.occurredAt)}</small>
             </span>
           </li>`).join("")}
@@ -1810,17 +1973,7 @@
               </div>
               <p class="time-edit-note">Timer ${duration(timedSeconds)}${manualWorkSeconds(job) ? ` · ${manualWorkSignValue(job) < 0 ? "subtracted" : "added"} ${adjustment.hours}h ${adjustment.minutes}m` : ""} · timer labor ${money(draft.timedLaborCents)}</p>
               ${locked ? "" : `
-                ${job.startedAt ? `
-                  <div class="time-edit-fields">
-                    <label class="field clock-in-edit-field">
-                      <span>Clocked in</span>
-                      <input id="clockInTimeInput" type="datetime-local" value="${toDatetimeLocalValue(job.startedAt)}">
-                    </label>
-                  </div>
-                  <div class="save-row time-edit-actions">
-                    <button class="button button-quiet" id="setClockInButton" type="button">Save clock-in time</button>
-                  </div>
-                  <p class="time-edit-note">Fixes the clock-in stamp if the timer got left running by mistake.</p>` : ""}
+                ${timeSheetMarkup(job)}
                 <div class="time-edit-fields">
                   <label class="field">
                     <span>Hours</span>
@@ -2394,38 +2547,102 @@
       });
     }
 
-    const setClockInButton = $("setClockInButton");
-    if (setClockInButton) {
-      setClockInButton.addEventListener("click", () => {
-        const raw = $("clockInTimeInput")?.value;
-        if (!raw) {
-          notify("Pick a clock-in date and time first.", true);
-          return;
-        }
-        const parsed = new Date(raw);
-        if (Number.isNaN(parsed.getTime())) {
-          notify("That clock-in time isn't valid.", true);
-          return;
-        }
-        if (parsed.getTime() > Date.now()) {
-          notify("Clock-in time can't be in the future.", true);
-          return;
-        }
-        flushJobAutosave();
-        const iso = parsed.toISOString();
-        job.startedAt = iso;
-        const firstEntry = [...job.timeEntries]
-          .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))[0];
-        if (firstEntry) firstEntry.startedAt = iso;
-        job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
-        const clockInEvent = [...job.eventHistory]
-          .sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)))
-          .find((event) => event.action === "clock_in");
-        if (clockInEvent) clockInEvent.occurredAt = iso;
-        if (job.invoice) job.invoice = invoiceDraft(job);
-        queueJobSync(job);
-        renderJob();
-        notify(`Clock-in time corrected to ${clockTime(iso)}.`);
+    // The hand-written time sheet: date, clock in, clock out, Done — repeated
+    // for every span he actually worked. Bound to the rows this render made;
+    // the whole panel is rebuilt by renderJob, so nothing is double-bound.
+    const timeSheet = $("timeSheet");
+    if (timeSheet) {
+      const rowOf = (element) => element.closest("[data-entry-id], [data-draft-id]");
+
+      /**
+       * A Done rebuilds the whole card, and anything typed into a DIFFERENT
+       * saved row — a start he was halfway through correcting — would be gone
+       * with it. Nothing here is saved; the typing is simply put back where he
+       * left it, and it still takes that row's own Done to bill it.
+       */
+      const carrySavedRowEdits = () => {
+        const typed = new Map();
+        document.querySelectorAll("[data-entry-id]").forEach((row) => {
+          typed.set(row.dataset.entryId, {
+            date: row.querySelector("[data-session-date]")?.value || "",
+            start: row.querySelector("[data-session-start]")?.value || "",
+            end: row.querySelector("[data-session-end]")?.value || ""
+          });
+        });
+        return () => {
+          document.querySelectorAll("[data-entry-id]").forEach((row) => {
+            const before = typed.get(row.dataset.entryId);
+            if (!before) return;
+            const write = (selector, value) => {
+              const input = row.querySelector(selector);
+              // A blank is "this row was not being edited", never an erase.
+              if (input && value) input.value = value;
+            };
+            write("[data-session-date]", before.date);
+            write("[data-session-start]", before.start);
+            write("[data-session-end]", before.end);
+          });
+        };
+      };
+
+      const addRow = () => {
+        readTimeSheetDrafts();
+        const restore = carrySavedRowEdits();
+        timeSheetDrafts.push(newTimeSheetDraft());
+        renderJob().then(() => {
+          restore();
+          // Land the thumb straight on the new row's date picker.
+          const rows = document.querySelectorAll("[data-draft-id]");
+          rows[rows.length - 1]?.querySelector("[data-session-date]")?.focus();
+        });
+      };
+
+      $("addWorkedTimeButton")?.addEventListener("click", addRow);
+
+      timeSheet.querySelectorAll("[data-session-done]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const row = rowOf(button);
+          if (!row) return;
+          const values = {
+            entryId: row.dataset.entryId || "",
+            date: row.querySelector("[data-session-date]")?.value || "",
+            start: row.querySelector("[data-session-start]")?.value || "",
+            end: row.querySelector("[data-session-end]")?.value || ""
+          };
+          // Whatever is typed in the OTHER unsaved rows is captured first, so
+          // saving this one never wipes the row he filled in before it.
+          readTimeSheetDrafts();
+          const result = commitWorkSession(job, values);
+          if (!result.ok) {
+            notify(result.message, true);
+            return;
+          }
+          if (row.dataset.draftId) {
+            timeSheetDrafts = timeSheetDrafts.filter((draft) => draft.draftId !== row.dataset.draftId);
+          }
+          const restore = carrySavedRowEdits();
+          renderJob().then(restore);
+          notify(result.message);
+        });
+      });
+
+      timeSheet.querySelectorAll("[data-session-remove]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const row = rowOf(button);
+          if (!row) return;
+          readTimeSheetDrafts();
+          if (row.dataset.draftId) {
+            // Never saved, so nothing to confirm and nothing to un-bill.
+            timeSheetDrafts = timeSheetDrafts.filter((draft) => draft.draftId !== row.dataset.draftId);
+            const restoreRows = carrySavedRowEdits();
+            renderJob().then(restoreRows);
+            return;
+          }
+          if (!window.confirm("Remove this worked time from the invoice?")) return;
+          const result = voidWorkSession(job, row.dataset.entryId || "");
+          renderJob();
+          notify(result.message, !result.ok);
+        });
       });
     }
 
@@ -2709,6 +2926,159 @@
         reopenInvoice(job);
       });
     });
+  }
+
+  /**
+   * Records that worked time was entered or corrected by hand. It is NOT posted
+   * to /api/jobs/:id/events — that endpoint only accepts clock_in and clock_out
+   * and would reject this — but it rides along in the job body, which the cloud
+   * merges into the history as a union. The distinction is deliberate: a hand
+   * entry is not a tap, and the audit trail should never claim it was.
+   */
+  function logTimeEdit(job, action, detail) {
+    job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
+    job.eventHistory.push({ id: uid(), action, occurredAt: new Date().toISOString(), detail });
+  }
+
+  /** The first moment ever worked, which is what the invoice reads. */
+  function syncStartedAt(job) {
+    const first = workSessions(job)[0];
+    if (first) job.startedAt = first.startedAt;
+  }
+
+  /**
+   * Saves one hand-entered span of work — a date, a clock-in and a clock-out —
+   * onto the job. Used by the Done button on each row and by Anya.
+   *
+   * Every refusal returns a sentence, never a silent no: this is money on a
+   * customer's invoice, and a row that looked saved but was not is a day of
+   * work billed at zero.
+   */
+  function commitWorkSession(job, { entryId = "", date, start, end }) {
+    if (job.status === "invoiced") {
+      return { ok: false, message: "That invoice is filed. Unsubmit it before changing the hours." };
+    }
+    const existing = entryId
+      ? (job.timeEntries || []).find((entry) => entry.id === entryId && !entry.voided)
+      : null;
+    if (entryId && !existing) {
+      return { ok: false, message: "That worked time is no longer on the job." };
+    }
+    const running = Boolean(existing && !existing.endedAt);
+
+    if (!date) return { ok: false, message: "Pick the date you worked first." };
+    if (!start) return { ok: false, message: "Set the clock-in time first." };
+    if (!running && !end) return { ok: false, message: "Set the clock-out time first." };
+
+    const startDate = fromDateAndTime(date, start);
+    if (!startDate) return { ok: false, message: "That clock-in date and time isn't valid." };
+
+    let endDate = null;
+    let crossedMidnight = false;
+    if (!running) {
+      endDate = fromDateAndTime(date, end);
+      if (!endDate) return { ok: false, message: "That clock-out time isn't valid." };
+      if (endDate.getTime() <= startDate.getTime()) {
+        // A shift that ends earlier in the day than it started is a shift that
+        // ran past midnight, not a typo to reject — 10 PM to 1 AM is a night.
+        endDate = new Date(endDate.getTime() + 24 * 60 * 60 * 1000);
+        crossedMidnight = true;
+      }
+      if (endDate.getTime() - startDate.getTime() > 24 * 60 * 60 * 1000) {
+        return { ok: false, message: "That span is longer than a day. Split it into separate times." };
+      }
+    }
+
+    // A minute of slack: phone clocks drift, and a time set to "right now"
+    // should not be refused for landing a few seconds ahead of Date.now().
+    const ceiling = Date.now() + 60_000;
+    if (startDate.getTime() > ceiling) {
+      return { ok: false, message: "Worked time can't be in the future." };
+    }
+    if (endDate && endDate.getTime() > ceiling) {
+      return { ok: false, message: "That clock-out time is in the future." };
+    }
+
+    const startIso = startDate.toISOString();
+    const endIso = endDate ? endDate.toISOString() : null;
+
+    // Two spans that overlap bill the same minutes twice.
+    const clash = workSessions(job).find((entry) => {
+      if (existing && entry.id === existing.id) return false;
+      const otherStart = Date.parse(entry.startedAt);
+      const otherEnd = entry.endedAt ? Date.parse(entry.endedAt) : Date.now();
+      const thisEnd = endDate ? endDate.getTime() : Date.now();
+      return startDate.getTime() < otherEnd && thisEnd > otherStart;
+    });
+    if (clash) {
+      return {
+        ok: false,
+        message: `That overlaps the time already saved for ${spokenSpan(clash.startedAt, clash.endedAt)}.`
+      };
+    }
+
+    // Done on a row he did not actually change is not a correction. Writing one
+    // anyway fills the audit trail with edits that never happened, and pushes a
+    // job sync for nothing.
+    if (existing && existing.startedAt === startIso && (running || existing.endedAt === endIso)) {
+      return { ok: true, message: "That one was already saved.", entryId: existing.id };
+    }
+
+    // The details panel autosaves on a debounce; flushing it first keeps a
+    // half-typed rate or note from being written back over this save.
+    if (typeof flushOpenJobAutosave === "function") flushOpenJobAutosave();
+    let saved;
+    if (existing) {
+      existing.startedAt = startIso;
+      if (!running) existing.endedAt = endIso;
+      saved = existing;
+      logTimeEdit(job, "time_edited", running
+        ? `Clock-in moved to ${calendarDate(startIso)} · ${clockTime(startIso)}`
+        : spokenSpan(startIso, existing.endedAt));
+    } else {
+      saved = { id: uid(), kind: "work", startedAt: startIso, endedAt: endIso, voided: false };
+      job.timeEntries.push(saved);
+      logTimeEdit(job, "time_added", spokenSpan(startIso, endIso));
+    }
+
+    // Hand-entered work on a job that was never clocked into leaves it off the
+    // clock, not still a draft — that is what enables Finish Project.
+    if (job.status === "draft") job.status = "clocked_out";
+    syncStartedAt(job);
+    if (job.invoice) job.invoice = invoiceDraft(job);
+    queueJobSync(job);
+
+    const span = hoursMinutes(
+      endDate ? Math.floor((endDate.getTime() - startDate.getTime()) / 1000) : 0
+    );
+    const message = running
+      ? `Clock-in moved to ${clockTime(startIso)}.`
+      : `Saved ${clockTime(startIso)} – ${clockTime(endIso)}${crossedMidnight ? " (next day)" : ""} · ${span.hours}h ${String(span.minutes).padStart(2, "0")}m.`;
+    return { ok: true, message, entryId: saved.id };
+  }
+
+  /**
+   * Takes one worked time back off the invoice. The row is tombstoned rather
+   * than deleted: the cloud merges timeEntries as a union of ids, so a deleted
+   * row would be handed straight back by the next sync and billed again.
+   */
+  function voidWorkSession(job, entryId) {
+    if (job.status === "invoiced") {
+      return { ok: false, message: "That invoice is filed. Unsubmit it before changing the hours." };
+    }
+    const entry = (job.timeEntries || []).find((item) => item.id === entryId && !item.voided);
+    if (!entry) return { ok: false, message: "That worked time is no longer on the job." };
+    if (!entry.endedAt) {
+      return { ok: false, message: "That one is still running. Clock out first." };
+    }
+    if (typeof flushOpenJobAutosave === "function") flushOpenJobAutosave();
+    const span = spokenSpan(entry.startedAt, entry.endedAt);
+    entry.voided = true;
+    logTimeEdit(job, "time_removed", span);
+    syncStartedAt(job);
+    if (job.invoice) job.invoice = invoiceDraft(job);
+    queueJobSync(job);
+    return { ok: true, message: `Removed ${span} from the invoice.` };
   }
 
   function timerAction(job, action, { skipConfirm = false } = {}) {
@@ -4094,6 +4464,20 @@
       return { ok: true, message: "Clocked out. Billable time is stopped." };
     }
 
+    if (name === "log_worked_time") {
+      // Same commit path as the Done button on the time sheet, refusals and
+      // all — she reports what actually happened, never a save that was not.
+      const result = commitWorkSession(job, {
+        date: String(input.date || ""),
+        start: String(input.start || ""),
+        end: String(input.end || "")
+      });
+      if (result.ok) void renderJob();
+      return result.ok
+        ? { ok: true, message: result.message }
+        : { ok: false, message: result.message };
+    }
+
     if (name === "add_note") {
       const note = String(input.note || "").trim();
       if (!note) return { ok: false, message: "There was no note to add." };
@@ -4165,6 +4549,9 @@
       const job = agentJob();
       if (job) {
         return {
+          // Her date arithmetic ("yesterday", "Tuesday") has to run off the
+          // phone's calendar day, not the Worker's UTC one.
+          today: toDateInputValue(new Date().toISOString()),
           customerName: job.customerName || "",
           vehicleYear: job.vehicleYear || "",
           vehicleMake: job.vehicleMake || "",

@@ -113,6 +113,25 @@ const PHONE_TOOLS = [
     },
   },
   {
+    name: "log_worked_time",
+    description:
+      "Record a span he already worked but never clocked. Use it when he says he worked hours that are not on the clock — \"I worked eight to noon yesterday\", \"put me down for two hours on Tuesday\". This is billable time on the customer's invoice, so never guess: if the date, the start or the end is not clear, ask him for it first. Refuses an overlap with time already saved, and says so.",
+    strict: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        date: {
+          type: "string",
+          description: "The calendar day he worked, as YYYY-MM-DD. Today's date is given to you in the job context.",
+        },
+        start: { type: "string", description: "Clock-in time on that day, 24-hour, as HH:MM." },
+        end: { type: "string", description: "Clock-out time, 24-hour, as HH:MM. A time earlier than the start is read as running past midnight." },
+      },
+      required: ["date", "start", "end"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "add_note",
     description:
       "Append a line to the mechanic's notes on the open job. THESE PRINT ON THE CUSTOMER'S INVOICE. Use it for anything he notices and wants recorded — a worn part he did not replace, a recommendation, a measurement, something to check next visit. Write it in his voice, as a professional note to the customer, not as a summary of your conversation.",
@@ -191,6 +210,7 @@ YOU CAN ACTUALLY DO THINGS, NOT JUST ANSWER
 You have tools that change the open job. Use them when he asks, and use them when he plainly means them without asking:
 - He says he is starting, getting to it, or "clock me in" — clock_in.
 - He says he is done for now, stopping, breaking for lunch, or "clock me out" — clock_out.
+- He says he already worked hours that were never clocked — "I did eight to noon yesterday and never clocked in" — log_worked_time. Get the day, the start and the end from him; never assume any of the three.
 - He notices anything worth recording — a worn part he is not replacing, a recommendation, a measurement, something to check next time — add_note. These print on the customer's invoice.
 - The scope genuinely changes or grows — set_agreed_work.
 
@@ -492,9 +512,23 @@ function youTubeIds(text: string): string[] {
   return [...found];
 }
 
+/**
+ * The mechanic's own calendar day, as his phone reads it.
+ *
+ * Not `new Date()` here: this Worker runs on UTC, so from late afternoon in
+ * Montana the edge is already on tomorrow's date — and "I worked eight to noon
+ * yesterday" would then land a day late on a customer's invoice. Shape-checked
+ * because it arrives from the client.
+ */
+function localToday(value: unknown): string {
+  const text = String(value ?? "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+}
+
 /** Tells the agent what job it is standing in front of. */
 function jobContextBlock(job: unknown): string {
   const item = (job ?? {}) as Record<string, unknown>;
+  const today = localToday(item.today);
   const vehicle = [item.vehicleYear, item.vehicleMake, item.vehicleModel]
     .map((value) => String(value ?? "").trim())
     .filter(Boolean)
@@ -510,6 +544,7 @@ function jobContextBlock(job: unknown): string {
         ? "invoice already filed — the job is locked, tell him to unsubmit it before changing anything"
         : "not started yet";
   return [
+    today ? `Today is ${today} where he is standing. Read "yesterday", "Tuesday" and "this morning" against that date.` : "",
     `He has a job open: ${String(item.customerName ?? "owner not recorded")}, ${vehicle || "vehicle not recorded"}.`,
     `Clock status: ${status}.`,
     item.agreedWork ? `Agreed work: ${String(item.agreedWork).slice(0, 600)}` : "",

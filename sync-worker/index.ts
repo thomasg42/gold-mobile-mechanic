@@ -246,6 +246,10 @@ function mergeRecordsById(
     const id = typeof value?.id === "string" ? value.id : "";
     if (!id) continue;
     const existing = records.get(id);
+    // A tombstone is monotonic. These lists merge as a union of ids, so the
+    // only way a removed worked time stays removed is for `voided` to survive
+    // a push from a phone that still has the live copy of that row.
+    const voided = Boolean(existing?.voided) || Boolean(value.voided);
     records.set(id, {
       ...(existing || {}),
       ...value,
@@ -253,6 +257,7 @@ function mergeRecordsById(
         value.endedAt ??
         existing?.endedAt ??
         null,
+      ...(voided ? { voided: true } : {}),
     });
   }
   return [...records.values()];

@@ -1409,6 +1409,62 @@ button {
   gap: 10px;
 }
 
+/* The hand-written time sheet. One row per span he actually worked: date, in,
+   out, Done. Sized for a thumb in a driveway — no animation anywhere near it. */
+.time-sheet {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.session-list {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-row {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.session-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+/* The date spans the row; the two times sit side by side under it. */
+.session-fields > .field:first-child {
+  grid-column: 1 / -1;
+}
+
+.session-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.session-length {
+  margin-right: auto;
+  font-size: 13px;
+  color: var(--slate);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A date or time picker has to be tappable without aiming. */
+.session-row input[type="date"],
+.session-row input[type="time"] {
+  min-height: 46px;
+}
+
 .materials-list {
   margin: 0;
   padding-left: 18px;

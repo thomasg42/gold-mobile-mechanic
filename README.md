@@ -319,6 +319,38 @@ billable web search per shop-mode lookup. The per-caller cap
 (`ASSISTANT_RATE_LIMIT`) is a runaway guard, not a budget — set a spend limit
 in the Anthropic console if that matters.
 
+## Card payments (Stripe link)
+
+Every filed invoice has **or send Stripe link**, and tapping **Share invoice**
+offers it as a follow-up. One tap, and the Worker:
+
+1. reads the bill from the cloud copy of the invoice (never from the phone's
+   request — the phone syncs first),
+2. finds the Stripe customer by email or creates one (name, email, phone),
+3. creates the invoice line plus a **Card processing fee** line,
+4. creates a single-use, card-only Payment Link tagged with the job and
+   invoice number, and stores it in `stripe_payment_links`,
+
+then the phone opens the share sheet with a ready-to-send text. The same bill
+tapped twice returns the same link. A reopened and refiled bill gets a new link
+and the old one is switched off at Stripe.
+
+**The fee.** Stripe takes its cut of the *gross* charge, so the fee is grossed
+up: `total = ceil((bill + 30¢) / (1 − 2.9%))`. That leaves the shop the exact
+bill — except that it is capped at **3% of the bill** (the Visa surcharge
+ceiling), which costs the shop at most about 30¢ on small bills. Standard
+payouts to the bank are free, so there is no deposit fee to add unless Instant
+Payouts are used. All four numbers are Worker vars with these defaults:
+`STRIPE_FEE_PERCENT=2.9`, `STRIPE_FEE_FIXED_CENTS=30`,
+`STRIPE_PAYOUT_FEE_PERCENT=0` (1.5 for Instant Payouts), `CARD_FEE_CAP_PERCENT=3`
+(0 removes the cap).
+
+**Turning it on:** `./deploy-stripe-link.sh` from your own terminal. It applies
+migration 0005, asks for a restricted Stripe key (write on Customers, Products,
+Prices, Payment Links only), deploys the Worker, then ships the app.
+`/api/health` reports `cardPayments: true` once the key is set — that means the
+key is present, not that Stripe accepts it; the first real link is the test.
+
 ## Local development
 
 Requirements: Node 22.13 or newer.

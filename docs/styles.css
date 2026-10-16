@@ -2606,3 +2606,8 @@ button {
   color: var(--slate);
   font-size: 0.85rem;
 }
+
+/* Stripe card link — sits under the invoice actions, never between him and Share. */
+.stripe-link-button { width: 100%; margin-top: 10px; }
+.stripe-link-note { margin: 8px 0 0; font-size: 0.85rem; opacity: 0.75; }
+.stripe-sheet p { margin: 12px 0 18px; line-height: 1.45; }

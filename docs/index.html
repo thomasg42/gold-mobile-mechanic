@@ -242,6 +242,21 @@
     </form>
   </dialog>
 
+  <dialog class="sheet stripe-sheet" id="stripeDialog">
+    <div class="sheet-header">
+      <div>
+        <p class="eyebrow">Get paid by card</p>
+        <h2>Send a Stripe payment link?</h2>
+      </div>
+      <button class="icon-button" type="button" aria-label="Close" data-close-dialog>×</button>
+    </div>
+    <p>They pay <strong id="stripeDialogTotal"></strong> plus the card processing fee by credit card. The link is built for you — nothing to type into Stripe.</p>
+    <div class="sheet-actions">
+      <button class="button button-quiet" type="button" data-close-dialog>Not now</button>
+      <button class="button button-gold" id="stripeDialogSend" type="button">Send Stripe payment link</button>
+    </div>
+  </dialog>
+
   <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
 
   <script src="./sync-auth.js"></script>

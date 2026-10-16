@@ -914,6 +914,9 @@
     job.status = "clocked_out";
     job.endedAt = null;
     job.invoice = null;
+    // The old card link is for the old total. The Worker switches it off at
+    // Stripe the moment a link for the refiled bill is made.
+    job.paymentLink = null;
     job.eventHistory = Array.isArray(job.eventHistory) ? job.eventHistory : [];
     job.eventHistory.push({ id: uid(), action: "invoice_reopened", occurredAt: now });
     // A real clock-out event with the current timestamp so the cloud merge
@@ -1714,6 +1717,8 @@
           <button class="button button-quiet" id="downloadInvoiceButton" type="button">Download</button>
           <button class="button button-gold" id="emailInvoiceButton" type="button">Prepare email</button>
         </div>
+        <button class="button button-quiet stripe-link-button" id="stripeLinkButton" type="button">or send Stripe link</button>
+        ${job.paymentLink ? `<p class="stripe-link-note">Card link sent ${calendarDate(job.paymentLink.sentAt)} · ${money(job.paymentLink.totalCents)} with ${money(job.paymentLink.feeCents)} card fee</p>` : ""}
         ${customerPortalLink(job) ? `
           <div class="customer-link-row">
             <span class="detail-label">Customer's invoice link — send this</span>
@@ -2898,7 +2903,13 @@
     if (downloadInvoiceButton) downloadInvoiceButton.addEventListener("click", () => downloadInvoice(job));
 
     const shareInvoiceButton = $("shareInvoiceButton");
-    if (shareInvoiceButton) shareInvoiceButton.addEventListener("click", () => shareInvoice(job));
+    if (shareInvoiceButton) shareInvoiceButton.addEventListener("click", async () => {
+      // Once the bill is on its way, offer the card link while he is still
+      // holding the phone — that is the moment it actually gets sent.
+      if (await shareInvoice(job)) offerStripeLink(job);
+    });
+    const stripeLinkButton = $("stripeLinkButton");
+    if (stripeLinkButton) stripeLinkButton.addEventListener("click", () => sendStripeLink(job, stripeLinkButton));
 
     const emailInvoiceButton = $("emailInvoiceButton");
     if (emailInvoiceButton) emailInvoiceButton.addEventListener("click", () => prepareEmail(job));
@@ -4195,13 +4206,98 @@
           text: `Gold Mobile Mechanic invoice for ${vehicleName(job)}`,
           files: [file]
         });
-        return;
+        return true;
       } catch (error) {
-        if (error?.name === "AbortError") return;
+        if (error?.name === "AbortError") return false;
       }
     }
     downloadBlob(file, file.name);
     notify("Invoice downloaded because file sharing is unavailable here.");
+    return true;
+  }
+
+  /** Asks once, right after Share, whether to send the card link too. */
+  function offerStripeLink(job) {
+    const dialog = $("stripeDialog");
+    if (!dialog || !job.invoice) return;
+    $("stripeDialogTotal").textContent = money(job.invoice.totalCents);
+    const send = $("stripeDialogSend");
+    const fresh = send.cloneNode(true);
+    send.replaceWith(fresh);
+    fresh.addEventListener("click", async () => {
+      await sendStripeLink(job, fresh);
+      dialog.close();
+    });
+    dialog.showModal();
+  }
+
+  /**
+   * Creates the Stripe customer, price and payment link on the Worker — the
+   * card fee already added — then puts a ready-to-send message in the share
+   * sheet. Nothing is typed into Stripe by hand.
+   *
+   * The Worker charges what the CLOUD copy of the invoice says, so the sync
+   * queue is drained first; a link for a bill the cloud has not seen yet would
+   * be refused rather than guessed at.
+   */
+  async function sendStripeLink(job, button) {
+    if (!job.invoice) return;
+    const label = button?.textContent;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Making the link…";
+    }
+    try {
+      await flushSyncQueue().catch(() => {});
+      const response = await cloudFetch(`/api/jobs/${encodeURIComponent(job.id)}/payment-link`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      const link = await response.json();
+      job.paymentLink = {
+        url: link.url,
+        invoiceCents: link.invoiceCents,
+        feeCents: link.feeCents,
+        totalCents: link.totalCents,
+        sentAt: new Date().toISOString()
+      };
+      job.updatedAt = new Date().toISOString();
+      queueJobSync(job);
+
+      const firstName = String(job.customerName || "").trim().split(/\s+/)[0] || "there";
+      const feeLine = link.feeCents > 0
+        ? `${money(link.invoiceCents)} + ${money(link.feeCents)} card processing fee = ${money(link.totalCents)}`
+        : money(link.totalCents);
+      const text = [
+        `Hi ${firstName}, here's a secure card payment link for Gold Mobile Mechanic invoice ${link.invoiceNumber}.`,
+        `Total: ${feeLine}`,
+        link.url
+      ].join("\n\n");
+
+      if (navigator.share) {
+        try {
+          await navigator.share({ title: `Pay ${link.invoiceNumber}`, text });
+          notify("Card payment link sent.");
+          return;
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            notify("Link made but not sent — tap again to send the same link.");
+            return;
+          }
+        }
+      }
+      await navigator.clipboard.writeText(text);
+      notify("Payment link copied — paste it into a text.");
+    } catch (error) {
+      notify(error?.message || "The payment link could not be made.", true);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = label;
+      }
+      if (selectedJobId === job.id) renderJob();
+    }
   }
 
   function prepareEmail(job) {
@@ -4848,6 +4944,14 @@
   $("restoreInput").addEventListener("change", () => {
     const file = $("restoreInput").files?.[0];
     if (file) restoreData(file);
+  });
+
+  document.querySelectorAll("[data-close-dialog]").forEach((button) => {
+    button.addEventListener("click", () => button.closest("dialog")?.close());
+  });
+  const stripeDialog = $("stripeDialog");
+  if (stripeDialog) stripeDialog.addEventListener("click", (event) => {
+    if (event.target === stripeDialog) stripeDialog.close();
   });
 
   [jobDialog, receiptDialog].forEach((dialog) => {

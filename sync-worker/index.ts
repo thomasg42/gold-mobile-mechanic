@@ -24,6 +24,29 @@ interface Env extends AssistantEnv {
   ELEVENLABS_API_KEY?: string;
   /** Optional override for the spoken voice. Defaults to ELEVEN_DEFAULT_VOICE. */
   ELEVENLABS_VOICE_ID?: string;
+  /**
+   * Set with `wrangler secret put STRIPE_SECRET_KEY --config wrangler.sync.jsonc`.
+   * Use a RESTRICTED key (rk_live_…) with write access to Customers, Products,
+   * Prices and Payment Links only. When absent the payment-link route returns
+   * 503 and the phone says card payments are not set up — nothing else breaks.
+   */
+  STRIPE_SECRET_KEY?: string;
+  /**
+   * The card fee passed on to the customer. Plain vars, not secrets, so they
+   * live in wrangler.sync.jsonc. Defaults are Stripe's US online card price.
+   */
+  STRIPE_FEE_PERCENT?: string;
+  STRIPE_FEE_FIXED_CENTS?: string;
+  /**
+   * Only when Thomas uses Instant Payouts (standard payouts are free). Grossed
+   * up on top so the deposit, not just the Stripe balance, equals the bill.
+   */
+  STRIPE_PAYOUT_FEE_PERCENT?: string;
+  /**
+   * Ceiling on the fee as a percent of the bill. Card-network surcharge rules
+   * cap it (Visa: 3%), so 3 is the default; "0" removes the ceiling.
+   */
+  CARD_FEE_CAP_PERCENT?: string;
 }
 
 type StoredJobRow = {
@@ -78,6 +101,14 @@ const DEVICE_TOKEN_VERSION = "v1";
 // data — it only stops one caller hammering the worker or bulk-scraping it.
 const PORTAL_RATE_LIMIT = 120;
 const PORTAL_RATE_WINDOW_SECONDS = 300;
+
+// Every payment link is a Stripe write on Thomas's live account, so it gets the
+// same cap the billable routes do. A real day is a handful of invoices.
+const STRIPE_API = "https://api.stripe.com/v1";
+const PAYMENT_LINK_RATE_LIMIT = 20;
+const PAYMENT_LINK_RATE_WINDOW_SECONDS = 300;
+/** Stripe refuses a USD charge under fifty cents. */
+const STRIPE_MIN_CENTS = 50;
 const CLOCK_ACTIONS = new Set(["clock_in", "clock_out"]);
 
 function allowedOrigin(request: Request): string | null {
@@ -920,6 +951,277 @@ async function withinAssistantRateLimit(request: Request, env: Env): Promise<boo
  * feature in its own bucket, so a long voice interview cannot use up the shop
  * agent's allowance or the other way round.
  */
+// ---------------------------------------------------------- card payments
+
+export type CardFee = {
+  invoiceCents: number;
+  feeCents: number;
+  totalCents: number;
+  /** True when the cap, not the full Stripe cost, set the fee. */
+  capped: boolean;
+};
+
+function envNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return value !== undefined && value !== "" && Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : fallback;
+}
+
+/**
+ * What the customer pays so the shop keeps the whole bill.
+ *
+ * Stripe takes its percent of the GROSS charge, not of the bill, so adding
+ * 2.9% to the bill comes up short. Solving net = gross·(1 − p) − fixed for
+ * gross is the only version where Thomas is actually made whole. An Instant
+ * Payout fee, when set, comes off what is left, so it is grossed up first.
+ * Rounded up: a cent short on every invoice is a cent lost on every invoice.
+ */
+export function cardFeeFor(
+  invoiceCents: number,
+  config: {
+    percent?: number;
+    fixedCents?: number;
+    payoutPercent?: number;
+    capPercent?: number;
+  } = {},
+): CardFee {
+  const percent = (config.percent ?? 2.9) / 100;
+  const fixed = config.fixedCents ?? 30;
+  const payout = (config.payoutPercent ?? 0) / 100;
+  const cap = config.capPercent ?? 3;
+
+  const beforePayout = invoiceCents / (1 - payout);
+  const gross = Math.ceil((beforePayout + fixed) / (1 - percent) - 1e-9);
+  let feeCents = Math.max(0, gross - invoiceCents);
+  let capped = false;
+  if (cap > 0) {
+    const ceiling = Math.floor((invoiceCents * cap) / 100);
+    if (feeCents > ceiling) {
+      feeCents = ceiling;
+      capped = true;
+    }
+  }
+  return { invoiceCents, feeCents, totalCents: invoiceCents + feeCents, capped };
+}
+
+function cardFeeConfig(env: Env) {
+  return {
+    percent: envNumber(env.STRIPE_FEE_PERCENT, 2.9),
+    fixedCents: envNumber(env.STRIPE_FEE_FIXED_CENTS, 30),
+    payoutPercent: envNumber(env.STRIPE_PAYOUT_FEE_PERCENT, 0),
+    capPercent: envNumber(env.CARD_FEE_CAP_PERCENT, 3),
+  };
+}
+
+/**
+ * One form-encoded Stripe call. The idempotency key is what makes a retry on
+ * dead signal safe: Stripe replays the first answer instead of creating a
+ * second customer, price or link.
+ */
+async function stripeCall(
+  env: Env,
+  method: "GET" | "POST",
+  path: string,
+  params: Record<string, string | number> = {},
+  idempotencyKey?: string,
+): Promise<Record<string, unknown>> {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) body.append(key, String(value));
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+    "Stripe-Version": "2024-06-20",
+  };
+  let target = `${STRIPE_API}${path}`;
+  if (method === "GET") {
+    target += `?${body.toString()}`;
+  } else {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  }
+  const response = await fetch(target, {
+    method,
+    headers,
+    body: method === "POST" ? body.toString() : undefined,
+  });
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
+    const error = payload.error as { message?: string } | undefined;
+    throw new Error(error?.message || `Stripe answered ${response.status}.`);
+  }
+  return payload;
+}
+
+type PaymentLinkRow = {
+  id: string;
+  url: string;
+  invoice_cents: number;
+  fee_cents: number;
+  total_cents: number;
+};
+
+/**
+ * Builds — or hands back — the Stripe link for one filed invoice.
+ *
+ * The bill is read from the CLOUD copy of the job, never from the request
+ * body: the amount a customer is charged must be the amount on the invoice
+ * the shop filed, not whatever a request says it is. The phone syncs first.
+ */
+async function createPaymentLink(
+  request: Request,
+  env: Env,
+  jobId: string,
+): Promise<Response> {
+  if (!env.STRIPE_SECRET_KEY) {
+    return json(request, { error: "Card payments aren't set up yet." }, 503);
+  }
+  if (!(await withinRateLimit(
+    request, env, "stripe", PAYMENT_LINK_RATE_LIMIT, PAYMENT_LINK_RATE_WINDOW_SECONDS,
+  ))) {
+    return json(request, { error: "Too many payment links at once. Try again in a few minutes." }, 429);
+  }
+
+  const row = await env.DB.prepare("SELECT data FROM jobs WHERE id = ?")
+    .bind(jobId)
+    .first<StoredJobRow>();
+  if (!row) return json(request, { error: "That job hasn't synced yet." }, 404);
+  const job = JSON.parse(row.data) as Record<string, unknown>;
+  const invoice = job.invoice as Record<string, unknown> | undefined;
+  if (!invoice || job.status !== "invoiced") {
+    return json(request, { error: "File the invoice before sending a payment link." }, 409);
+  }
+  const invoiceNumber = String(invoice.invoiceNumber || jobId);
+  const invoiceCents = Math.round(Number(invoice.totalCents) || 0);
+  if (invoiceCents < STRIPE_MIN_CENTS) {
+    return json(request, { error: "Stripe can't charge a bill under $0.50." }, 400);
+  }
+
+  const fee = cardFeeFor(invoiceCents, cardFeeConfig(env));
+
+  // Same bill, same link. A double tap or a resend never mints a second link.
+  const existing = await env.DB.prepare(
+    `SELECT id, url, invoice_cents, fee_cents, total_cents FROM stripe_payment_links
+     WHERE job_id = ?1 AND invoice_number = ?2 AND invoice_cents = ?3
+       AND fee_cents = ?4 AND active = 1
+     ORDER BY created_at DESC LIMIT 1`,
+  ).bind(jobId, invoiceNumber, invoiceCents, fee.feeCents).first<PaymentLinkRow>();
+  if (existing) {
+    return json(request, {
+      url: existing.url,
+      invoiceNumber,
+      invoiceCents: existing.invoice_cents,
+      feeCents: existing.fee_cents,
+      totalCents: existing.total_cents,
+      capped: fee.capped,
+      reused: true,
+    });
+  }
+
+  // The link count is in the key because a bill reopened and refiled back to
+  // an earlier total would otherwise replay that earlier — now switched off —
+  // link from Stripe's idempotency cache.
+  const prior = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM stripe_payment_links WHERE job_id = ?",
+  ).bind(jobId).first<{ n: number }>();
+  const key = `gmm-${jobId}-${invoiceNumber}-${invoiceCents}-${fee.feeCents}-${prior?.n ?? 0}`;
+  const name = String(job.customerName || "").trim();
+  const email = String(job.customerEmail || "").trim();
+  const phone = String(job.customerPhone || "").trim();
+  const vehicle = [job.vehicleYear, job.vehicleMake, job.vehicleModel].filter(Boolean).join(" ");
+
+  try {
+    // Customer: reuse the one Stripe already has for this email, so a repeat
+    // customer is one record with their whole payment history on it.
+    let customerId = "";
+    if (email) {
+      const found = await stripeCall(env, "GET", "/customers", { email, limit: 1 });
+      const first = (found.data as Array<{ id: string }> | undefined)?.[0];
+      if (first) customerId = first.id;
+    }
+    if (!customerId) {
+      const params: Record<string, string> = { "metadata[gmm_job]": jobId };
+      if (name) params.name = name;
+      if (email) params.email = email;
+      if (phone) params.phone = phone;
+      customerId = String((await stripeCall(env, "POST", "/customers", params, `${key}-customer`)).id);
+    }
+
+    const invoicePrice = await stripeCall(env, "POST", "/prices", {
+      currency: "usd",
+      unit_amount: invoiceCents,
+      "product_data[name]": `Invoice ${invoiceNumber}${vehicle ? ` — ${vehicle}` : ""}`,
+    }, `${key}-price`);
+
+    const linkParams: Record<string, string | number> = {
+      "line_items[0][price]": String(invoicePrice.id),
+      "line_items[0][quantity]": 1,
+      // The fee is only honest for cards, so cards are the only way to pay.
+      "payment_method_types[0]": "card",
+      "restrictions[completed_sessions][limit]": 1,
+      "metadata[gmm_job]": jobId,
+      "metadata[gmm_invoice]": invoiceNumber,
+      "metadata[stripe_customer]": customerId,
+      "payment_intent_data[description]": `Gold Mobile Mechanic ${invoiceNumber}`,
+      "payment_intent_data[metadata][gmm_job]": jobId,
+      "payment_intent_data[metadata][gmm_invoice]": invoiceNumber,
+      "payment_intent_data[metadata][stripe_customer]": customerId,
+    };
+    if (fee.feeCents > 0) {
+      const feePrice = await stripeCall(env, "POST", "/prices", {
+        currency: "usd",
+        unit_amount: fee.feeCents,
+        "product_data[name]": "Card processing fee",
+      }, `${key}-fee`);
+      linkParams["line_items[1][price]"] = String(feePrice.id);
+      linkParams["line_items[1][quantity]"] = 1;
+    }
+    const link = await stripeCall(env, "POST", "/payment_links", linkParams, `${key}-link`);
+    const url = String(link.url || "");
+    if (!url) throw new Error("Stripe did not return a link.");
+
+    // A reopened invoice with a new total: switch the stale link off so the
+    // customer cannot pay the old amount. Best effort — a failure here leaves
+    // an extra link, never a wrong charge on the new one.
+    const stale = await env.DB.prepare(
+      "SELECT id FROM stripe_payment_links WHERE job_id = ?1 AND active = 1",
+    ).bind(jobId).all<{ id: string }>();
+    for (const old of stale.results || []) {
+      try {
+        await stripeCall(env, "POST", `/payment_links/${old.id}`, { active: "false" });
+      } catch {
+        // Leave it marked active so the next attempt tries again.
+        continue;
+      }
+      await env.DB.prepare("UPDATE stripe_payment_links SET active = 0 WHERE id = ?")
+        .bind(old.id).run();
+    }
+
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO stripe_payment_links
+         (id, job_id, invoice_number, invoice_cents, fee_cents, total_cents,
+          url, stripe_customer_id, active, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)`,
+    ).bind(
+      String(link.id), jobId, invoiceNumber, invoiceCents, fee.feeCents,
+      fee.totalCents, url, customerId, new Date().toISOString(),
+    ).run();
+
+    return json(request, {
+      url,
+      invoiceNumber,
+      invoiceCents,
+      feeCents: fee.feeCents,
+      totalCents: fee.totalCents,
+      capped: fee.capped,
+      reused: false,
+    });
+  } catch (error) {
+    return json(request, {
+      error: `Stripe couldn't make the link: ${(error as Error).message}`,
+    }, 502);
+  }
+}
+
 async function withinRateLimit(
   request: Request,
   env: Env,
@@ -1093,6 +1395,9 @@ export default {
         // Not a secret, and the fastest way to catch a deploy that shipped the
         // code without the secret it depends on.
         locked: Boolean(env.OWNER_PIN),
+        // Reports the key is SET, not that Stripe accepts it — the first real
+        // link is the test of that.
+        cardPayments: Boolean(env.STRIPE_SECRET_KEY),
       });
     }
 
@@ -1183,6 +1488,16 @@ export default {
     }
     if (receipt && request.method === "GET") {
       return getReceipt(request, env, receipt.jobId, receipt.receiptId);
+    }
+
+    // Writes to Thomas's live Stripe account, so app-origin only, like the
+    // other routes that act on a paid account.
+    const paymentLink = /^\/api\/jobs\/([^/]+)\/payment-link$/.exec(url.pathname);
+    if (paymentLink && request.method === "POST") {
+      if (!allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      return createPaymentLink(request, env, decodeURIComponent(paymentLink[1]));
     }
 
     const jobEvent = jobEventsPath(url.pathname);

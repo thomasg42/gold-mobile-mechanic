@@ -47,6 +47,13 @@ interface Env extends AssistantEnv {
    * cap it (Visa: 3%), so 3 is the default; "0" removes the ceiling.
    */
   CARD_FEE_CAP_PERCENT?: string;
+  /**
+   * n8n webhook that emails Thomas each website/Ken booking (workflow
+   * fVzWG0PtQZq4hlhf). A plain var in wrangler.sync.jsonc; unset = nothing is
+   * sent, which keeps tests and local runs quiet. The booking is already saved
+   * before this is called, so a failed email never loses the request.
+   */
+  BOOKING_NOTIFY_URL?: string;
 }
 
 type StoredJobRow = {
@@ -446,7 +453,27 @@ async function withinWebsiteBookingLimit(request: Request, env: Env): Promise<bo
   return (row?.count ?? 0) <= 5;
 }
 
-async function bookWebsiteDay(request: Request, env: Env): Promise<Response> {
+// Tells Thomas about a booking that is already in D1. One retry, then a log
+// line; it never changes what the customer is told.
+async function notifyBooking(env: Env, payload: Record<string, unknown>): Promise<void> {
+  if (!env.BOOKING_NOTIFY_URL) return;
+  const body = JSON.stringify(payload);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(env.BOOKING_NOTIFY_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (res.ok) return;
+      console.error(`booking notify ${payload.jobId} attempt ${attempt}: HTTP ${res.status}`);
+    } catch (err) {
+      console.error(`booking notify ${payload.jobId} attempt ${attempt}: ${String(err)}`);
+    }
+  }
+}
+
+async function bookWebsiteDay(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   if (!(await withinWebsiteBookingLimit(request, env))) {
     return json(request, { ok: false, reason: "rate_limited" }, 429);
   }
@@ -560,6 +587,10 @@ async function bookWebsiteDay(request: Request, env: Env): Promise<Response> {
     }
     return json(request, { ok: false, reason: "save_failed" }, 503);
   }
+
+  const notified = notifyBooking(env, { ...booking, jobId });
+  if (ctx) ctx.waitUntil(notified);
+  else await notified;
 
   return json(request, { ok: true, dayHeld: true, requestedDay, jobId }, 201);
 }
@@ -1376,7 +1407,7 @@ async function runAssistant(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -1410,7 +1441,7 @@ export default {
       if (request.headers.get("Origin") && !allowedOrigin(request)) {
         return json(request, { error: "Forbidden." }, 403);
       }
-      return bookWebsiteDay(request, env);
+      return bookWebsiteDay(request, env, ctx);
     }
 
     if (url.pathname === "/api/portal/customers" && request.method === "GET") {

@@ -5,6 +5,10 @@
   "compatibility_date": "2026-07-26",
   "workers_dev": true,
   "preview_urls": false,
+  "vars": {
+    // n8n fVzWG0PtQZq4hlhf emails Thomas each website/Ken booking.
+    "BOOKING_NOTIFY_URL": "https://tggai.app.n8n.cloud/webhook/gmm-booking-notify"
+  },
   "observability": {
     "enabled": true
   },

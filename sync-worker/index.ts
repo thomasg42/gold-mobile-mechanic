@@ -1429,6 +1429,9 @@ export default {
         // Reports the key is SET, not that Stripe accepts it — the first real
         // link is the test of that.
         cardPayments: Boolean(env.STRIPE_SECRET_KEY),
+        // Proves the deploy carried the booking-email code and its var; the
+        // first real booking is the test of delivery.
+        bookingEmail: Boolean(env.BOOKING_NOTIFY_URL),
       });
     }
 

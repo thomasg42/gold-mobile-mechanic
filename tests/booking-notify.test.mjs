@@ -118,3 +118,10 @@ test("with no BOOKING_NOTIFY_URL nothing is sent", async () => {
   assert.equal(res.status, 201);
   assert.equal(calls.length, 0);
 });
+
+test("health says whether booking email is configured, so a deploy can be checked", async () => {
+  const worker = await loadWorker();
+  const health = (env) => worker.fetch(new Request("https://sync.example.com/api/health", { headers: { Origin: ORIGIN } }), env).then((r) => r.json());
+  assert.equal((await health({ DB: makeD1(), BOOKING_NOTIFY_URL: NOTIFY })).bookingEmail, true);
+  assert.equal((await health({ DB: makeD1() })).bookingEmail, false);
+});

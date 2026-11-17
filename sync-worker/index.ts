@@ -117,6 +117,8 @@ const PAYMENT_LINK_RATE_WINDOW_SECONDS = 300;
 /** Stripe refuses a USD charge under fifty cents. */
 const STRIPE_MIN_CENTS = 50;
 const CLOCK_ACTIONS = new Set(["clock_in", "clock_out"]);
+/** Compare-and-swap retries for a job row before answering 503. */
+const JOB_WRITE_ATTEMPTS = 4;
 
 function allowedOrigin(request: Request): string | null {
   const origin = request.headers.get("Origin");
@@ -359,6 +361,34 @@ function mergeJobs(
       Array.isArray(current.receipts) ? current.receipts as Array<Record<string, unknown>> : [],
       Array.isArray(incoming.receipts) ? incoming.receipts as Array<Record<string, unknown>> : [],
     ),
+    estimate: mergeEstimate(current.estimate, base.estimate),
+  };
+}
+
+/**
+ * The customer's answer to an estimate is written by the portal, not a phone,
+ * so a phone that has not pulled yet will push its older copy still marked
+ * "sent". The answer is monotonic for one sent link (one token): once the
+ * stored copy has a response, a push that lacks one keeps the stored answer.
+ * Re-sending an edited estimate mints a new token, which is how the mechanic
+ * deliberately starts a fresh approval.
+ */
+function mergeEstimate(current: unknown, incoming: unknown): unknown {
+  const stored = current as Record<string, unknown> | null | undefined;
+  const next = incoming as Record<string, unknown> | null | undefined;
+  if (!next) return incoming ?? null;
+  if (!stored?.respondedAt || stored.token !== next.token || next.respondedAt) return next;
+  const decisions = new Map(
+    (Array.isArray(stored.lines) ? stored.lines : []).map((line: Record<string, unknown>) =>
+      [String(line.id), line.decision]),
+  );
+  return {
+    ...next,
+    status: stored.status,
+    respondedAt: stored.respondedAt,
+    signatureName: stored.signatureName,
+    lines: (Array.isArray(next.lines) ? next.lines : []).map((line: Record<string, unknown>) =>
+      decisions.has(String(line.id)) ? { ...line, decision: decisions.get(String(line.id)) } : line),
   };
 }
 
@@ -625,46 +655,69 @@ async function putJob(
     return json(request, { error: "Job identity and required fields are invalid." }, 400);
   }
 
-  const existingRow = await env.DB.prepare("SELECT data FROM jobs WHERE id = ?")
-    .bind(jobId)
-    .first<StoredJobRow>();
-  let existing: Record<string, unknown> | null = null;
-  if (existingRow?.data) {
-    try {
-      existing = JSON.parse(existingRow.data) as Record<string, unknown>;
-    } catch {
-      existing = null;
+  const incoming = job;
+  const incomingEvents = Array.isArray(incoming.eventHistory)
+    ? (incoming.eventHistory as Array<Record<string, unknown>>)
+    : [];
+
+  // Two writers touch a job row: this phone save and a customer answering an
+  // estimate link. Each reads, merges and writes back, so a blind overwrite
+  // could erase whatever the other wrote in between — a signed approval lost
+  // without a trace. The write lands only while the row is still exactly what
+  // was read; otherwise it reads again and re-merges. Out of attempts, it
+  // answers 503 and the phone keeps the job queued and retries.
+  for (let attempt = 0; attempt < JOB_WRITE_ATTEMPTS; attempt += 1) {
+    const existingRow = await env.DB.prepare("SELECT data FROM jobs WHERE id = ?")
+      .bind(jobId)
+      .first<StoredJobRow>();
+    let existing: Record<string, unknown> | null = null;
+    if (existingRow?.data) {
+      try {
+        existing = JSON.parse(existingRow.data) as Record<string, unknown>;
+      } catch {
+        existing = null;
+      }
     }
+
+    // Clock events written one-at-a-time by /events are the authority on the
+    // ledger, and they are folded in BEFORE the merge: the merge reads the last
+    // event to decide whether the job is on the clock, so handing it a history
+    // that is missing an event already recorded would resolve a stale status.
+    const candidate: Record<string, unknown> = {
+      ...incoming,
+      eventHistory: mergeRecordsById(await storedEvents(env, jobId), incomingEvents)
+        .sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt))),
+    };
+    const merged = mergeJobs(existing, candidate);
+
+    // The row's updated_at is server time (it only ever orders the job list), but
+    // the body keeps the phone's own timestamp. mergeJobs compares one phone's
+    // clock against another's, and overwriting it here would make every device
+    // whose clock trails the server look permanently stale.
+    const updatedAt = new Date().toISOString();
+    merged.updatedAt = String(merged.updatedAt || updatedAt);
+    const data = JSON.stringify(merged);
+    const result = existingRow
+      ? await env.DB.prepare(
+        "UPDATE jobs SET data = ?1, updated_at = ?2 WHERE id = ?3 AND data = ?4",
+      ).bind(data, updatedAt, jobId, existingRow.data).run()
+      : await env.DB.prepare(
+        "INSERT INTO jobs (id, data, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO NOTHING",
+      ).bind(jobId, data, updatedAt).run();
+    if (rowsChanged(result) > 0) return json(request, { job: merged, updatedAt });
   }
 
-  // Clock events written one-at-a-time by /events are the authority on the
-  // ledger, and they are folded in BEFORE the merge: the merge reads the last
-  // event to decide whether the job is on the clock, so handing it a history
-  // that is missing an event already recorded would resolve a stale status.
-  job.eventHistory = mergeRecordsById(
-    await storedEvents(env, jobId),
-    Array.isArray(job.eventHistory) ? (job.eventHistory as Array<Record<string, unknown>>) : [],
-  ).sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)));
+  return json(request, { error: "The job changed while it was saving. It will retry on its own." }, 503);
+}
 
-  job = mergeJobs(existing, job);
-
-  // The row's updated_at is server time (it only ever orders the job list), but
-  // the body keeps the phone's own timestamp. mergeJobs compares one phone's
-  // clock against another's, and overwriting it here would make every device
-  // whose clock trails the server look permanently stale.
-  const updatedAt = new Date().toISOString();
-  job.updatedAt = String(job.updatedAt || updatedAt);
-  await env.DB.prepare(
-    `INSERT INTO jobs (id, data, updated_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET
-       data = excluded.data,
-       updated_at = excluded.updated_at`,
-  )
-    .bind(jobId, JSON.stringify(job), updatedAt)
-    .run();
-
-  return json(request, { job, updatedAt });
+/**
+ * Rows a D1 write touched; 0 means a compare-and-swap lost the race. D1
+ * documents `meta.changes`; `rows_written` is a belt-and-braces fallback so a
+ * missing field can never turn every phone save into a 503.
+ */
+function rowsChanged(result: unknown): number {
+  const meta = (result as { meta?: { changes?: number | bigint; rows_written?: number } } | null)?.meta;
+  return Number(meta?.changes ?? meta?.rows_written ?? 0);
 }
 
 async function storedEvents(
@@ -780,6 +833,12 @@ type PortalInvoice = {
   partsCents: unknown;
   totalCents: unknown;
   workSeconds: unknown;
+  quotedCents: unknown;
+  shopSuppliesCents: unknown;
+  taxCents: unknown;
+  depositCents: unknown;
+  balanceDueCents: unknown;
+  flatLabor: boolean;
 };
 
 type PortalCustomer = {
@@ -836,6 +895,12 @@ async function portalCustomers(env: Env): Promise<PortalCustomer[]> {
       partsCents: invoice.materialsCents ?? 0,
       totalCents: invoice.totalCents ?? 0,
       workSeconds: invoice.workSeconds ?? 0,
+      quotedCents: invoice.quotedCents ?? 0,
+      shopSuppliesCents: invoice.shopSuppliesCents ?? 0,
+      taxCents: invoice.taxCents ?? 0,
+      depositCents: invoice.depositCents ?? 0,
+      balanceDueCents: invoice.balanceDueCents ?? invoice.totalCents ?? 0,
+      flatLabor: Boolean(invoice.flatLabor),
     });
     customers.set(id, customer);
   }
@@ -877,6 +942,157 @@ async function portalCustomer(
   const customer = (await portalCustomers(env)).find((entry) => entry.id === id);
   if (!customer) return json(request, { error: "No such customer." }, 404);
   return json(request, { customer });
+}
+
+// ------------------------------------------------------- estimate approval
+//
+// Public like the rest of the portal, but an estimate is reached only by its
+// unguessable token (128 random bits minted on the phone), never listed. It is
+// the one public view of a job that is NOT finished: whoever holds the link
+// sees the customer's first name, the vehicle, the priced lines and the
+// mechanic's note — never a phone, email, cost basis, receipt or clock ledger.
+// Pulling the estimate back on the phone clears the token and kills the link.
+
+const ESTIMATE_TOKEN = /^[A-Za-z0-9_-]{20,64}$/;
+
+function centsOf(value: unknown): number {
+  const n = Math.round(Number(value) || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function estimateLineCents(line: Record<string, unknown>): number {
+  return Math.max(0, Math.round(Number(line.quantity || 0) * centsOf(line.unitCents)));
+}
+
+function liveEstimate(job: Record<string, unknown> | null, token: string): boolean {
+  const estimate = job?.estimate as Record<string, unknown> | undefined;
+  return estimate?.token === token
+    && (estimate.status === "sent" || estimate.status === "responded");
+}
+
+async function findEstimateJob(
+  env: Env,
+  token: string,
+): Promise<Record<string, unknown> | null> {
+  const result = await env.DB.prepare("SELECT data FROM jobs").all<StoredJobRow>();
+  for (const row of result.results || []) {
+    try {
+      const job = JSON.parse(row.data) as Record<string, unknown>;
+      if (liveEstimate(job, token)) return job;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function publicEstimate(job: Record<string, unknown>) {
+  const estimate = job.estimate as Record<string, unknown>;
+  const lines = (Array.isArray(estimate.lines) ? estimate.lines : []) as Array<Record<string, unknown>>;
+  return {
+    estimateNumber: String(job.id || "").replace(/^GMM-/, "GMM-EST-"),
+    firstName: String(job.customerName || "").trim().split(/\s+/)[0] || "",
+    vehicle: [job.vehicleYear, job.vehicleMake, job.vehicleModel].filter(Boolean).join(" "),
+    sentAt: estimate.sentAt || null,
+    status: estimate.status,
+    respondedAt: estimate.respondedAt || null,
+    signatureName: estimate.respondedAt ? estimate.signatureName || "" : "",
+    notes: String(estimate.notes || ""),
+    taxRatePct: Number(estimate.taxRatePct || 0),
+    shopSuppliesPct: Number(estimate.shopSuppliesPct || 0),
+    depositCents: centsOf(estimate.depositCents),
+    lines: lines.map((line) => ({
+      id: String(line.id),
+      kind: String(line.kind || "labor"),
+      description: String(line.description || ""),
+      quantity: Number(line.quantity || 0),
+      unitCents: centsOf(line.unitCents),
+      amountCents: estimateLineCents(line),
+      decision: String(line.decision || "pending"),
+    })),
+  };
+}
+
+async function portalEstimate(request: Request, env: Env, token: string): Promise<Response> {
+  if (!(await withinPortalRateLimit(request, env))) {
+    return json(request, { error: "The portal is busy. Try again in a moment." }, 429);
+  }
+  if (!ESTIMATE_TOKEN.test(token)) return json(request, { error: "No such estimate." }, 404);
+  const job = await findEstimateJob(env, token);
+  if (!job) return json(request, { error: "This estimate link is no longer active." }, 404);
+  return json(request, { estimate: publicEstimate(job) });
+}
+
+async function decideEstimate(request: Request, env: Env, token: string): Promise<Response> {
+  if (!(await withinPortalRateLimit(request, env))) {
+    return json(request, { error: "The portal is busy. Try again in a moment." }, 429);
+  }
+  if (!ESTIMATE_TOKEN.test(token)) return json(request, { error: "No such estimate." }, 404);
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return json(request, { error: "Send your answers as JSON." }, 400);
+  }
+  const signatureName = cleanText(body.signatureName, 80);
+  if (signatureName.length < 2) {
+    return json(request, { error: "Type your full name to sign." }, 400);
+  }
+  if (body.agree !== true) {
+    return json(request, { error: "Tick the box to confirm your answers." }, 400);
+  }
+  const decisions = (body.decisions || {}) as Record<string, unknown>;
+
+  const found = await findEstimateJob(env, token);
+  if (!found) return json(request, { error: "This estimate link is no longer active." }, 404);
+  const jobId = String(found.id);
+
+  // Compare-and-swap, like putJob: a phone save landing between this read and
+  // this write must not be erased, and must not erase this answer either.
+  for (let attempt = 0; attempt < JOB_WRITE_ATTEMPTS; attempt += 1) {
+    const row = await env.DB.prepare("SELECT data FROM jobs WHERE id = ?")
+      .bind(jobId)
+      .first<StoredJobRow>();
+    let job: Record<string, unknown> | null = null;
+    try {
+      job = row?.data ? JSON.parse(row.data) as Record<string, unknown> : null;
+    } catch {
+      job = null;
+    }
+    if (!row || !job || !liveEstimate(job, token)) {
+      return json(request, { error: "This estimate link is no longer active." }, 404);
+    }
+    const estimate = job.estimate as Record<string, unknown>;
+    if (estimate.status !== "sent") {
+      return json(request, { error: "This estimate was already answered. Call the shop to change it." }, 409);
+    }
+    const lines = (Array.isArray(estimate.lines) ? estimate.lines : []) as Array<Record<string, unknown>>;
+    if (!lines.length) {
+      return json(request, { error: "This estimate has nothing on it to approve. Call the shop." }, 409);
+    }
+    for (const line of lines) {
+      const answer = decisions[String(line.id)];
+      if (answer !== "approved" && answer !== "declined") {
+        return json(request, { error: "Approve or decline every line before signing." }, 400);
+      }
+    }
+    job.estimate = {
+      ...estimate,
+      status: "responded",
+      respondedAt: new Date().toISOString(),
+      signatureName,
+      lines: lines.map((line) => ({ ...line, decision: decisions[String(line.id)] })),
+    };
+    // updated_at only orders the list; the body keeps the phone's own clock (see
+    // putJob), and mergeEstimate protects this answer from a stale phone push.
+    const result = await env.DB.prepare(
+      "UPDATE jobs SET data = ?1, updated_at = ?2 WHERE id = ?3 AND data = ?4",
+    )
+      .bind(JSON.stringify(job), new Date().toISOString(), jobId, row.data)
+      .run();
+    if (rowsChanged(result) > 0) return json(request, { estimate: publicEstimate(job) });
+  }
+  return json(request, { error: "The shop was saving this job at the same moment. Tap Sign and send again." }, 503);
 }
 
 async function deleteJob(
@@ -1122,7 +1338,12 @@ async function createPaymentLink(
     return json(request, { error: "File the invoice before sending a payment link." }, 409);
   }
   const invoiceNumber = String(invoice.invoiceNumber || jobId);
-  const invoiceCents = Math.round(Number(invoice.totalCents) || 0);
+  // A deposit already taken comes off: the card link charges what is still owed.
+  const depositCents = Math.max(0, Math.round(Number(invoice.depositCents) || 0));
+  const invoiceCents = Math.round(Number(invoice.balanceDueCents ?? invoice.totalCents) || 0);
+  if (depositCents && invoiceCents <= 0) {
+    return json(request, { error: "The deposit already covers this bill. Nothing is left to charge." }, 400);
+  }
   if (invoiceCents < STRIPE_MIN_CENTS) {
     return json(request, { error: "Stripe can't charge a bill under $0.50." }, 400);
   }
@@ -1180,7 +1401,7 @@ async function createPaymentLink(
     const invoicePrice = await stripeCall(env, "POST", "/prices", {
       currency: "usd",
       unit_amount: invoiceCents,
-      "product_data[name]": `Invoice ${invoiceNumber}${vehicle ? ` — ${vehicle}` : ""}`,
+      "product_data[name]": `Invoice ${invoiceNumber}${depositCents ? " balance due" : ""}${vehicle ? ` — ${vehicle}` : ""}`,
     }, `${key}-price`);
 
     const linkParams: Record<string, string | number> = {
@@ -1462,6 +1683,17 @@ export default {
       return portalCustomer(request, env, decodeURIComponent(portalProfile[1]));
     }
 
+    const estimateRoute = /^\/api\/portal\/estimates\/([^/]+)(\/decision)?$/.exec(url.pathname);
+    if (estimateRoute) {
+      if (request.headers.get("Origin") && !allowedOrigin(request)) {
+        return json(request, { error: "Forbidden." }, 403);
+      }
+      const token = decodeURIComponent(estimateRoute[1]);
+      if (!estimateRoute[2] && request.method === "GET") return portalEstimate(request, env, token);
+      if (estimateRoute[2] && request.method === "POST") return decideEstimate(request, env, token);
+      return json(request, { error: "Not found." }, 404);
+    }
+
     // Pairing is the door itself, so it cannot sit behind the lock. It is a
     // browser-only route: nothing but the app has any business calling it.
     if (url.pathname === "/api/pair" && request.method === "POST") {
@@ -1474,8 +1706,10 @@ export default {
     // ------------------------------------------------------------- the gate
     //
     // Everything ABOVE this line is public on purpose: the health probe, the
-    // website's booking form, and the customer invoice portal (which publishes
-    // filed bills only — never a phone number, a cost basis or an open job).
+    // website's booking form, the customer invoice portal (which publishes
+    // filed bills only — never a phone number, a cost basis or an open job),
+    // and estimate links, the one exception for an open job: reachable only by
+    // an unguessable token, showing first name, vehicle and priced lines.
     //
     // Everything BELOW it is the shop's own records and the two routes that
     // spend money on Thomas's accounts. New routes land below by default, and

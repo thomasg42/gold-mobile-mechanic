@@ -22,7 +22,11 @@ device. Three routes are public on purpose: `/api/health`, `/api/public/*`
 (the website's booking calendar), and `/api/portal/*`, the customer invoice
 portal, which publishes filed bills and deliberately withholds phone numbers,
 email addresses, receipts, cost basis, the clock ledger, and any job still in
-progress.
+progress — with one exception: `/api/portal/estimates/:token` serves a sent
+estimate (first name, vehicle, priced lines, the mechanic's note) to whoever
+holds its link, and takes the customer's signed answer. It is never listed;
+the token is 128 random bits, and pulling the estimate back kills the link.
+See "Estimates and customer approval" below.
 
 Pairing a phone: open the app, enter the six-digit PIN when it asks. Once, per
 device. The PIN is exchanged at `POST /api/pair` for a device token — an HMAC of
@@ -179,7 +183,17 @@ wrangler.sync.jsonc               Backend deployment configuration
 - `receipts`: job ownership, image bytes, MIME type, filename, vendor, amount,
   and timestamp.
 - `invoices`: one invoice per job, calculated labor/material/total cents,
-  recipient email, status, and timestamp.
+  recipient email, status, and timestamp. Since estimates: `quotedCents` and
+  `quotedLines` (approved estimate parts/fees), `shopSuppliesCents`, `taxCents`,
+  `depositCents`, `balanceDueCents`, and `flatLabor` (labor came from an
+  approved estimate rather than hours × rate).
+- `estimate` (inside the job body): `status` (`draft` → `sent` → `responded`),
+  `token`, `lines` (`kind` labor/part/fee, `description`, `quantity`,
+  `unitCents`, `decision`), `taxRatePct`, `shopSuppliesPct`, `depositCents`
+  (asked for), `notes`, `sentAt`, `respondedAt`, `signatureName`,
+  `convertedAt`, `appliedScope`. Job-level `taxRatePct`, `shopSuppliesPct`,
+  `depositCents` (received), `quotedLines` and `flatLaborFromEstimate` are what
+  the invoice bills.
 
 Money is stored as integer cents. Timestamps are stored as ISO UTC values.
 
@@ -318,6 +332,43 @@ Costs run on the Anthropic API: Claude Opus 5 tokens on every turn, plus a
 billable web search per shop-mode lookup. The per-caller cap
 (`ASSISTANT_RATE_LIMIT`) is a runaway guard, not a budget — set a spend limit
 in the Anthropic console if that matters.
+
+## Estimates and customer approval
+
+The **Estimate & approval** card on every open job prices the work line by
+line — **Labor** (hours × rate, defaulting to the job's rate), **Part**,
+**Fee** — with a sales tax %, shop supplies % of labor, a deposit to ask for,
+and a note. **Saved jobs** keep a set of lines for reuse (on this phone only).
+
+1. **Send for approval** mints a 128-bit token; **Share link** waits until the
+   job has actually reached the cloud (a link shared offline would be dead),
+   then opens the share sheet with a ready-to-send text.
+2. The customer opens `portal.html#estimate/TOKEN`, approves or declines each
+   line (or **Approve all**), types their full name and ticks the agreement
+   box. The Worker requires every line answered, a name, and the box, and an
+   answer is final for that link (409 after).
+3. **Check for answer** pulls it in. **Put approved work on the invoice**
+   copies the approved lines onto the job: approved labor becomes a flat labor
+   charge (the labor card says so and offers **Bill by the timer instead**),
+   approved parts and fees bill as quoted lines, receipts still add on top,
+   tax/supplies carry over, and the approved scope is added to the agreed
+   work once (a later approval replaces it, never stacks it).
+4. **Pull back to edit** / **Change & resend** clears the token — the old link
+   stops working — and a resend starts a fresh approval.
+
+**Protecting the answer.** The customer's answer is written by the Worker,
+not a phone, so two rules keep it: `mergeEstimate` keeps a stored answer when
+a phone pushes an older copy of the same link still marked `sent`, and every
+write to a job row (phone save or customer answer) is a compare-and-swap on
+the row's previous contents, retried up to four times and otherwise answered
+`503` so the phone keeps the job queued.
+
+**Deposits and tax.** **Deposit received** (cash or card already taken) comes
+off the balance due on the invoice, the portal, the email, and the Stripe link,
+which charges the balance. A deposit that covers the whole bill gets a plain
+"nothing left to charge" instead of a Stripe error. Tax and shop supplies can
+also be set straight on the running invoice for jobs with no estimate; both
+default to 0% (Montana has no sales tax).
 
 ## Card payments (Stripe link)
 

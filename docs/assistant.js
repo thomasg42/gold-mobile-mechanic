@@ -444,10 +444,12 @@
       lines.push(`Missing but not required: ${review.recommended.join("; ")}.`);
     }
     if (review.nextStep) lines.push(review.nextStep);
+    if (review.estimateNote) lines.push(review.estimateNote);
     lines.push(`This job's history so far: ${review.history}.`);
+    const owed = review.balanceDue ? `, ${review.balanceDue} still owed after the deposit` : "";
     lines.push(review.laborRate
-      ? `Rate ${review.laborRate}, ${review.billedMinutes} minutes billed, total ${review.total}.`
-      : `Total so far ${review.total}.`);
+      ? `Rate ${review.laborRate}, ${review.billedMinutes} minutes billed, total ${review.total}${owed}.`
+      : `Total so far ${review.total}${owed}.`);
     lines.push("Tell me plainly whether this is a complete, fileable invoice, and if not, exactly what to fix first. If I dictate a note or a scope change, put it on.");
     return lines.join(" ");
   }

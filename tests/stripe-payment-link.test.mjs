@@ -203,6 +203,29 @@ test("payment link route builds one link from the filed invoice", async () => {
     const keys = stripeCalls.filter((c) => c.path === "/v1/payment_links").map((c) => c.key);
     assert.equal(new Set(keys).size, keys.length, "no two links share an idempotency key");
 
+    // A deposit already taken: the link charges the balance, and its Stripe
+    // line says it is the balance.
+    await call("/api/jobs/GMM-0042", { method: "PUT", body: { ...job,
+      invoice: { ...job.invoice, depositCents: 10000, balanceDueCents: 38750 },
+      updatedAt: "2026-10-16T21:00:00.000Z" } });
+    r = await call("/api/jobs/GMM-0042/payment-link", { method: "POST", body: {} });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).invoiceCents, 38750);
+    const balancePrice = stripeCalls
+      .filter((c) => c.path === "/v1/prices" && Number(c.form.get("unit_amount")) === 38750).at(-1);
+    assert.ok(balancePrice, "the balance, not the total, is the Stripe price");
+    assert.match(balancePrice.form.get("product_data[name]"), /^Invoice GMM-INV-0042 balance due/);
+
+    // A deposit that covers the whole bill: nothing to charge, and no Stripe call.
+    const callsBeforeCovered = stripeCalls.length;
+    await call("/api/jobs/GMM-0042", { method: "PUT", body: { ...job,
+      invoice: { ...job.invoice, depositCents: 48750, balanceDueCents: 0 },
+      updatedAt: "2026-10-16T22:00:00.000Z" } });
+    r = await call("/api/jobs/GMM-0042/payment-link", { method: "POST", body: {} });
+    assert.equal(r.status, 400);
+    assert.match((await r.json()).error, /deposit already covers/);
+    assert.equal(stripeCalls.length, callsBeforeCovered);
+
     // Health reports the key is configured.
     r = await call("/api/health");
     assert.equal((await r.json()).cardPayments, true);

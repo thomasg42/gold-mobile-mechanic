@@ -22,7 +22,7 @@
   </header>
 
   <main class="page">
-    <section id="portalDirectory">
+    <section id="portalDirectory" class="hidden">
       <div class="board-heading">
         <div>
           <p class="eyebrow">Open door</p>
@@ -52,6 +52,34 @@
         </div>
       </div>
       <div id="portalInvoices"></div>
+    </section>
+
+    <section id="portalEstimate" class="hidden">
+      <div class="board-heading">
+        <div>
+          <p class="eyebrow" id="estimateNumber">Estimate</p>
+          <h1 id="estimateTitle">Your estimate</h1>
+          <p id="estimateIntro"></p>
+        </div>
+      </div>
+      <p class="portal-error hidden" id="estimateError" role="alert"></p>
+      <form id="estimateForm" class="content-card" novalidate>
+        <div id="estimateLines"></div>
+        <div id="estimateTotals"></div>
+        <p class="portal-work" id="estimateNotes"></p>
+        <div id="estimateSign">
+          <label class="field field-wide">
+            <span>Type your full name to sign</span>
+            <input id="estimateSignature" name="signature" autocomplete="name" required>
+          </label>
+          <label class="estimate-agree">
+            <input type="checkbox" id="estimateAgree" name="agree">
+            <span>I approve the work I marked above and agree to pay for it.</span>
+          </label>
+          <button class="button button-gold" type="submit" id="estimateSubmit">Sign and send</button>
+        </div>
+        <p class="portal-work hidden" id="estimateDone" role="status"></p>
+      </form>
     </section>
   </main>
 

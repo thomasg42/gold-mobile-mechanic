@@ -89,6 +89,19 @@
       ...job,
       archived: Boolean(job.archived),
       materials: Array.isArray(job.materials) ? job.materials : [],
+      // Estimate fields are optional, so they are only shaped when present: a
+      // job with no estimate must not grow an empty one on every sync.
+      ...(job.estimate && typeof job.estimate === "object" ? {
+        estimate: {
+          ...job.estimate,
+          lines: (Array.isArray(job.estimate.lines) ? job.estimate.lines : [])
+            .filter((line) => line && typeof line === "object")
+        }
+      } : {}),
+      ...(job.quotedLines !== undefined ? {
+        quotedLines: (Array.isArray(job.quotedLines) ? job.quotedLines : [])
+          .filter((line) => line && typeof line === "object")
+      } : {}),
       timeEntries: (Array.isArray(job.timeEntries) ? job.timeEntries : []).map((entry) => ({
         ...entry,
         // Every span has to be addressable to be correctable on the time sheet.
@@ -742,6 +755,15 @@
     const laborAdjustmentCents = sign * magnitude;
     const laborCents = Math.max(0, baseLaborCents + laborAdjustmentCents);
     const materialsCents = partsTotal(job);
+    // Parts and fees the customer approved on the estimate. Labor lines from
+    // the estimate are not here: converting sets them as the flat labor charge.
+    const quotedCents = (Array.isArray(job.quotedLines) ? job.quotedLines : [])
+      .reduce((sum, line) => sum + estimateLineCents(line), 0);
+    const shopSuppliesCents = Math.round(laborCents * percentOf(job.shopSuppliesPct) / 100);
+    const subtotalCents = laborCents + materialsCents + quotedCents + shopSuppliesCents;
+    const taxCents = Math.round(subtotalCents * percentOf(job.taxRatePct) / 100);
+    const totalCents = subtotalCents + taxCents;
+    const depositCents = Math.max(0, Math.round(Number(job.depositCents || 0)));
     return {
       invoiceNumber: job.id.replace(/^GMM-/, "GMM-INV-"),
       createdAt: job.invoice?.createdAt || new Date().toISOString(),
@@ -752,9 +774,29 @@
       laborAdjustmentCents,
       laborCents,
       materialsCents,
-      totalCents: laborCents + materialsCents,
+      quotedCents,
+      quotedLines: (Array.isArray(job.quotedLines) ? job.quotedLines : []).map((line) => ({
+        description: String(line.description || ""), kind: String(line.kind || "part"),
+        quantity: Number(line.quantity || 0), unitCents: Math.round(Number(line.unitCents || 0)),
+        amountCents: estimateLineCents(line)
+      })),
+      flatLabor: Boolean(job.flatLaborFromEstimate) && hasOwnLabor,
+      shopSuppliesCents,
+      taxCents,
+      totalCents,
+      depositCents,
+      balanceDueCents: Math.max(0, totalCents - depositCents),
       difficultyLevel: String(job.difficultyLevel || "Standard")
     };
+  }
+
+  function percentOf(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0;
+  }
+
+  function estimateLineCents(line) {
+    return Math.max(0, Math.round(Number(line?.quantity || 0) * Math.round(Number(line?.unitCents || 0))));
   }
 
   function requiredStar(label) {
@@ -816,11 +858,26 @@
     else if (job.status === "invoiced") nextStep = "Already filed. Unsubmit it first to change anything.";
 
     const draft = invoiceDraft(job);
+
+    // Estimate state is a fact to report before filing, never a blocker: plenty
+    // of jobs are billed with no estimate at all.
+    const estimate = job.estimate;
+    let estimateNote = "";
+    if (estimate?.status === "sent") {
+      estimateNote = "The estimate was sent but the customer hasn't approved it yet.";
+    } else if (estimate?.status === "responded" && !estimate.convertedAt && estimateTotals(estimate).approved.total > 0) {
+      estimateNote = "The customer approved estimate work that isn't on the invoice yet. Tap Put approved work on the invoice first.";
+    } else if (draft.flatLabor) {
+      estimateNote = `Labor is the flat ${money(draft.baseLaborCents)} the customer approved on the estimate, not hours times rate.`;
+    }
+
     return {
       ready: blocking.length === 0,
       blocking,
       recommended,
       nextStep,
+      estimateNote,
+      balanceDue: draft.depositCents ? money(draft.balanceDueCents) : "",
       billedMinutes: Math.round((draft.workSeconds || 0) / 60),
       laborRate: job.laborRateCents ? money(job.laborRateCents) : "",
       total: money(draft.totalCents),
@@ -850,7 +907,7 @@
     const magnitude = Math.abs(Number(draft.laborAdjustmentCents || 0));
     if (!magnitude) return "No labor adjustment.";
     const sign = Number(draft.laborAdjustmentCents) < 0 ? "−" : "+";
-    return `Adjusted by ${sign}${money(magnitude)} · original ${money(draft.timedLaborCents)} → new ${money(draft.laborCents)}`;
+    return `Adjusted by ${sign}${money(magnitude)} · original ${money(draft.baseLaborCents)} → new ${money(draft.laborCents)}`;
   }
 
   function receiptAdjustmentNote(receipt) {
@@ -925,6 +982,485 @@
     queueJobSync(job);
     renderJob();
     notify("Invoice reopened. Fix anything, then Finish Project to file it again.");
+  }
+
+  // ------------------------------------------------------------ estimates
+  //
+  // Estimate → customer approval → invoice. The customer opens an unguessable
+  // link (portal.html#estimate/TOKEN), approves or declines each line, and
+  // signs with their typed name. The Worker writes the answer; this phone only
+  // ever reads it back. Converting copies the approved lines onto the job:
+  // labor lines become the flat labor charge, parts and fees bill as quoted
+  // lines, and receipts still add on top for anything bought beyond the quote.
+
+  const SAVED_JOBS_STORAGE = "gold-mobile-mechanic-saved-jobs-v1";
+  const ESTIMATE_KINDS = { labor: "Labor (hours)", part: "Part", fee: "Fee" };
+
+  function savedJobs() {
+    return arrayFromStorage(SAVED_JOBS_STORAGE)
+      .filter((item) => item && typeof item.name === "string" && Array.isArray(item.lines));
+  }
+
+  function estimateToken() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function ensureEstimate(job) {
+    if (!job.estimate) {
+      job.estimate = {
+        status: "draft", token: "", lines: [], notes: "",
+        taxRatePct: percentOf(job.taxRatePct),
+        shopSuppliesPct: percentOf(job.shopSuppliesPct),
+        depositCents: 0
+      };
+    }
+    return job.estimate;
+  }
+
+  function estimateTotals(estimate) {
+    const lines = Array.isArray(estimate?.lines) ? estimate.lines : [];
+    const sum = (filter) => lines.filter(filter).reduce((total, line) => total + estimateLineCents(line), 0);
+    const totalsFor = (filter) => {
+      const labor = sum((line) => line.kind === "labor" && filter(line));
+      const other = sum((line) => line.kind !== "labor" && filter(line));
+      const supplies = Math.round(labor * percentOf(estimate?.shopSuppliesPct) / 100);
+      const tax = Math.round((labor + other + supplies) * percentOf(estimate?.taxRatePct) / 100);
+      return { labor, other, supplies, tax, total: labor + other + supplies + tax };
+    };
+    return {
+      all: totalsFor(() => true),
+      approved: totalsFor((line) => line.decision === "approved")
+    };
+  }
+
+  function estimateLink(job) {
+    return job.estimate?.token ? `${PORTAL_URL}#estimate/${job.estimate.token}` : "";
+  }
+
+  function estimateLineRow(line, editable) {
+    const decision = line.decision && line.decision !== "pending"
+      ? `<span class="status-pill ${line.decision === "approved" ? "invoiced" : "archived"}">${line.decision === "approved" ? "Approved" : "Declined"}</span>`
+      : "";
+    if (!editable) {
+      return `
+        <div class="estimate-line">
+          <div><strong>${escapeHtml(line.description || "Untitled line")}</strong>
+            <span class="time-edit-note">${escapeHtml(ESTIMATE_KINDS[line.kind] || "Line")} · ${escapeHtml(String(line.quantity))} × ${money(line.unitCents)}</span></div>
+          <div class="estimate-line-end"><strong>${money(estimateLineCents(line))}</strong>${decision}</div>
+        </div>`;
+    }
+    return `
+      <div class="estimate-line estimate-line-edit" data-estimate-line="${escapeHtml(line.id)}">
+        <label class="field field-wide"><span>${escapeHtml(ESTIMATE_KINDS[line.kind] || "Line")}</span>
+          <input data-line-field="description" value="${escapeHtml(line.description || "")}" placeholder="${line.kind === "labor" ? "Replace front brake pads and rotors" : line.kind === "fee" ? "Diagnostic fee" : "Front pad set"}"></label>
+        <label class="field"><span>${line.kind === "labor" ? "Hours" : "Qty"}</span>
+          <input data-line-field="quantity" inputmode="decimal" value="${escapeHtml(String(line.quantity ?? ""))}"></label>
+        <label class="field"><span>${line.kind === "labor" ? "Rate" : "Price each"}</span>
+          <span class="money-input"><b>$</b><input data-line-field="unitCents" inputmode="decimal" value="${(Number(line.unitCents || 0) / 100).toFixed(2)}"></span></label>
+        <span class="estimate-line-amount">Line total <strong data-line-amount>${money(estimateLineCents(line))}</strong></span>
+        <button class="text-button" type="button" data-remove-line="${escapeHtml(line.id)}" aria-label="Remove ${escapeHtml(line.description || "this line")}">Remove</button>
+      </div>`;
+  }
+
+  function estimateTotalsMarkup(estimate) {
+    const lines = Array.isArray(estimate?.lines) ? estimate.lines : [];
+    if (!lines.length) return "";
+    const totals = estimateTotals(estimate);
+    const showApproved = estimate.status === "responded";
+    const shown = showApproved ? totals.approved : totals.all;
+    return `
+      <div class="invoice-meta">
+        <span>Labor · ${money(shown.labor)}</span>
+        <span>Parts &amp; fees · ${money(shown.other)}</span>
+        ${shown.supplies ? `<span>Supplies · ${money(shown.supplies)}</span>` : ""}
+        ${shown.tax ? `<span>Tax · ${money(shown.tax)}</span>` : ""}
+      </div>
+      <div class="invoice-total"><span>${showApproved ? "Approved total" : "Estimate total"}</span><strong>${money(shown.total)}</strong></div>
+      ${showApproved && totals.approved.total !== totals.all.total ? `<p class="time-edit-note">Declined work: ${money(totals.all.total - totals.approved.total)}. Worth a follow-up later.</p>` : ""}`;
+  }
+
+  function estimateMarkup(job, locked) {
+    const estimate = job.estimate;
+    // A filed job that never had an estimate has nothing to show here.
+    if (locked && !estimate) return "";
+    const status = estimate?.status || "none";
+    const editable = !locked && (status === "none" || status === "draft");
+    const lines = Array.isArray(estimate?.lines) ? estimate.lines : [];
+    const totals = estimateTotals(estimate || {});
+    const saved = savedJobs();
+    const link = estimateLink(job);
+    const heading = {
+      none: "No estimate yet", draft: "Draft estimate", sent: "Waiting on the customer",
+      responded: estimate?.convertedAt ? "Approved and on the invoice" : "Customer answered"
+    }[status] || "Estimate";
+
+    return `
+      <article class="content-card estimate-card" id="estimateCard">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">Estimate &amp; approval</p>
+            <h2>${heading}</h2>
+            <p>${status === "sent" ? `Sent ${calendarDate(estimate.sentAt)}. They approve or decline each line and sign on their phone.`
+              : status === "responded" ? `Signed by ${escapeHtml(estimate.signatureName || "the customer")} · ${calendarDate(estimate.respondedAt)} ${clockTime(estimate.respondedAt)}`
+              : "Price the job line by line, then send the customer a link to approve it before you start."}</p>
+          </div>
+        </div>
+        <div class="estimate-lines">
+          ${lines.length ? lines.map((line) => estimateLineRow(line, editable)).join("")
+            : `<p class="history-empty">No lines yet. Add labor, parts or fees${editable && saved.length ? ", or start from a saved job" : ""}.</p>`}
+        </div>
+        ${editable ? `
+          <div class="save-row estimate-add">
+            <button class="button button-quiet" type="button" data-add-line="labor">+ Labor</button>
+            <button class="button button-quiet" type="button" data-add-line="part">+ Part</button>
+            <button class="button button-quiet" type="button" data-add-line="fee">+ Fee</button>
+          </div>
+          ${saved.length ? `
+            <label class="field field-wide"><span>Add a saved job</span>
+              <select id="savedJobSelect"><option value="">Choose a saved job…</option>
+                ${saved.map((item, index) => `<option value="${index}">${escapeHtml(item.name)} (${item.lines.length} line${item.lines.length === 1 ? "" : "s"})</option>`).join("")}
+              </select></label>
+            <details class="saved-jobs-manage">
+              <summary>Manage saved jobs</summary>
+              ${saved.map((item, index) => `
+                <div class="saved-job-row"><span>${escapeHtml(item.name)}</span>
+                  <button class="text-button" type="button" data-remove-saved="${index}" aria-label="Remove the saved job ${escapeHtml(item.name)}">Remove</button></div>`).join("")}
+            </details>` : ""}
+          ${lines.length ? `
+            <div class="form-grid estimate-settings">
+              <label class="field"><span>Sales tax %</span><input id="estimateTaxInput" inputmode="decimal" value="${escapeHtml(String(percentOf(estimate.taxRatePct)))}"></label>
+              <label class="field"><span>Shop supplies % of labor</span><input id="estimateSuppliesInput" inputmode="decimal" value="${escapeHtml(String(percentOf(estimate.shopSuppliesPct)))}"></label>
+              <label class="field"><span>Deposit to ask for</span><span class="money-input"><b>$</b><input id="estimateDepositInput" inputmode="decimal" value="${(Number(estimate.depositCents || 0) / 100).toFixed(2)}"></span></label>
+            </div>
+            <label class="field field-wide"><span>Note to the customer</span>
+              <textarea class="suggestions" id="estimateNotesInput" rows="2" placeholder="Price good for 14 days. Parts may change if we find more once it's apart.">${escapeHtml(estimate.notes || "")}</textarea></label>
+            <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>` : ""}
+        ` : estimate?.notes ? `<p class="work-copy">${escapeHtml(estimate.notes)}</p>` : ""}
+        <div id="estimateTotalsLive">${estimateTotalsMarkup(estimate)}</div>
+        ${(status === "sent" || status === "responded") && link ? `
+          <div class="customer-link-row">
+            <span class="detail-label">Customer's estimate link</span>
+            <code class="customer-link-url">${escapeHtml(link)}</code>
+            <button class="button button-quiet button-compact" id="copyEstimateLinkButton" type="button">Copy link</button>
+          </div>` : ""}
+        ${locked ? "" : `<div class="save-row estimate-actions">
+          ${editable && lines.length ? `<button class="button button-quiet" type="button" id="saveAsJobButton">Save as a saved job</button>
+            <button class="button button-gold" type="button" id="sendEstimateButton">Send for approval</button>` : ""}
+          ${status === "sent" ? `<button class="button button-dark" type="button" id="shareEstimateButton">Share link</button>
+            <button class="button button-quiet" type="button" id="refreshEstimateButton">Check for answer</button>
+            <button class="button button-quiet" type="button" id="editEstimateButton">Pull back to edit</button>` : ""}
+          ${status === "responded" && !estimate.convertedAt && totals.approved.total > 0 ? `<button class="button button-gold" type="button" id="convertEstimateButton">Put approved work on the invoice</button>` : ""}
+          ${status === "responded" ? `<button class="button button-quiet" type="button" id="editEstimateButton">Change &amp; resend</button>` : ""}
+        </div>
+        <div class="estimate-deposit">
+          <label class="field"><span>Deposit received</span><span class="money-input"><b>$</b><input id="depositReceivedInput" inputmode="decimal" value="${(Number(job.depositCents || 0) / 100).toFixed(2)}"></span></label>
+          <p class="time-edit-note">Cash or card you already took. It comes off the balance due and the card link.</p>
+        </div>`}
+      </article>`;
+  }
+
+  /** Reads the draft estimate's inputs into `estimate` (the job's, or a scratch copy). */
+  function readEstimateForm(estimate) {
+    if (!estimate || estimate.status !== "draft") return;
+    document.querySelectorAll("[data-estimate-line]").forEach((row) => {
+      const line = estimate.lines.find((item) => item.id === row.dataset.estimateLine);
+      if (!line) return;
+      line.description = String(row.querySelector('[data-line-field="description"]')?.value || "").trim();
+      const quantity = Number.parseFloat(row.querySelector('[data-line-field="quantity"]')?.value || "0");
+      line.quantity = Number.isFinite(quantity) ? Math.max(0, quantity) : 0;
+      line.unitCents = parseCents(row.querySelector('[data-line-field="unitCents"]')?.value);
+    });
+    const pct = (id) => percentOf(Number.parseFloat($(id)?.value || "0"));
+    if ($("estimateTaxInput")) estimate.taxRatePct = pct("estimateTaxInput");
+    if ($("estimateSuppliesInput")) estimate.shopSuppliesPct = pct("estimateSuppliesInput");
+    if ($("estimateDepositInput")) estimate.depositCents = parseCents($("estimateDepositInput").value);
+    if ($("estimateNotesInput")) estimate.notes = $("estimateNotesInput").value.trim();
+  }
+
+  /** Repaints the line totals and the estimate total without a full render. */
+  function refreshEstimateTotals(estimate) {
+    const box = $("estimateTotalsLive");
+    if (box) box.innerHTML = estimateTotalsMarkup(estimate);
+    document.querySelectorAll("[data-estimate-line]").forEach((row) => {
+      const line = estimate?.lines?.find((item) => item.id === row.dataset.estimateLine);
+      const amount = row.querySelector("[data-line-amount]");
+      if (line && amount) amount.textContent = money(estimateLineCents(line));
+    });
+  }
+
+  /** Autosave for the draft estimate, in the same chain as every other card. */
+  function persistEstimate(job) {
+    const estimate = job.estimate;
+    if (!estimate || estimate.status !== "draft" || !$("estimateCard")) return false;
+    const before = JSON.stringify(estimate);
+    readEstimateForm(estimate);
+    if (JSON.stringify(estimate) === before) return false;
+    queueJobSync(job);
+    return true;
+  }
+
+  function persistDeposit(job) {
+    const input = $("depositReceivedInput");
+    if (!input) return false;
+    const cents = parseCents(input.value);
+    if (cents === Math.max(0, Math.round(Number(job.depositCents || 0)))) return false;
+    job.depositCents = cents;
+    queueJobSync(job);
+    refreshRunningInvoice(job);
+    return true;
+  }
+
+  function persistInvoiceTerms(job) {
+    const supplies = $("invoiceSuppliesInput");
+    const tax = $("invoiceTaxInput");
+    if (!supplies && !tax) return false;
+    const read = (input, current) => (input ? percentOf(Number.parseFloat(input.value || "0")) : percentOf(current));
+    const nextSupplies = read(supplies, job.shopSuppliesPct);
+    const nextTax = read(tax, job.taxRatePct);
+    if (nextSupplies === percentOf(job.shopSuppliesPct) && nextTax === percentOf(job.taxRatePct)) return false;
+    job.shopSuppliesPct = nextSupplies;
+    job.taxRatePct = nextTax;
+    queueJobSync(job);
+    refreshRunningInvoice(job);
+    return true;
+  }
+
+  function runningInvoiceFigures(job, draft) {
+    return `
+      <div class="invoice-meta">
+        <span>Labor · ${money(draft.laborCents)}</span>
+        <span>Parts · ${money(draft.materialsCents)}</span>
+        ${draft.quotedCents ? `<span>Quoted parts &amp; fees · ${money(draft.quotedCents)}</span>` : ""}
+        ${draft.shopSuppliesCents ? `<span>Supplies · ${money(draft.shopSuppliesCents)}</span>` : ""}
+        ${draft.taxCents ? `<span>Tax · ${money(draft.taxCents)}</span>` : ""}
+        <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"}</span>
+      </div>
+      <div class="invoice-total"><span>Total so far</span><strong>${money(draft.totalCents)}</strong></div>
+      ${draft.depositCents ? `<div class="invoice-total"><span>Balance after deposit</span><strong>${money(draft.balanceDueCents)}</strong></div>` : ""}`;
+  }
+
+  function refreshRunningInvoice(job) {
+    const box = $("runningInvoiceFigures");
+    if (box) box.innerHTML = runningInvoiceFigures(job, invoiceDraft(job));
+  }
+
+  function convertEstimate(job) {
+    const estimate = job.estimate;
+    const approved = (estimate?.lines || []).filter((line) => line.decision === "approved");
+    if (!approved.length) return false;
+    const labor = approved.filter((line) => line.kind === "labor");
+    if (labor.length) {
+      job.laborAmountCents = labor.reduce((sum, line) => sum + estimateLineCents(line), 0);
+      job.flatLaborFromEstimate = true;
+      job.laborAdjustmentCents = 0;
+      job.laborAdjustSign = 1;
+    } else if (job.flatLaborFromEstimate) {
+      // An earlier approval set flat labor and this one approved none: the
+      // timer bills labor again rather than a quote the customer took back.
+      job.laborAmountCents = null;
+      job.flatLaborFromEstimate = false;
+    }
+    job.quotedLines = approved
+      .filter((line) => line.kind !== "labor")
+      .map(({ id, kind, description, quantity, unitCents }) => ({ id, kind, description, quantity, unitCents }));
+    job.taxRatePct = percentOf(estimate.taxRatePct);
+    job.shopSuppliesPct = percentOf(estimate.shopSuppliesPct);
+    // The approved scope lands on the agreed work once. Approving a changed
+    // estimate replaces the earlier approval's text instead of stacking it.
+    const scope = approved.map((line) => line.description).filter(Boolean).join("; ");
+    if (scope) {
+      let base = String(job.agreedWork || "");
+      const previous = String(estimate.appliedScope || "");
+      if (previous && base.includes(previous)) base = base.replace(previous, "");
+      base = base.replace(/\n{2,}/g, "\n").trim();
+      const block = base ? `Approved estimate: ${scope}` : scope;
+      job.agreedWork = base ? `${base}\n${block}` : block;
+      estimate.appliedScope = block;
+    }
+    estimate.convertedAt = new Date().toISOString();
+    return true;
+  }
+
+  /**
+   * The link only opens once the job has reached the cloud. Sharing it from a
+   * phone with no signal would hand the customer a dead link, so it waits.
+   */
+  async function estimateUploaded(job) {
+    await flushSyncQueue().catch(() => {});
+    if (!pendingJobIds().includes(job.id)) return true;
+    notify("This estimate hasn't uploaded yet, so the link won't open for them. Get signal, then share it.", true);
+    return false;
+  }
+
+  function bindEstimateEvents(job) {
+    const save = (message) => {
+      queueJobSync(job);
+      renderJob();
+      if (message) notify(message);
+    };
+
+    // Lives in the labor card, not this one, so it is bound before the early return.
+    $("useTimerLaborButton")?.addEventListener("click", () => {
+      if (!window.confirm("Bill labor by the timer (hours × rate) instead of the flat amount from the estimate?")) return;
+      job.laborAmountCents = null;
+      job.flatLaborFromEstimate = false;
+      save("Labor is back on the timer.");
+    });
+
+    const card = $("estimateCard");
+    if (!card) return;
+
+    card.querySelectorAll("[data-add-line]").forEach((button) => button.addEventListener("click", () => {
+      const estimate = ensureEstimate(job);
+      readEstimateForm(estimate);
+      const kind = button.dataset.addLine;
+      estimate.lines.push({
+        id: uid(), kind, description: "", quantity: 1,
+        unitCents: kind === "labor" ? Number(job.laborRateCents || 0) : 0, decision: "pending"
+      });
+      save();
+    }));
+
+    card.querySelectorAll("[data-remove-line]").forEach((button) => button.addEventListener("click", () => {
+      readEstimateForm(job.estimate);
+      job.estimate.lines = job.estimate.lines.filter((line) => line.id !== button.dataset.removeLine);
+      save();
+    }));
+
+    $("savedJobSelect")?.addEventListener("change", (event) => {
+      const item = savedJobs()[Number(event.target.value)];
+      if (!item) return;
+      const estimate = ensureEstimate(job);
+      readEstimateForm(estimate);
+      item.lines.forEach((line) => estimate.lines.push({
+        id: uid(),
+        kind: ESTIMATE_KINDS[line.kind] ? line.kind : "part",
+        description: String(line.description || ""),
+        quantity: Number(line.quantity || 0),
+        unitCents: Math.max(0, Math.round(Number(line.unitCents || 0))),
+        decision: "pending"
+      }));
+      save(`Added "${item.name}".`);
+    });
+
+    card.querySelectorAll("[data-remove-saved]").forEach((button) => button.addEventListener("click", () => {
+      const items = savedJobs();
+      const index = Number(button.dataset.removeSaved);
+      const item = items[index];
+      if (!item || !window.confirm(`Remove the saved job "${item.name}"? Estimates already sent keep their lines.`)) return;
+      items.splice(index, 1);
+      writeStorageArray(SAVED_JOBS_STORAGE, items);
+      readEstimateForm(job.estimate);
+      save(`Removed "${item.name}".`);
+    }));
+
+    $("saveAsJobButton")?.addEventListener("click", () => {
+      readEstimateForm(job.estimate);
+      const name = String(window.prompt("Name this saved job (for example: Front brakes, pads + rotors)") || "").trim();
+      if (!name) return;
+      const items = savedJobs().filter((item) => item.name.toLowerCase() !== name.toLowerCase());
+      items.push({
+        name,
+        lines: job.estimate.lines.map(({ kind, description, quantity, unitCents }) => ({ kind, description, quantity, unitCents }))
+      });
+      writeStorageArray(SAVED_JOBS_STORAGE, items);
+      save(`Saved "${name}" for next time.`);
+    });
+
+    $("sendEstimateButton")?.addEventListener("click", () => {
+      const estimate = job.estimate;
+      readEstimateForm(estimate);
+      if (!estimate.lines.length) return notify("Add at least one line first.", true);
+      const blank = estimate.lines.find((line) => !line.description || !estimateLineCents(line));
+      if (blank) return notify("Every line needs a description and a price before you send it.", true);
+      if (!String(job.customerName || "").trim()) return notify("Add the customer's name first.", true);
+      estimate.token = estimateToken();
+      estimate.status = "sent";
+      estimate.sentAt = new Date().toISOString();
+      estimate.respondedAt = null;
+      estimate.signatureName = "";
+      estimate.convertedAt = null;
+      estimate.lines.forEach((line) => { line.decision = "pending"; });
+      save("Estimate link ready. Tap Share link to send it.");
+    });
+
+    $("shareEstimateButton")?.addEventListener("click", async () => {
+      if (!(await estimateUploaded(job))) return;
+      const firstName = String(job.customerName || "").trim().split(/\s+/)[0] || "there";
+      const text = `Hi ${firstName}, here's your estimate from Gold Mobile Mechanic. Approve what you'd like done and sign here: ${estimateLink(job)}`;
+      if (navigator.share) {
+        try {
+          await navigator.share({ title: "Your estimate", text });
+          return;
+        } catch (error) {
+          if (error?.name === "AbortError") return;
+        }
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        notify("Estimate message copied. Paste it into a text.");
+      } catch {
+        window.prompt("Copy this message for the customer:", text);
+      }
+    });
+
+    $("copyEstimateLinkButton")?.addEventListener("click", async () => {
+      if (!(await estimateUploaded(job))) return;
+      const link = estimateLink(job);
+      try {
+        await navigator.clipboard.writeText(link);
+        notify("Estimate link copied.");
+      } catch {
+        window.prompt("Copy this link for the customer:", link);
+      }
+    });
+
+    $("refreshEstimateButton")?.addEventListener("click", async () => {
+      if (!navigator.onLine) return notify("You're offline. Check again when you have signal.", true);
+      const ok = await ensureCloudSync();
+      renderJob();
+      if (ok) notify(job.estimate?.status === "responded" ? "The customer answered." : "No answer yet.");
+    });
+
+    $("editEstimateButton")?.addEventListener("click", () => {
+      if (!window.confirm("This turns off the link you sent. You'll send a new one after your changes. Continue?")) return;
+      job.estimate.status = "draft";
+      job.estimate.token = "";
+      job.estimate.lines.forEach((line) => { line.decision = "pending"; });
+      job.estimate.respondedAt = null;
+      job.estimate.signatureName = "";
+      save("Back to draft. The old link no longer works.");
+    });
+
+    $("convertEstimateButton")?.addEventListener("click", () => {
+      if (!convertEstimate(job)) return;
+      save(job.flatLaborFromEstimate
+        ? "Approved work is on the invoice. Labor is now the flat quoted amount."
+        : "Approved work is on the invoice.");
+    });
+
+    $("depositReceivedInput")?.addEventListener("change", () => {
+      if (persistDeposit(job)) notify("Deposit saved.");
+    });
+
+    const inDraftForm = (target) => target.closest("[data-estimate-line]")
+      || target.closest(".estimate-settings") || target.id === "estimateNotesInput";
+
+    // Totals follow every keystroke on a scratch copy; the job itself is only
+    // written on change or autosave, so the autosave dirty check stays honest.
+    card.addEventListener("input", (event) => {
+      if (!job.estimate || job.estimate.status !== "draft" || !inDraftForm(event.target)) return;
+      const preview = JSON.parse(JSON.stringify(job.estimate));
+      readEstimateForm(preview);
+      refreshEstimateTotals(preview);
+    });
+
+    card.addEventListener("change", (event) => {
+      if (!inDraftForm(event.target)) return;
+      if (persistEstimate(job)) refreshEstimateTotals(job.estimate);
+    });
   }
 
   function findJob(id) {
@@ -1709,9 +2245,13 @@
         <div class="invoice-meta">
           <span>Labor · ${money(job.invoice.laborCents)}</span>
           <span>Parts · ${money(job.invoice.materialsCents)}</span>
+          ${job.invoice.quotedCents ? `<span>Quoted parts &amp; fees · ${money(job.invoice.quotedCents)}</span>` : ""}
+          ${job.invoice.shopSuppliesCents ? `<span>Supplies · ${money(job.invoice.shopSuppliesCents)}</span>` : ""}
+          ${job.invoice.taxCents ? `<span>Tax · ${money(job.invoice.taxCents)}</span>` : ""}
           <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"} filed</span>
         </div>
         <div class="invoice-total"><span>Total</span><strong>${money(job.invoice.totalCents)}</strong></div>
+        ${job.invoice.depositCents ? `<div class="invoice-total"><span>Balance due</span><strong>${money(job.invoice.balanceDueCents)}</strong></div>` : ""}
         <div class="invoice-actions">
           <button class="button button-dark" id="shareInvoiceButton" type="button">Share invoice</button>
           <button class="button button-quiet" id="downloadInvoiceButton" type="button">Download</button>
@@ -2021,6 +2561,9 @@
                     <span>Labor total</span>
                     <strong id="laborTotalLive">${money(draft.laborCents)}</strong>
                   </div>
+                  ${draft.flatLabor ? `
+                    <p class="time-edit-note flat-labor-note">Labor is the flat ${money(draft.baseLaborCents)} the customer approved on the estimate, not hours × rate.
+                      <button class="text-button" type="button" id="useTimerLaborButton">Bill by the timer instead</button></p>` : ""}
                   <div class="save-row time-edit-actions">
                     <button class="button button-quiet" id="saveLaborButton" type="button">Save labor</button>
                   </div>
@@ -2094,6 +2637,8 @@
                 <p class="time-edit-note">Tap away or scroll and it auto-saves.</p>
               </div>`}
           </article>
+
+          ${estimateMarkup(job, locked)}
 
           <article class="content-card" id="agreedWorkCard">
             <div class="card-heading">
@@ -2178,12 +2723,11 @@
                   <p>Receipt photos roll into parts the moment you file them. Finish Project files the invoice so you can share it for payment.</p>
                 </div>
               </div>
-              <div class="invoice-meta">
-                <span>Labor · ${money(draft.laborCents)}</span>
-                <span>Parts · ${money(draft.materialsCents)}</span>
-                <span>${job.receipts.length} receipt${job.receipts.length === 1 ? "" : "s"}</span>
+              <div id="runningInvoiceFigures">${runningInvoiceFigures(job, draft)}</div>
+              <div class="form-grid invoice-terms">
+                <label class="field"><span>Shop supplies % of labor</span><input id="invoiceSuppliesInput" inputmode="decimal" value="${escapeHtml(String(percentOf(job.shopSuppliesPct)))}"></label>
+                <label class="field"><span>Sales tax %</span><input id="invoiceTaxInput" inputmode="decimal" value="${escapeHtml(String(percentOf(job.taxRatePct)))}"></label>
               </div>
-              <div class="invoice-total"><span>Total so far</span><strong>${money(draft.totalCents)}</strong></div>
               ${job.status === "completed" ? `<button class="button button-gold" id="createInvoiceButton" type="button">Create & share invoice</button>` : ""}
             </article>` : ""}
 
@@ -2233,6 +2777,7 @@
   });
 
   function bindJobEvents(job) {
+    bindEstimateEvents(job);
     /**
      * Writes the customer and vehicle back onto the job. Every field on a work
      * order is correctable after the fact — a name heard wrong over a phone, a
@@ -2303,7 +2848,9 @@
     function applyLaborFromForm(targetJob) {
       const rateCents = parseCents($("laborRateInput")?.value);
       if (rateCents) targetJob.laborRateCents = rateCents;
-      targetJob.laborAmountCents = null;
+      // Flat labor from an approved estimate survives autosave; the timer
+      // only drives labor when there is no quote behind it.
+      if (!targetJob.flatLaborFromEstimate) targetJob.laborAmountCents = null;
       const magnitude = parseCents($("laborAdjustInput")?.value);
       const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
       targetJob.laborAdjustmentCents = sign * magnitude;
@@ -2398,7 +2945,10 @@
         persistSuggestions(),
         persistMaterials(),
         persistLabor(),
-        persistFolder()
+        persistFolder(),
+        persistEstimate(job),
+        persistDeposit(job),
+        persistInvoiceTerms(job)
       ];
       const changed = results.some(Boolean);
       if (changed) notifyAutoSaved();
@@ -2427,6 +2977,10 @@
         persistAgreedWork();
         persistSuggestions();
         persistMaterials();
+        // A deposit or supplies % typed a moment ago is on the filed bill too.
+        persistEstimate(job);
+        persistDeposit(job);
+        persistInvoiceTerms(job);
         const blocked = jobReadyForInvoice(job);
         if (blocked) {
           notify(blocked, true);
@@ -2798,9 +3352,13 @@
     function liveLaborTotal() {
       const rateCents = parseCents($("laborRateInput")?.value);
       const timed = Math.round((billableSeconds(job) / 3600) * rateCents);
+      // An approved estimate's flat labor is the base the adjustment moves,
+      // exactly as invoiceDraft bills it; otherwise it is hours × rate.
+      const billed = invoiceDraft(job);
+      const base = billed.flatLabor ? billed.baseLaborCents : timed;
       const magnitude = parseCents($("laborAdjustInput")?.value);
       const sign = ($("laborAdjustSign")?.textContent || "+").includes("−") || ($("laborAdjustSign")?.textContent || "").includes("-") ? -1 : 1;
-      const total = Math.max(0, timed + sign * magnitude);
+      const total = Math.max(0, base + sign * magnitude);
       const timedLive = $("timedLaborLive");
       const laborLive = $("laborTotalLive");
       const note = $("laborAdjustNote");
@@ -2808,7 +3366,7 @@
       if (laborLive) laborLive.textContent = money(total);
       if (note) {
         note.textContent = magnitude
-          ? `Adjusted by ${sign < 0 ? "−" : "+"}${money(magnitude)} · original ${money(timed)} → new ${money(total)}`
+          ? `Adjusted by ${sign < 0 ? "−" : "+"}${money(magnitude)} · original ${money(base)} → new ${money(total)}`
           : "No labor adjustment.";
       }
     }
@@ -2887,6 +3445,12 @@
         button.textContent = next;
         refreshFolderSubtotal(button.dataset.folderSign);
         if (persistFolder()) notifyAutoSaved();
+      });
+    });
+
+    ["invoiceSuppliesInput", "invoiceTaxInput"].forEach((id) => {
+      $(id)?.addEventListener("change", () => {
+        if (persistInvoiceTerms(job)) notifyAutoSaved();
       });
     });
 
@@ -4152,19 +4716,28 @@
       <div class="box"><span class="eyebrow">Bill to</span><br><strong>${escapeHtml(job.customerName)}</strong><br>${escapeHtml(job.customerPhone || "Phone not provided")}<br>${escapeHtml(job.customerEmail || "Email not provided")}</div>
       <div class="box"><span class="eyebrow">Vehicle</span><br><strong>${escapeHtml(vehicleName(job))}</strong><br>${escapeHtml(job.vehiclePlate || "No plate recorded")}</div>
     </div>
-    <div class="box"><span class="eyebrow">Agreed work</span><p>${escapeHtml(job.agreedWork)}</p></div>
+    <div class="box"><span class="eyebrow">Agreed work</span><p>${escapeHtml(job.agreedWork)}</p>
+      ${job.estimate?.status === "responded" && job.estimate.convertedAt ? `<p><strong>Estimate ${escapeHtml(job.id.replace(/^GMM-/, "GMM-EST-"))} approved and signed by ${escapeHtml(job.estimate.signatureName || "the customer")} on ${calendarDate(job.estimate.respondedAt)}.</strong></p>` : ""}</div>
     ${agreedMaterialsMarkup}
     <table>
       <thead><tr><th>Service / part</th><th>Qty / hours</th><th>Rate</th><th>Amount</th></tr></thead>
       <tbody>
-        <tr><td>Mobile mechanic labor</td><td>${(job.invoice.workSeconds / 3600).toFixed(2)} hrs</td><td>${money(job.laborRateCents)}/hr</td><td>${money(job.invoice.laborCents)}</td></tr>
+        ${job.invoice.flatLabor
+          ? `<tr><td>Labor (approved estimate)</td><td>Flat rate</td><td></td><td>${money(job.invoice.laborCents)}</td></tr>`
+          : `<tr><td>Mobile mechanic labor</td><td>${(job.invoice.workSeconds / 3600).toFixed(2)} hrs</td><td>${money(job.laborRateCents)}/hr</td><td>${money(job.invoice.laborCents)}</td></tr>`}
+        ${(job.invoice.quotedLines || []).map((line) => `<tr><td>${escapeHtml(line.description)}</td><td>${escapeHtml(String(line.quantity))}</td><td>${money(line.unitCents)}</td><td>${money(line.amountCents)}</td></tr>`).join("")}
         ${receiptRowsMarkup}
       </tbody>
     </table>
     <div class="totals">
       <div><span>Labor</span><strong>${money(job.invoice.laborCents)}</strong></div>
+      ${job.invoice.quotedCents ? `<div><span>Parts &amp; fees (approved estimate)</span><strong>${money(job.invoice.quotedCents)}</strong></div>` : ""}
       <div><span>Parts (from receipts)</span><strong>${money(job.invoice.materialsCents)}</strong></div>
+      ${job.invoice.shopSuppliesCents ? `<div><span>Shop supplies</span><strong>${money(job.invoice.shopSuppliesCents)}</strong></div>` : ""}
+      ${job.invoice.taxCents ? `<div><span>Sales tax</span><strong>${money(job.invoice.taxCents)}</strong></div>` : ""}
       <div class="total"><span>Total</span><span>${money(job.invoice.totalCents)}</span></div>
+      ${job.invoice.depositCents ? `<div><span>Deposit received</span><strong>−${money(job.invoice.depositCents)}</strong></div>
+      <div class="total"><span>Balance due</span><span>${money(job.invoice.balanceDueCents)}</span></div>` : ""}
     </div>
     <div class="notes box"><span class="eyebrow">Mechanic's suggestions</span><p>${escapeHtml(job.suggestions || "No additional suggestions.")}</p></div>
     <div class="notes box"><span class="eyebrow">Difficulty</span><p>${escapeHtml(job.difficultyLevel || "Standard")}</p></div>
@@ -4220,7 +4793,7 @@
   function offerStripeLink(job) {
     const dialog = $("stripeDialog");
     if (!dialog || !job.invoice) return;
-    $("stripeDialogTotal").textContent = money(job.invoice.totalCents);
+    $("stripeDialogTotal").textContent = money(job.invoice.balanceDueCents ?? job.invoice.totalCents);
     const send = $("stripeDialogSend");
     const fresh = send.cloneNode(true);
     send.replaceWith(fresh);
@@ -4269,9 +4842,10 @@
       const feeLine = link.feeCents > 0
         ? `${money(link.invoiceCents)} + ${money(link.feeCents)} card processing fee = ${money(link.totalCents)}`
         : money(link.totalCents);
+      const depositCents = Number(job.invoice?.depositCents || 0);
       const text = [
         `Hi ${firstName}, here's a secure card payment link for Gold Mobile Mechanic invoice ${link.invoiceNumber}.`,
-        `Total: ${feeLine}`,
+        `${depositCents ? `Balance due after your ${money(depositCents)} deposit` : "Total"}: ${feeLine}`,
         link.url
       ].join("\n\n");
 
@@ -4308,6 +4882,7 @@
       "",
       `Your Gold Mobile Mechanic invoice for ${vehicleName(job)} is ready.`,
       `Invoice total: ${money(job.invoice.totalCents)}`,
+      ...(job.invoice.depositCents ? [`Deposit received: ${money(job.invoice.depositCents)}`, `Balance due: ${money(job.invoice.balanceDueCents)}`] : []),
       "",
       "Attach the downloaded invoice file to this message before sending.",
       "",

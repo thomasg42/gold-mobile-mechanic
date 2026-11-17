@@ -2611,3 +2611,27 @@ button {
 .stripe-link-button { width: 100%; margin-top: 10px; }
 .stripe-link-note { margin: 8px 0 0; font-size: 0.85rem; opacity: 0.75; }
 .stripe-sheet p { margin: 12px 0 18px; line-height: 1.45; }
+
+/* Estimate & approval (phone card + customer portal page) */
+.estimate-lines { display: grid; gap: 10px; margin: 12px 0; }
+.estimate-line { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid rgba(127,127,127,.2); }
+.estimate-line > div:first-child { display: grid; gap: 2px; min-width: 0; }
+.estimate-line-end { display: grid; gap: 6px; justify-items: end; text-align: right; }
+.estimate-line-edit { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: end; }
+.estimate-line-edit .field-wide { grid-column: 1 / -1; }
+.estimate-choice { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.estimate-choice .button { min-height: 48px; min-width: 96px; }
+.estimate-add, .estimate-actions { flex-wrap: wrap; }
+.estimate-agree { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0; }
+.estimate-agree input { width: 24px; height: 24px; flex: none; }
+@media (max-width: 420px) { .estimate-line { flex-direction: column; } .estimate-line-end { justify-items: start; text-align: left; } }
+.estimate-line-amount { align-self: center; font-size: .9rem; }
+.estimate-line-edit .text-button { justify-self: end; align-self: center; min-height: 44px; }
+.saved-jobs-manage { margin: 4px 0 12px; }
+.saved-jobs-manage summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
+.saved-job-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 4px 0; }
+.estimate-bulk { display: flex; justify-content: flex-end; margin-bottom: 4px; }
+.estimate-bulk .button { min-height: 48px; }
+.estimate-deposit { margin-top: 12px; }
+.invoice-terms { margin-top: 12px; }
+.flat-labor-note .text-button { display: inline; padding: 0; min-height: 0; }

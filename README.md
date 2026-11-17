@@ -247,7 +247,8 @@ routes.
 | Surface | Where | What it does |
 |---|---|---|
 | **Talk to Anya** | Top of the Add invoice sheet | Fills the sheet by conversation (`/api/assistant/invoice`). Returns structured JSON, never prose — a misheard sentence cannot land in a customer record as if it were a value. |
-| **Ask Anya** | Board, and inside a job | A real chat (`/api/assistant/chat`). Repair help with the video first, and she can act on the open job. |
+| **Ask Anya** | Board only | A real chat (`/api/assistant/chat`). Repair help with the video first, and she can act on the open job. Taken off the vehicle screen on 2026-11-16 (Thomas): on a job, Anya's work is the invoice, not a chat. |
+| **AI book time & parts** | Estimate card, and automatically once when a job is created | One structured call (`/api/assistant/estimate`). See "AI estimate" below. |
 
 Both stay hidden until `GET /api/health` reports `assistant: true`, so a button
 that would always fail is never shown.
@@ -369,6 +370,34 @@ which charges the balance. A deposit that covers the whole bill gets a plain
 "nothing left to charge" instead of a Stripe error. Tax and shop supplies can
 also be set straight on the running invoice for jobs with no estimate; both
 default to 0% (Montana has no sales tax).
+
+## AI estimate (book time & parts)
+
+When a job is created — by the form or by **Ask Anya to create invoice** — and
+it has a make, model and agreed work, the phone asks the Worker once for an AI
+estimate. **AI book time & parts** on the estimate card asks again (a redo
+replaces the AI's own lines and keeps every line typed by hand).
+
+- **One call, no tools, never retried.** `POST /api/assistant/estimate` with the
+  vehicle and the work → Claude Opus 5.5 at low effort, structured JSON, the
+  server-side refusal fallback on (`fallbacks: "default"`). Behind the PIN gate,
+  app origin only, and the shared assistant rate limit (40 per 5 minutes).
+- **What comes back, per job:** a title, AI-estimated flat-rate hours, the
+  parts, and the consumables people forget (sealant, gaskets, fluids, one-time
+  hardware). Hours outside (0, 40] are dropped, never shown.
+- **What lands on the phone:** one labor line per job at the job's rate, a part
+  line per part and consumable at **$0**, the names on the materials checklist,
+  and a panel with total hours and labor dollars.
+- **It is an AI estimate, never book time.** Every AI line is tagged
+  "AI estimate — verify"; the estimate will not send until every line is
+  priced; sending with AI lines asks "Did you check them?" first. The model
+  never prices anything (the same "pricing is not yours" rule as Anya).
+- **No licensed labor guide feeds it.** The CHARM tables in the vault are
+  internal-only and stay off a customer-facing app (Thomas's rule in
+  `Cars/book-times/README.md`). They are used as an answer key instead:
+  `tools/check-ai-hours.mjs` runs the estimator on eight E30 jobs and prints
+  the AI's miss against real book time. It makes 8 billed calls, so run it on
+  purpose; it reads the CSV from the vault and copies none of it here.
 
 ## Card payments (Stripe link)
 

@@ -1059,7 +1059,7 @@
           <input data-line-field="quantity" inputmode="decimal" value="${escapeHtml(String(line.quantity ?? ""))}"></label>
         <label class="field"><span>${line.kind === "labor" ? "Rate" : "Price each"}</span>
           <span class="money-input"><b>$</b><input data-line-field="unitCents" inputmode="decimal" value="${(Number(line.unitCents || 0) / 100).toFixed(2)}"></span></label>
-        <span class="estimate-line-amount">Line total <strong data-line-amount>${money(estimateLineCents(line))}</strong></span>
+        <span class="estimate-line-amount">Line total <strong data-line-amount>${money(estimateLineCents(line))}</strong>${line.source === "ai" ? ` <span class="ai-tag">${AI_LABEL}</span>` : ""}</span>
         <button class="text-button" type="button" data-remove-line="${escapeHtml(line.id)}" aria-label="Remove ${escapeHtml(line.description || "this line")}">Remove</button>
       </div>`;
   }
@@ -1111,6 +1111,7 @@
           ${lines.length ? lines.map((line) => estimateLineRow(line, editable)).join("")
             : `<p class="history-empty">No lines yet. Add labor, parts or fees${editable && saved.length ? ", or start from a saved job" : ""}.</p>`}
         </div>
+        ${aiEstimatePanel(job, editable)}
         ${editable ? `
           <div class="save-row estimate-add">
             <button class="button button-quiet" type="button" data-add-line="labor">+ Labor</button>
@@ -1376,6 +1377,8 @@
       const blank = estimate.lines.find((line) => !line.description || !estimateLineCents(line));
       if (blank) return notify("Every line needs a description and a price before you send it.", true);
       if (!String(job.customerName || "").trim()) return notify("Add the customer's name first.", true);
+      if (estimate.lines.some((line) => line.source === "ai")
+        && !window.confirm("Some hours and parts came from the AI estimate. Did you check them before the customer sees them?")) return;
       estimate.token = estimateToken();
       estimate.status = "sent";
       estimate.sentAt = new Date().toISOString();
@@ -1441,6 +1444,11 @@
         : "Approved work is on the invoice.");
     });
 
+    $("aiEstimateButton")?.addEventListener("click", () => {
+      readEstimateForm(job.estimate);
+      void requestAiEstimate(job);
+    });
+
     $("depositReceivedInput")?.addEventListener("change", () => {
       if (persistDeposit(job)) notify("Deposit saved.");
     });
@@ -1461,6 +1469,115 @@
       if (!inDraftForm(event.target)) return;
       if (persistEstimate(job)) refreshEstimateTotals(job.estimate);
     });
+  }
+
+  // ------------------------------------------------------- AI estimate
+  //
+  // Hours, parts and the consumables people forget, from the Worker's one-call
+  // estimate route. Everything it returns is an AI ESTIMATE: tagged, never
+  // called book time, and priced by the mechanic before a customer sees it
+  // (parts arrive at $0 and the estimate will not send until they are priced).
+
+  const AI_LABEL = "AI estimate — verify";
+  let aiEstimateInFlight = null;
+
+  function aiEstimateReady(job) {
+    return Boolean(String(job.vehicleMake || "").trim() && String(job.vehicleModel || "").trim()
+      && String(job.agreedWork || "").trim());
+  }
+
+  function aiEstimatePanel(job, editable) {
+    const ai = job.aiEstimate;
+    const working = aiEstimateInFlight === job.id;
+    const button = editable && aiEstimateReady(job)
+      ? `<button class="button button-quiet" type="button" id="aiEstimateButton" ${working ? "disabled" : ""}>${working
+        ? "Estimating…" : ai ? "Redo AI estimate" : "AI book time &amp; parts"}</button>`
+      : "";
+    if (!ai) return button ? `<div class="save-row ai-estimate-actions">${button}</div>` : "";
+    const hours = ai.jobs.reduce((sum, item) => sum + Number(item.hours || 0), 0);
+    const rate = Number(job.laborRateCents || 0);
+    return `
+      <div class="ai-estimate" id="aiEstimatePanel">
+        <p class="eyebrow">${AI_LABEL}</p>
+        <p class="ai-estimate-total"><strong>${hours.toFixed(1)} hr</strong>${rate ? ` · ${money(Math.round(hours * rate))} labor at ${money(rate)}/hr` : ""}</p>
+        <ul class="ai-estimate-jobs">${ai.jobs.map((item) => `
+          <li><strong>${escapeHtml(item.title)}</strong> · ${Number(item.hours).toFixed(1)} hr${item.note ? `<br><span class="time-edit-note">${escapeHtml(item.note)}</span>` : ""}</li>`).join("")}</ul>
+        <p class="time-edit-note">Not official book time. Parts are listed at $0 for you to price; check every line before sending.</p>
+        ${button ? `<div class="save-row ai-estimate-actions">${button}</div>` : ""}
+      </div>`;
+  }
+
+  /**
+   * Puts the AI's jobs on the draft estimate: one labor line per job at this
+   * job's rate, a $0 part line per part and consumable, and the names on the
+   * materials checklist. A redo replaces the AI lines it added last time and
+   * leaves every line the mechanic typed himself.
+   */
+  function applyAiEstimate(job, result) {
+    job.aiEstimate = { jobs: result.jobs, requestedAt: new Date().toISOString() };
+    const estimate = ensureEstimate(job);
+    if (estimate.status !== "draft") return;
+    estimate.lines = estimate.lines.filter((line) => line.source !== "ai");
+    const rate = Number(job.laborRateCents || 0);
+    const materials = Array.isArray(job.materials) ? job.materials : [];
+    // Matched on the name alone: a checklist entry reads "Coolant × 2", and a
+    // redo must recognize it rather than add the same part again.
+    const materialKey = (text) => String(text || "").replace(/\s×\s[\d.]+$/, "").trim().toLowerCase();
+    const have = new Set(materials.map((item) => materialKey(item.description)));
+    result.jobs.forEach((item) => {
+      estimate.lines.push({ id: uid(), kind: "labor", description: item.title, quantity: item.hours,
+        unitCents: rate, decision: "pending", source: "ai" });
+      [...item.parts, ...item.consumables].forEach((part) => {
+        estimate.lines.push({ id: uid(), kind: "part", description: part.name, quantity: part.quantity,
+          unitCents: 0, decision: "pending", source: "ai" });
+        const key = materialKey(part.name);
+        if (!have.has(key)) {
+          have.add(key);
+          materials.push({ id: uid(), description: part.quantity === 1 ? part.name : `${part.name} × ${part.quantity}` });
+        }
+      });
+    });
+    job.materials = materials;
+  }
+
+  async function requestAiEstimate(job, { quiet = false } = {}) {
+    if (aiEstimateInFlight) return false;
+    if (!navigator.onLine) {
+      if (!quiet) notify("You're offline. The AI estimate needs signal.", true);
+      return false;
+    }
+    aiEstimateInFlight = job.id;
+    if (selectedJobId === job.id) renderJob();
+    try {
+      const response = await cloudFetch("/api/assistant/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vehicle: { year: job.vehicleYear || "", make: job.vehicleMake || "", model: job.vehicleModel || "" },
+          work: job.agreedWork || ""
+        })
+      });
+      const result = await response.json();
+      if (!Array.isArray(result?.jobs) || !result.jobs.length) throw new Error("The AI couldn't estimate that work.");
+      applyAiEstimate(job, result);
+      queueJobSync(job);
+      notify("AI estimate added. Check the hours and price the parts.");
+      return true;
+    } catch (error) {
+      if (!quiet) notify(error?.message || "The AI estimate didn't come back.", true);
+      return false;
+    } finally {
+      aiEstimateInFlight = null;
+      if (selectedJobId === job.id) renderJob();
+    }
+  }
+
+  /** Once, right after a job is created with the work on it. Silent if it can't. */
+  async function autoAiEstimate(job) {
+    if (job.aiEstimate || !aiEstimateReady(job)) return;
+    const available = await Promise.resolve(window.GMMAgent?.available() ?? false).catch(() => false);
+    if (!available) return;
+    await requestAiEstimate(job, { quiet: true });
   }
 
   function findJob(id) {
@@ -2699,7 +2816,6 @@
               </div>
               <div class="card-cta">
                 <button class="button button-voice" id="voiceReceiptButton" type="button" ${locked ? "disabled" : ""}><span aria-hidden="true">🎙</span> Receipts by voice</button>
-                <button class="button button-talk hidden" id="jobShopAgentButton" type="button"><span aria-hidden="true">💬</span> Ask Anya</button>
                 <button class="button button-quiet" id="addReceiptButton" type="button" ${locked ? "disabled" : ""}>+ Receipt</button>
               </div>
             </div>
@@ -2995,16 +3111,6 @@
       addReceiptButton.addEventListener("click", () => {
         flushJobAutosave();
         openReceiptDialog(job.id);
-      });
-    }
-
-    const jobShopAgentButton = $("jobShopAgentButton");
-    if (jobShopAgentButton) {
-      jobShopAgentButton.addEventListener("click", () => window.GMMAgent?.openChat());
-      // Re-checked per render rather than cached on the element: the job view
-      // is rebuilt by innerHTML, so this is a fresh button every time.
-      void Promise.resolve(window.GMMAgent?.available() ?? false).then((ready) => {
-        jobShopAgentButton.classList.toggle("hidden", !ready);
       });
     }
 
@@ -3965,6 +4071,7 @@
     notify(`${job.customerName} saved · ${job.id}`);
     openJob(job.id);
     void confirmJobSaved(job);
+    void autoAiEstimate(job);
   });
 
   /**

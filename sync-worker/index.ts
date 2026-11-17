@@ -1,6 +1,7 @@
 import {
   type AssistantEnv,
   chatTurn,
+  estimateTurn,
   invoiceTurn,
 } from "./assistant";
 
@@ -1616,7 +1617,9 @@ async function runAssistant(
         ? await invoiceTurn(env, payload)
         : pathname === "/api/assistant/chat"
           ? await chatTurn(env, payload)
-          : null;
+          : pathname === "/api/assistant/estimate"
+            ? await estimateTurn(env, payload)
+            : null;
     if (!result) return json(request, { error: "Not found." }, 404);
     return json(request, result.body, result.status);
   } catch (error) {

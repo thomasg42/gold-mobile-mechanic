@@ -547,10 +547,12 @@ test("Ask Anya clocks him in for real before she says she did",
   context.GMMVoice = fakeVoice([], spoken);
 
   await settle(() => !doc.getElementById("jobView").classList.contains("hidden"), "the work order");
-  await settle(() => doc.getElementById("jobShopAgentButton")
-    && !doc.getElementById("jobShopAgentButton").classList.contains("hidden"), "Ask Anya on the job");
-
-  doc.getElementById("jobShopAgentButton").dispatchEvent(new dom.Event("click"));
+  // Thomas, 2026-11-16: no general chat button on the vehicle screen. The
+  // chat's job tools still exist, so their honesty is still pinned here by
+  // opening the panel directly.
+  assert.equal(doc.getElementById("jobShopAgentButton"), null, "no Ask Anya chat on the vehicle screen");
+  await settle(() => context.GMMAgent, "the agent script");
+  context.GMMAgent.openChat();
   await settle(() => doc.querySelector(".agent-panel")?.open, "the chat panel");
 
   // The app back-fills clock history from a job's existing time entries at
